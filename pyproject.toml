@@ -1,0 +1,48 @@
+[project]
+name = "the-trader-bot"
+version = "1.0.0"
+description = "Autonomous Binance spot bot with a ported order gate, journal and operator panel."
+requires-python = ">=3.12"
+dependencies = [
+    "ccxt>=4.5.71",
+    "fastapi>=0.115.0",
+    "httpx>=0.28.0",
+    "numpy>=1.26.0",
+    "pandas>=2.2.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "uvicorn>=0.32.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "hypothesis>=6.100.0",
+    "mypy>=1.13.0",
+    "pytest>=8.3.0",
+    "ruff>=0.8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["bot*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 140
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F"]
+
+[tool.mypy]
+python_version = "3.12"
+packages = ["bot.api", "bot.evaluator", "bot.risk", "bot.executor", "bot.runtime", "bot.config", "bot.store"]
+strict = true
+ignore_missing_imports = true
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
