@@ -4,22 +4,22 @@ version = "1.0.0"
 description = "Autonomous Binance spot bot with a ported order gate, journal and operator panel."
 requires-python = ">=3.12"
 dependencies = [
-    "ccxt>=4.5.71",
-    "fastapi>=0.115.0",
-    "httpx>=0.28.0",
-    "numpy>=1.26.0",
-    "pandas>=2.2.0",
-    "pydantic>=2.0.0",
-    "python-dotenv>=1.0.0",
-    "uvicorn>=0.32.0",
+    "ccxt==4.5.76",
+    "fastapi==0.141.1",
+    "httpx==0.28.1",
+    "numpy==2.4.6",
+    "pandas==2.3.3",
+    "pydantic==2.13.5",
+    "python-dotenv==1.2.3",
+    "uvicorn==0.52.4",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "hypothesis>=6.100.0",
-    "mypy>=1.13.0",
-    "pytest>=8.3.0",
-    "ruff>=0.8.0",
+    "hypothesis==6.169.4",
+    "mypy==2.4.0",
+    "pytest==9.1.1",
+    "ruff==0.16.10",
 ]
 
 [tool.setuptools.packages.find]
@@ -39,9 +39,34 @@ select = ["E", "F"]
 
 [tool.mypy]
 python_version = "3.12"
-packages = ["bot.api", "bot.evaluator", "bot.risk", "bot.executor", "bot.runtime", "bot.config", "bot.store"]
+packages = [
+    "bot.api", "bot.evaluator", "bot.risk", "bot.executor", "bot.runtime", "bot.config", "bot.store",
+    "bot.collector", "bot.recommend", "bot.markets", "bot.features", "bot.reports", "bot.promotion",
+    "bot.decay", "bot.backtest", "bot.paths", "bot.mandate_io", "bot.strategies", "bot.__main__",
+    "bot.exchange", "bot.ops",
+]
+# Vendored modules this branch changed (ORIGIN.md, "Baseados no commit e alterados aqui") are typed here.
+modules = ["bot.live.sdk_order_gate", "bot.governance.ledger"]
 strict = true
 ignore_missing_imports = true
+
+# Vendored from Vibe-Trading d7f1b9e and unchanged (ORIGIN.md): reviewed as a diff against that commit,
+# not typed here. The changed ones are listed in ``modules`` above: their type errors are reported,
+# with the strict flags except the ones that demand annotations the vendored code does not have.
+[[tool.mypy.overrides]]
+module = ["bot.live", "bot.live.*", "bot.governance", "bot.governance.*", "bot.tools", "bot.tools.*"]
+follow_imports = "silent"
+
+# Type errors in them are reported; missing annotations of the vendored code are not.
+[[tool.mypy.overrides]]
+module = ["bot.live.sdk_order_gate", "bot.governance.ledger"]
+follow_imports = "normal"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_calls = false
+disallow_any_generics = false
+warn_unused_ignores = false
+warn_return_any = false
 
 [build-system]
 requires = ["setuptools>=68"]
