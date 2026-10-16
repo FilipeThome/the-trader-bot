@@ -17,22 +17,24 @@ class TrendBreakout:
     def evaluate(self, symbol: str, timeframe: str, frame: pd.DataFrame) -> Setup | None:
         if timeframe not in self.timeframes or len(frame) < 60:
             return None
-        state = regime(frame)
         close = float(frame["close"].iloc[-1])
         prior_high = float(frame["high"].iloc[-21:-1].max())
+        prior_low = float(frame["low"].iloc[-21:-1].min())
         avg_volume = float(frame["volume"].iloc[-21:-1].mean() or 0)
         volume = float(frame["volume"].iloc[-1])
-        strength = float(adx(frame).iloc[-1]) if pd.notna(adx(frame).iloc[-1]) else 0.0
-        true_range = float(atr(frame).iloc[-1]) if pd.notna(atr(frame).iloc[-1]) else 0.0
+        # Most bars break nothing: refuse them before the ADX and ATR, which
+        # cost most of a backtest step.
+        if not (volume > avg_volume and (close > prior_high or close < prior_low)):
+            return None
+        strength_series = adx(frame)
+        state = regime(frame, strength_series)
+        strength = float(strength_series.iloc[-1]) if pd.notna(strength_series.iloc[-1]) else 0.0
+        range_series = atr(frame)
+        true_range = float(range_series.iloc[-1]) if pd.notna(range_series.iloc[-1]) else 0.0
         if true_range <= 0 or close <= 0:
             return None
         broke = close > prior_high and volume > avg_volume and strength > 25 and state == "trend_up"
-        broke_down = (
-            close < float(frame["low"].iloc[-21:-1].min())
-            and volume > avg_volume
-            and strength > 25
-            and state == "trend_down"
-        )
+        broke_down = close < prior_low and volume > avg_volume and strength > 25 and state == "trend_down"
         if not broke and not broke_down:
             return None
         direction = 1.0 if broke else -1.0

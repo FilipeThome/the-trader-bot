@@ -1,4 +1,11 @@
-"""Top liquid Binance pairs by the same score the bot uses to judge a trade."""
+"""Top liquid Binance pairs for the panel.
+
+Rows of kind ``setup`` carry the same score the bot uses to judge a trade.
+When fewer than five setups qualify, rows of kind ``movimento`` list liquid
+USDT pairs that rose today. Those rows have no score and no strategy: they
+are a watch list, never an order signal, and they always come after the
+scored rows.
+"""
 
 from __future__ import annotations
 
@@ -45,13 +52,14 @@ def shortlist(tickers: list[dict[str, Any]], usdt: dict[str, str], *, min_volume
 
 def rank_setups(setups: list[Setup]) -> list[dict[str, Any]]:
     """Keep the best positive net return per pair, at most five."""
-    ranked = []
+    ranked: list[dict[str, Any]] = []
     for setup in setups:
         item = classify(setup)
         if item.score <= 0 or item.net_return <= 0:
             continue
         ranked.append(
             {
+                "kind": "setup",
                 "symbol": item.symbol,
                 "strategy": item.strategy,
                 "action": item.action,
@@ -67,7 +75,7 @@ def rank_setups(setups: list[Setup]) -> list[dict[str, Any]]:
     for row in ranked:
         if row["symbol"] in seen:
             continue
-        seen.add(row["symbol"])
+        seen.add(str(row["symbol"]))
         best.append(row)
         if len(best) == 5:
             break
@@ -77,7 +85,7 @@ def rank_setups(setups: list[Setup]) -> list[dict[str, Any]]:
 def recommendations(collector: Collector, *, min_volume: float) -> list[dict[str, Any]]:
     """Scan a small liquid slice at most once a minute."""
     now = datetime.now(timezone.utc)
-    cached = getattr(collector, "recommendation_cache", None)
+    cached = collector.recommendation_cache
     if cached is not None and (now - cached[0]).total_seconds() < _MAX_AGE_SECONDS:
         return cached[1]
     if weight_pressure():
@@ -93,8 +101,6 @@ def recommendations(collector: Collector, *, min_volume: float) -> list[dict[str
     rows = rank_setups(_setups(collector, chosen))
     if len(rows) < 5:
         rows = _fill_with_movers(rows, tickers, usdt, min_volume=min_volume)
-        rows.sort(key=lambda row: (float(row["score"]), float(row["net_return"])), reverse=True)
-        rows = rows[:5]
     collector.recommendation_cache = (now, rows)
     return rows
 
@@ -106,7 +112,7 @@ def _fill_with_movers(
     *,
     min_volume: float,
 ) -> list[dict[str, Any]]:
-    """Complete the top 5 with liquid USDT pairs that rose today. Losers stay out."""
+    """Append liquid USDT pairs that rose today until there are five rows. Losers stay out."""
     seen = {row["symbol"] for row in rows}
     movers: list[tuple[float, dict[str, Any]]] = []
     for item in tickers:
@@ -120,24 +126,23 @@ def _fill_with_movers(
             continue
         if volume < min_volume or change <= 0:
             continue
-        score = change * min(volume / 50_000_000, 3.0)
+        weight = change * min(volume / 50_000_000, 3.0)
         movers.append(
             (
-                score,
+                weight,
                 {
+                    "kind": "movimento",
                     "symbol": pair,
-                    "strategy": "trend" if change >= 0.03 else "mean_reversion",
-                    "action": "Comprar",
-                    "score": round(score, 4),
-                    "net_return": round(change, 6),
+                    "change": round(change, 6),
+                    "quote_volume": volume,
                     "status": "potencial",
-                    "reason": f"Alta de {change:+.1%} no dia com volume alto",
+                    "reason": f"Alta de {change:+.1%} no dia com volume alto; sem setup das estratégias",
                 },
             )
         )
     movers.sort(key=lambda item: item[0], reverse=True)
     filled = list(rows)
-    for _score, row in movers:
+    for _weight, row in movers:
         filled.append(row)
         if len(filled) == 5:
             break

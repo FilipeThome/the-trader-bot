@@ -2,16 +2,19 @@ import { useEffect } from "react";
 import { NavLink, Route, Routes } from "react-router";
 
 import { Help } from "./Help";
+import { Balance } from "./pages/Balance";
 import { Controls } from "./pages/Controls";
 import { History } from "./pages/History";
 import { Opportunities } from "./pages/Opportunities";
 import { Performance } from "./pages/Performance";
 import { Positions } from "./pages/Positions";
+import { TradeLive } from "./pages/TradeLive";
 import { useBot } from "./store";
 
 const links: [string, string, string][] = [
   ["/", "Oportunidades", "Lista o que o robô está vendo agora, da melhor nota para a pior. Nada aqui vira ordem sozinho se o status não for Pronta."],
   ["/positions", "Posições", "Mostra o que está aberto neste ambiente: quanto entrou, onde corta a perda e onde realiza o ganho."],
+  ["/balance", "Saldo", "Mostra o saldo desta conta Binance (testnet ou produção), moeda por moeda, com o valor estimado em USDT."],
   ["/performance", "Desempenho", "Mostra se o dinheiro cresceu ou encolheu ao longo dos dias, já descontando custos."],
   ["/controls", "Controles", "Liga, pausa e configura o robô. Também é aqui que se troca o ensaio (testnet) pela conta real."],
   ["/history", "Histórico", "Registro do que o robô decidiu, inclusive quando escolheu não operar."],
@@ -93,6 +96,7 @@ export function App() {
         </p>
       )}
       {error && <p className="px-6 text-sm text-red-600">{error}</p>}
+      <NoticeBar />
       <nav className="flex flex-wrap gap-4 px-6 pb-4 text-sm">
         {links.map(([path, label, hint]) => (
           <span key={path} className="inline-flex items-center">
@@ -107,9 +111,11 @@ export function App() {
         <Routes>
           <Route path="/" element={<Opportunities />} />
           <Route path="/positions" element={<Positions />} />
+          <Route path="/balance" element={<Balance />} />
           <Route path="/performance" element={<Performance />} />
           <Route path="/controls" element={<Controls />} />
           <Route path="/history" element={<History />} />
+          <Route path="/trade/:id" element={<TradeLive />} />
         </Routes>
       </main>
     </div>
@@ -123,4 +129,31 @@ export function formatPct(value: number): string {
 
 export function money(value: number): string {
   return value.toLocaleString("pt-BR", { style: "currency", currency: "USD" });
+}
+
+/** The result of the last button, pinned to the bottom of the window so it is seen wherever the button was. */
+function NoticeBar() {
+  const notice = useBot((state) => state.notice);
+  const clear = useBot((state) => state.clearNotice);
+  if (!notice) return null;
+  const tone =
+    notice.kind === "error"
+      ? "bg-red-700 text-white"
+      : notice.kind === "ok"
+        ? "bg-green-700 text-white"
+        : "bg-neutral-800 text-white dark:bg-neutral-200 dark:text-neutral-900";
+  return (
+    <div
+      role={notice.kind === "error" ? "alert" : "status"}
+      aria-live="polite"
+      className={`fixed bottom-4 right-4 z-50 flex max-w-md items-start gap-3 rounded px-4 py-3 text-sm shadow-lg ${tone}`}
+    >
+      <span className="whitespace-pre-line">{notice.text}</span>
+      {notice.kind !== "busy" && (
+        <button className="ml-auto underline" type="button" onClick={clear} aria-label="Fechar aviso">
+          fechar
+        </button>
+      )}
+    </div>
+  );
 }

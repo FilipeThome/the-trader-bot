@@ -1,5 +1,5 @@
-# Ported from Vibe-Trading d7f1b9e22b42c10197497a8e2cac4f0e2cc9ca1e.
-# Behavior of every profile other than binance-live-trade-bot is unchanged.
+# First-party code of this repository. It was written in a local, unpublished
+# Vibe-Trading checkout and is in no Vibe-Trading commit. See ORIGIN.md.
 """Allowed Binance spot order-journal transitions.
 
 A client order id or cancel key has one latest event. Terminal events are not

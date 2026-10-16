@@ -1,5 +1,5 @@
-# Ported from Vibe-Trading d7f1b9e22b42c10197497a8e2cac4f0e2cc9ca1e.
-# Behavior of every profile other than binance-live-trade-bot is unchanged.
+# First-party code of this repository. It was written in a local, unpublished
+# Vibe-Trading checkout and is in no Vibe-Trading commit. See ORIGIN.md.
 """Cross-process exclusive file lock with bounded waiting.
 
 Used by the execution journal and by ``binance.json`` persistence. The lock
@@ -18,17 +18,20 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from types import ModuleType
+from typing import IO, Any, Iterator
 
+fcntl: ModuleType | None
+msvcrt: ModuleType | None
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows
-    fcntl = None  # type: ignore[assignment]
+    fcntl = None
 
 try:
     import msvcrt
 except ImportError:  # pragma: no cover - POSIX
-    msvcrt = None  # type: ignore[assignment]
+    msvcrt = None
 
 DEFAULT_TIMEOUT = 10.0
 _POLL = 0.05
@@ -39,7 +42,7 @@ class LockUnavailable(OSError):
     """The lock could not be taken; the caller must not proceed unlocked."""
 
 
-def _try_lock(handle) -> bool:
+def _try_lock(handle: IO[Any]) -> bool:
     if fcntl is not None:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -56,7 +59,7 @@ def _try_lock(handle) -> bool:
     raise LockUnavailable("no file lock backend is available")
 
 
-def _unlock(handle) -> None:
+def _unlock(handle: IO[Any]) -> None:
     if fcntl is not None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     elif msvcrt is not None:

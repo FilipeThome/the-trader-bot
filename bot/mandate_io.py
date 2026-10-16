@@ -6,6 +6,7 @@ import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from bot.live.mandate.model import (
     MANDATE_SCHEMA_VERSION,
@@ -15,13 +16,16 @@ from bot.live.mandate.model import (
 from bot.live.paths import broker_dir
 from bot.paths import get_runtime_root
 
+if TYPE_CHECKING:
+    from bot.config import BotConfig
+
 
 def commit_binance_mandate(
     *,
     capital_usd: float,
     max_order_notional_usd: float,
     max_total_exposure_usd: float,
-    max_leverage: float = 3.0,
+    max_leverage: float = 1.0,
     max_trades_per_day: int = 20,
     flatten_on_halt: bool = False,
     days: int = 30,
@@ -62,6 +66,24 @@ def commit_binance_mandate(
     except OSError:
         pass
     return path
+
+
+#: Orders one bot entry may need: entry, stop, exit and one re-placed stop.
+ORDERS_PER_ENTRY = 4
+
+
+def commit_mandate_for(config: "BotConfig") -> Path:
+    """Write the mandate for the active mode from the operator limits."""
+    capital = config.capital_for_sizing()
+    limits = config.limits
+    return commit_binance_mandate(
+        capital_usd=capital,
+        max_order_notional_usd=capital * limits.max_order_notional_pct,
+        max_total_exposure_usd=capital * limits.max_exposure_pct,
+        max_leverage=limits.max_leverage,
+        max_trades_per_day=ORDERS_PER_ENTRY * limits.max_trades_per_day,
+        flatten_on_halt=config.flatten_on_halt,
+    )
 
 
 def mandate_is_restricted() -> bool:

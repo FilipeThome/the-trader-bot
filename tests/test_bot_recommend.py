@@ -2,10 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi.testclient import TestClient
-
-from bot.api.app import app, ctx
-from bot.config import BotConfig
+from bot.api.app import ctx
 from bot.recommend import _fill_with_movers, rank_setups, shortlist
 from bot.strategies.base import Setup
 
@@ -59,9 +56,21 @@ def test_rank_keeps_five_positive_scores_one_per_pair() -> None:
     assert len(rows) == 5
 
 
-def test_fill_completes_five_with_day_gainers_only() -> None:
-    rows = [{"symbol": "BTC/USDT", "strategy": "trend", "action": "Comprar", "score": 1.0, "net_return": 0.02, "status": "pronta", "reason": "setup"}]
-    usdt = {"BTCUSDT": "BTC/USDT", "ETHUSDT": "ETH/USDT", "SOLUSDT": "SOL/USDT", "BNBUSDT": "BNB/USDT", "XRPUSDT": "XRP/USDT", "ADAUSDT": "ADA/USDT"}
+def test_fill_appends_day_gainers_without_a_score() -> None:
+    rows = [
+        {
+            "kind": "setup",
+            "symbol": "BTC/USDT",
+            "strategy": "trend",
+            "action": "Comprar",
+            "score": 1.0,
+            "net_return": 0.02,
+            "status": "pronta",
+            "reason": "setup",
+        }
+    ]
+    pairs = ("BTC", "ETH", "SOL", "BNB", "XRP", "ADA")
+    usdt = {f"{base}USDT": f"{base}/USDT" for base in pairs}
     tickers = [
         {"symbol": "ETHUSDT", "quoteVolume": "80000000", "priceChangePercent": "6"},
         {"symbol": "SOLUSDT", "quoteVolume": "60000000", "priceChangePercent": "-5"},
@@ -73,22 +82,32 @@ def test_fill_completes_five_with_day_gainers_only() -> None:
     assert len(filled) == 5
     assert filled[0]["symbol"] == "BTC/USDT"
     assert [row["symbol"] for row in filled[1:]] == ["ETH/USDT", "BNB/USDT", "XRP/USDT", "ADA/USDT"]
-    assert all(float(row["net_return"]) > 0 for row in filled)
+    movers = filled[1:]
+    assert all(row["kind"] == "movimento" and row["change"] > 0 for row in movers)
+    assert not any("score" in row or "strategy" in row for row in movers)
     assert "SOL/USDT" not in {row["symbol"] for row in filled}
 
 
-def test_recommendations_route_uses_the_cache(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("BOT_RUNTIME_ROOT", str(tmp_path))
-    BotConfig().save()
-    cached = [{"symbol": "ETH/USDT", "strategy": "trend", "action": "Comprar", "score": 1.2, "net_return": 0.02, "status": "pronta", "reason": "cache"}]
-    with TestClient(app) as client:
-        assert ctx.runtime is not None
-        ctx.runtime.collector.recommendation_cache = (datetime.now(timezone.utc), cached)
+def test_recommendations_route_uses_the_cache(api_client) -> None:
+    cached = [
+        {
+            "kind": "setup",
+            "symbol": "ETH/USDT",
+            "strategy": "trend",
+            "action": "Comprar",
+            "score": 1.2,
+            "net_return": 0.02,
+            "status": "pronta",
+            "reason": "cache",
+        }
+    ]
+    assert ctx.runtime is not None
+    ctx.runtime.collector.recommendation_cache = (datetime.now(timezone.utc), cached)
 
-        def boom(url: str):
-            raise AssertionError(url)
+    def boom(url: str):
+        raise AssertionError(url)
 
-        ctx.runtime.collector._fetch = boom
-        response = client.get("/bot/recommendations")
+    ctx.runtime.collector._fetch = boom
+    response = api_client.get("/bot/recommendations")
     assert response.status_code == 200
     assert response.json()["rows"] == cached

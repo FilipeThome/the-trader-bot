@@ -1,5 +1,5 @@
-# Ported from Vibe-Trading d7f1b9e22b42c10197497a8e2cac4f0e2cc9ca1e.
-# Behavior of every profile other than binance-live-trade-bot is unchanged.
+# Based on Vibe-Trading d7f1b9e22b42c10197497a8e2cac4f0e2cc9ca1e and changed in this
+# repository. ORIGIN.md lists what changed.
 """Hash-chained, fsynced, append-only JSONL ledger.
 
 A generic, domain-agnostic primitive for governance/compliance records: each
@@ -330,7 +330,7 @@ def verify_chain(path: Path) -> ChainVerificationResult:
 def _lock_exclusive(handle: BinaryIO) -> None:
     """Acquire a blocking, cross-process exclusive advisory lock on ``handle``."""
     if fcntl is not None:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)  # type: ignore[attr-defined,unused-ignore]  # POSIX only
         return
     if msvcrt is not None:  # pragma: no cover - exercised on Windows CI
         # Windows byte-range locks are valid beyond EOF, so an empty ledger is
@@ -347,7 +347,7 @@ def _lock_exclusive(handle: BinaryIO) -> None:
 def _unlock(handle: BinaryIO) -> None:
     """Release the lock acquired by :func:`_lock_exclusive`."""
     if fcntl is not None:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined,unused-ignore]  # POSIX only
         return
     if msvcrt is not None:  # pragma: no cover - exercised on Windows CI
         handle.seek(0)
@@ -452,13 +452,7 @@ def append_record(
             # began at genesis would report every rotated ledger as corrupt.
             # Continuing from the newest segment is also what makes deleting a
             # whole segment leave a detectable seam.
-            start_seq, start_prev = 1, GENESIS_PREV_HASH
-            segments = archive_segments(path)
-            if segments:
-                tail = _read_raw_records(segments[-1])
-                if tail:
-                    start_seq = int(tail[-1]["seq"]) + 1
-                    start_prev = str(tail[-1]["record_hash"])
+            start_seq, start_prev = _active_start(path)
 
             verification, last_seq, last_hash = _walk_chain(
                 _iter_parsed_lines(existing_text.splitlines()),
@@ -544,8 +538,10 @@ def build_export(path: Path) -> dict[str, Any]:
     Returns:
         A JSON-serializable export dict.
     """
-    verification = verify_chain(path)
-    records = _read_raw_records(path)
+    # Sealed segments first: after rotate_if_needed the active file starts partway
+    # through the chain, and only the whole history verifies from genesis.
+    verification = verify_chain_with_archives(path)
+    records = [record for segment in [*archive_segments(path), path] if segment.exists() for record in _read_raw_records(segment)]
     envelope = {"format": EXPORT_FORMAT, "source_path": str(path), "records": records}
     export_hash = f"sha256:{_sha256_hex(_canonical_json(envelope))}"
     return {
@@ -634,6 +630,16 @@ DEFAULT_ROTATE_BYTES: int = 64 * 1024 * 1024
 ARCHIVE_SUFFIX_WIDTH: int = 4
 
 
+def _active_start(path: Path) -> tuple[int, str]:
+    """The ``seq`` and ``prev_record_hash`` the active file's first record must carry."""
+    segments = archive_segments(path)
+    if segments:
+        tail = _read_raw_records(segments[-1])
+        if tail:
+            return int(tail[-1]["seq"]) + 1, str(tail[-1]["record_hash"])
+    return 1, GENESIS_PREV_HASH
+
+
 def archive_segments(path: Path) -> list[Path]:
     """Sealed segments for a ledger, oldest first.
 
@@ -686,12 +692,27 @@ def rotate_if_needed(
     if not path.exists() or path.stat().st_size < max_bytes:
         return None
 
-    result = verify_chain(path)
-    if not result.ok:
+    # The active file continues the newest sealed segment: verify it from there, as
+    # append_record does, or every second rotation would read the ledger as corrupt.
+    start_seq, start_prev = _active_start(path)
+    result, _, _ = _walk_chain(
+        _iter_parsed_lines(path.read_text(encoding="utf-8").splitlines()),
+        start_seq=start_seq,
+        start_prev_hash=start_prev,
+    )
+    if not result.ok and result.first_break is not None:
         raise LedgerCorruptionError(result.first_break)
+    if not result.ok:
+        # _walk_chain always names the break of a broken chain; anything else is a bug here.
+        raise RuntimeError("chain walk reported a broken chain without naming the break")
 
-    counter = len(archive_segments(path)) + 1
+    # The next counter is one past the highest sealed segment, not the count: with a
+    # segment missing, ``len + 1`` would name the newest one and rename over it.
+    counters = [int(segment.name[len(path.stem) + 1 : -len(path.suffix) or None]) for segment in archive_segments(path)]
+    counter = max(counters, default=0) + 1
     archive = path.with_name(f"{path.stem}.{counter:0{ARCHIVE_SUFFIX_WIDTH}d}{path.suffix}")
+    if archive.exists():
+        raise FileExistsError(f"refusing to seal {path.name} over {archive.name}")
     path.rename(archive)
     if fsync:
         _fsync_dir(path.parent)

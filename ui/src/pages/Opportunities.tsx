@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "react-router";
 
 import { api } from "../api";
 import { formatPct } from "../App";
@@ -6,20 +7,37 @@ import { Help } from "../Help";
 import { MarketCharts } from "../LiveCharts";
 import { statusLabels, strategyName } from "../labels";
 import { useBot } from "../store";
-import type { Opportunity } from "../types";
+import type { Decision, Opportunity } from "../types";
 
 const strategies = [
   ["todas", "Todas"],
   ["trend", "Trend"],
   ["mean_reversion", "Mean Reversion"],
+  ["momentum", "Momentum"],
   ["funding_carry", "Funding Carry"],
 ] as const;
 
 export function Opportunities() {
   const rows = useBot((state) => state.rows);
-  const load = useBot((state) => state.load);
+  const perform = useBot((state) => state.perform);
+  const busy = useBot((state) => state.busy);
   const [strategy, setStrategy] = useState("todas");
   const [selected, setSelected] = useState<Opportunity | null>(null);
+  const [tradeId, setTradeId] = useState<number | null>(null);
+
+  async function execute(row: Opportunity) {
+    const body = await perform(`Executar ${row.symbol}`, () => api.execute(row.symbol, row.strategy), (reply) => {
+      const results: Decision[] = reply.results ?? [];
+      const opened = results.find((item) => item.decision === "operar");
+      const notes = results.filter((item) => item.decision !== "operar").map((item) => `${item.decision}: ${item.reason}`);
+      if (reply.cycle_started) notes.push("ciclo iniciado para acompanhar o stop e as saídas");
+      return [opened ? `Compra de ${row.symbol} executada, com stop na corretora` : `Nenhuma compra de ${row.symbol}`, ...notes].join("\n");
+    });
+    const started = (body?.results ?? []).find(
+      (item) => (item.decision === "operar" || item.decision === "pendente") && item.position_id != null,
+    );
+    setTradeId(started?.position_id ?? null);
+  }
   const visible = rows.filter((row) => strategy === "todas" || row.strategy === strategy);
 
   return (
@@ -61,6 +79,10 @@ export function Opportunities() {
               Risco<Help text="Quanto o preço pode andar contra você até o ponto em que a perda é cortada." />
             </th>
             <th className="pr-3 font-medium">
+              Acerto
+              <Help text="Taxa de acerto estimada da estratégia: fração de trades que fecharam no lucro no teste histórico e nas posições reais, com a mesma regra de saída usada agora. É histórico, não uma garantia para esta oportunidade. Sem amostra suficiente aparece um traço." />
+            </th>
+            <th className="pr-3 font-medium">
               Status
               <Help text="Pronta pode ser enviada. Potencial ainda não passou no critério. Bloqueada foi barrada por um limite. Ignorada fica escondida por 24 horas. Em posição já está aberta." />
             </th>
@@ -84,7 +106,13 @@ export function Opportunities() {
                 <span className={row.net_return >= 0 ? "text-green-600" : "text-red-600"}>{formatPct(row.net_return)}</span>
               </td>
               <td className="pr-3 text-red-600">{formatPct(-Math.abs(row.risk_pct))}</td>
-              <td className="pr-3">{statusLabels[row.status] ?? row.status}</td>
+              <td className="pr-3" title={`n=${row.win_rate_n ?? 0} trades`}>
+                {row.win_rate == null ? "—" : `${Math.round(row.win_rate * 100)}% (n=${row.win_rate_n ?? 0})`}
+              </td>
+              <td className="pr-3">
+                {statusLabels[row.status] ?? row.status}
+                {row.test_only && <span className="ml-1 rounded bg-amber-200 px-1 text-xs text-amber-900">teste</span>}
+              </td>
               <td>
                 {row.reason}
                 {row.data_age_seconds != null && (
@@ -99,7 +127,8 @@ export function Opportunities() {
                     <button
                       className="ml-2 underline"
                       type="button"
-                      onClick={() => void api.execute(row.symbol, row.strategy).then(() => load())}
+                      disabled={busy}
+                      onClick={() => void execute(row)}
                     >
                       executar
                     </button>
@@ -109,7 +138,8 @@ export function Opportunities() {
                 <button
                   className="ml-2 underline"
                   type="button"
-                  onClick={() => void api.ignore(row.symbol, row.strategy).then(() => load())}
+                  disabled={busy}
+                  onClick={() => void perform(`Ignorar ${row.symbol}`, () => api.ignore(row.symbol, row.strategy), () => `${row.symbol} ignorado por 24 h`)}
                 >
                   ignorar 24h
                 </button>
@@ -120,6 +150,13 @@ export function Opportunities() {
         </tbody>
       </table>
       {visible.length === 0 && <p className="mt-4 text-sm text-neutral-500">Nenhuma oportunidade neste ambiente.</p>}
+      {tradeId != null && (
+        <p className="mt-4 text-sm">
+          <Link className="rounded bg-green-700 px-3 py-2 font-medium text-white" to={`/trade/${tradeId}`}>
+            Ver o trade ao vivo no gráfico
+          </Link>
+        </p>
+      )}
       {selected && (
         <aside className="mt-6 max-w-xl rounded border border-neutral-300 p-4 text-sm dark:border-neutral-700">
           <h2 className="font-semibold">

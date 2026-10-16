@@ -1,5 +1,5 @@
-# Ported from Vibe-Trading d7f1b9e22b42c10197497a8e2cac4f0e2cc9ca1e.
-# Behavior of every profile other than binance-live-trade-bot is unchanged.
+# Based on Vibe-Trading d7f1b9e22b42c10197497a8e2cac4f0e2cc9ca1e and changed in this
+# repository. ORIGIN.md lists what changed.
 """Pure symbol and response shaping helpers for the Binance connector."""
 
 from __future__ import annotations
@@ -76,6 +76,8 @@ def order_to_dict(item: Any) -> dict[str, Any]:
         "price": obj_get(item, "price"),
         "quantity": obj_get(item, "amount"),
         "filled": obj_get(item, "filled"),
+        "average": obj_get(item, "average"),
+        "cost": obj_get(item, "cost"),
         "remaining": obj_get(item, "remaining"),
         "status": str(obj_get(item, "status", "")),
         "time": str(obj_get(item, "timestamp", "")),

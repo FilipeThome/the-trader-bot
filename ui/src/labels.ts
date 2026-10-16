@@ -1,6 +1,7 @@
 const strategies: Record<string, string> = {
   trend: "Trend",
   mean_reversion: "Mean Reversion",
+  momentum: "Momentum",
   funding_carry: "Funding Carry",
 };
 

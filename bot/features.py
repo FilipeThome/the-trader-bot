@@ -107,4 +107,4 @@ def _iso(stamp: Any) -> str:
     moment = pd.Timestamp(stamp)
     if moment.tzinfo is None:
         moment = moment.tz_localize(timezone.utc)
-    return moment.isoformat()
+    return str(moment.isoformat())

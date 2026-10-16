@@ -17,22 +17,26 @@ class MeanReversion:
     def evaluate(self, symbol: str, timeframe: str, frame: pd.DataFrame) -> Setup | None:
         if timeframe not in self.timeframes or len(frame) < 40:
             return None
-        state = regime(frame)
         close = float(frame["close"].iloc[-1])
         value = rsi(frame["close"])
         if value.dropna().empty or close <= 0:
             return None
         last_rsi = float(value.iloc[-1])
+        # RSI inside 30-70 is most bars: refuse them before the bands, the ATR and the regime.
+        if not (last_rsi < 30 or last_rsi > 70):
+            return None
         mid, upper, lower = bollinger(frame["close"])
         if pd.isna(lower.iloc[-1]):
-            return None
-        true_range = float(atr(frame).iloc[-1]) if pd.notna(atr(frame).iloc[-1]) else 0.0
-        if true_range <= 0:
             return None
         buy = last_rsi < 30 and close < float(lower.iloc[-1])
         sell = last_rsi > 70 and close > float(upper.iloc[-1])
         if not buy and not sell:
             return None
+        range_series = atr(frame)
+        true_range = float(range_series.iloc[-1]) if pd.notna(range_series.iloc[-1]) else 0.0
+        if true_range <= 0:
+            return None
+        state = regime(frame)
         direction = 1.0 if buy else -1.0
         mean = float(ema(frame["close"], 20).iloc[-1])
         target_pct = abs(mean - close) / close

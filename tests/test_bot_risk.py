@@ -4,7 +4,7 @@ import pytest
 
 from bot.config import RiskLimits
 from bot.evaluator import Opportunity
-from bot.risk import RiskManager
+from bot.risk import RiskManager, protect
 
 
 def _opportunity() -> Opportunity:
@@ -77,3 +77,37 @@ def test_order_is_capped_at_two_percent() -> None:
 def test_drawdown_halt_is_only_past_ten_percent(equity: float) -> None:
     verdict = _assess(_manager(), peak_equity=10_000, equity=equity)
     assert verdict.halt is (equity <= 9_000)
+
+
+def test_a_pair_waits_out_its_cooldown_after_a_loss() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    losses = [{"symbol": "BTC/USDT", "closed_at": (now - timedelta(minutes=30)).isoformat(), "realized_pnl": -1.0}]
+    btc, eth = _opportunity(), _opportunity()
+    eth.symbol = "ETH/USDT"
+    protect([btc, eth], losses, RiskLimits(pair_cooldown_minutes=120), now)
+    assert btc.status == "bloqueada" and "pausa" in btc.reason and eth.status == "pronta"
+    later = _opportunity()
+    protect([later], losses, RiskLimits(pair_cooldown_minutes=120), now + timedelta(minutes=91))
+    assert later.status == "pronta"
+
+
+def test_the_loss_guard_pauses_every_entry_and_zero_turns_it_off() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    losses = [
+        {"symbol": symbol, "closed_at": (now - timedelta(hours=hours)).isoformat(), "realized_pnl": -1.0}
+        for symbol, hours in (("SOL/USDT", 5), ("ETH/USDT", 3), ("XRP/USDT", 1))
+    ]
+    row = _opportunity()
+    protect([row], losses, RiskLimits(loss_guard_trades=3, pair_cooldown_minutes=0), now)
+    assert row.status == "bloqueada" and "3 perdas" in row.reason
+    off = _opportunity()
+    protect([off], losses, RiskLimits(loss_guard_trades=0, pair_cooldown_minutes=0), now)
+    assert off.status == "pronta"
+    # The oldest loss ages out of the six-hour window.
+    aged = _opportunity()
+    protect([aged], losses, RiskLimits(loss_guard_trades=3, pair_cooldown_minutes=0), now + timedelta(hours=1, minutes=1))
+    assert aged.status == "pronta"

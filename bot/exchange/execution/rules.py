@@ -1,5 +1,5 @@
-# Ported from Vibe-Trading d7f1b9e22b42c10197497a8e2cac4f0e2cc9ca1e.
-# Behavior of every profile other than binance-live-trade-bot is unchanged.
+# First-party code of this repository. It was written in a local, unpublished
+# Vibe-Trading checkout and is in no Vibe-Trading commit. See ORIGIN.md.
 """Pure Binance spot filter parsing and size flooring.
 
 ccxt 4.5.76 truncates a spot market ``quoteOrderQty`` to ``precision.price``
@@ -190,7 +190,8 @@ def parse_market(market: Mapping[str, Any]) -> tuple[MarketRules | None, tuple[s
         reasons.append("filter_missing:NOTIONAL")
     elif _decimal_field(filters.get("NOTIONAL") or filters.get("MIN_NOTIONAL") or {}, "minNotional") is None:
         reasons.append("filter_missing:NOTIONAL.minNotional")
-    precision = market.get("precision") if isinstance(market.get("precision"), Mapping) else {}
+    raw_precision = market.get("precision")
+    precision: Mapping[str, Any] = raw_precision if isinstance(raw_precision, Mapping) else {}
     price_tick = _positive(precision.get("price"))
     price_filter = filters.get("PRICE_FILTER", {})
     filter_tick = _decimal_field(price_filter, "tickSize") if price_filter else None

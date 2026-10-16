@@ -1,5 +1,5 @@
-# Ported from Vibe-Trading d7f1b9e22b42c10197497a8e2cac4f0e2cc9ca1e.
-# Behavior of every profile other than binance-live-trade-bot is unchanged.
+# Based on Vibe-Trading d7f1b9e22b42c10197497a8e2cac4f0e2cc9ca1e and changed in this
+# repository. ORIGIN.md lists what changed.
 """Binance trading connector with opt-in read-only USD-M account evidence.
 
 Read-only account/market access uses the ``ccxt`` library's unified ``binance``

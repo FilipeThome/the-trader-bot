@@ -10,10 +10,10 @@ def live_sharpe(daily_returns: list[float]) -> float:
         return 0.0
     mean = sum(daily_returns) / len(daily_returns)
     var = sum((value - mean) ** 2 for value in daily_returns) / (len(daily_returns) - 1)
-    sigma = var ** 0.5
+    sigma = float(var) ** 0.5
     if sigma == 0:
         return 0.0
-    return mean / sigma * (365 ** 0.5)
+    return float(mean / sigma * (365 ** 0.5))
 
 
 def apply_decay(store: Store, strategy_id: str, daily_returns: list[float]) -> bool:

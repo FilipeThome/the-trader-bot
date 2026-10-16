@@ -1,5 +1,5 @@
-# Ported from Vibe-Trading d7f1b9e22b42c10197497a8e2cac4f0e2cc9ca1e.
-# Behavior of every profile other than binance-live-trade-bot is unchanged.
+# First-party code of this repository. It was written in a local, unpublished
+# Vibe-Trading checkout and is in no Vibe-Trading commit. See ORIGIN.md.
 """Append-only Binance execution journal.
 
 Records are written with ``append_record`` so a broken chain cannot grow.
@@ -50,8 +50,11 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping
@@ -61,7 +64,8 @@ from bot.governance.ledger import (
     LedgerCorruptionError,
     _fsync_dir,
     append_record,
-    verify_chain,
+    _iter_parsed_lines,
+    _walk_chain,
 )
 from bot.exchange._filelock import LockUnavailable, exclusive_file_lock
 from bot.exchange.execution.lifecycle import (
@@ -239,32 +243,118 @@ def _write_checkpoint(rows: list[dict[str, Any]]) -> None:
         raise PersistError("execution journal checkpoint was not made durable") from exc
 
 
-def _read_verified(path: Path) -> tuple[list[dict[str, Any]], bool]:
-    verification = verify_chain(path)
-    if not verification.ok:
-        if verification.first_break is None:
-            raise PersistError("execution journal failed verification")
-        raise LedgerCorruptionError(verification.first_break)
-    if not path.exists():
+#: Seconds a verified read is trusted before the whole journal is verified again.
+FULL_VERIFY_SECONDS = 300.0
+#: Bytes before the cached end that must still match for an append-only read.
+_TAIL_BYTES = 4096
+
+
+@dataclass
+class _Verified:
+    """A journal already verified up to ``size`` bytes, in this process."""
+
+    identity: tuple[int, int]
+    size: int
+    mtime_ns: int
+    tail: bytes
+    rows: list[dict[str, Any]]
+    last_seq: int
+    last_hash: str
+    verified_at: float
+
+
+_CACHE: dict[str, _Verified] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def reset_journal_cache() -> None:
+    """Forget every verified read. Tests and the operator CLI call it."""
+    with _CACHE_LOCK:
+        _CACHE.clear()
+
+
+def _read_verified(path: Path, *, full: bool = False) -> tuple[list[dict[str, Any]], bool]:
+    """The journal's rows, verified against the hash chain.
+
+    The chain is walked in full once, then only for what was appended since:
+    while the file is the same inode, its size and mtime are unchanged or it
+    only grew, and the last cached bytes still match, the new lines are
+    verified as a continuation of the cached last record. Anything else (a
+    shrink, a rewrite, a replaced file), ``full=True``, a failed incremental
+    read, or a cache older than ``FULL_VERIFY_SECONDS`` walks the whole file
+    again. Reads run under the journal lock, so no writer moves the file
+    between ``stat`` and read.
+    """
+    key = str(path)
+    try:
+        status = path.stat()
+    except FileNotFoundError:
+        with _CACHE_LOCK:
+            _CACHE.pop(key, None)
         return [], False
-    rows: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if stripped:
-            rows.append(json.loads(stripped))
-    return rows, True
+    with _CACHE_LOCK:
+        cached = _CACHE.get(key)
+    identity = (status.st_dev, status.st_ino)
+    fresh = cached is not None and time.monotonic() - cached.verified_at < FULL_VERIFY_SECONDS
+    if not full and cached is not None and fresh and cached.identity == identity:
+        if status.st_size == cached.size and status.st_mtime_ns == cached.mtime_ns:
+            return [dict(row) for row in cached.rows], True
+        if status.st_size > cached.size:
+            grown = _verify_appended(path, cached, status.st_mtime_ns)
+            if grown is not None:
+                with _CACHE_LOCK:
+                    _CACHE[key] = grown
+                return [dict(row) for row in grown.rows], True
+    with _CACHE_LOCK:
+        _CACHE.pop(key, None)
+    data = path.read_bytes()
+    result, last_seq, last_hash = _walk_chain(_iter_parsed_lines(data.decode("utf-8").splitlines()))
+    if not result.ok:
+        if result.first_break is None:
+            raise PersistError("execution journal failed verification")
+        raise LedgerCorruptionError(result.first_break)
+    rows = [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()]
+    entry = _Verified(identity, len(data), status.st_mtime_ns, data[-_TAIL_BYTES:], rows, last_seq, last_hash, time.monotonic())
+    with _CACHE_LOCK:
+        _CACHE[key] = entry
+    return [dict(row) for row in rows], True
 
 
-def _records() -> list[dict[str, Any]]:
+def _verify_appended(path: Path, cached: _Verified, mtime_ns: int) -> _Verified | None:
+    """Verify only the bytes appended after ``cached``; None sends the caller to a full read."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(cached.size - len(cached.tail))
+            if handle.read(len(cached.tail)) != cached.tail:
+                return None
+            appended = handle.read()
+        if not appended.endswith(b"\n"):
+            return None
+        lines = appended.decode("utf-8").splitlines()
+        result, last_seq, last_hash = _walk_chain(
+            _iter_parsed_lines(lines), start_seq=cached.last_seq + 1, start_prev_hash=cached.last_hash
+        )
+        if not result.ok:
+            return None
+        rows = cached.rows + [json.loads(line) for line in lines if line.strip()]
+    except (OSError, ValueError):
+        return None
+    size = cached.size + len(appended)
+    tail = (cached.tail + appended)[-_TAIL_BYTES:]
+    return _Verified(cached.identity, size, mtime_ns, tail, rows, last_seq, last_hash, cached.verified_at)
+
+
+def _records(*, full: bool = False) -> list[dict[str, Any]]:
     """Read the whole journal, verified against its chain and its checkpoint.
 
     Takes the journal lock (re-entrant per thread), so a read never overlaps
-    an append and never compares a journal with a newer checkpoint.
+    an append and never compares a journal with a newer checkpoint. ``full``
+    walks the whole chain instead of trusting the verified read in memory.
     """
     with _exclusive_lock():
         try:
             checkpoint = _read_checkpoint()
-            rows, exists = _read_verified(journal_path())
+            rows, exists = _read_verified(journal_path(), full=full)
         except OSError as exc:
             raise PersistError(f"execution journal could not be read ({type(exc).__name__})") from exc
         _check_checkpoint(rows, exists, checkpoint)
@@ -392,7 +482,8 @@ def begin_submission(
     state_key = str(payload.get("state_key") or "")
     body = dict(payload)
     with _exclusive_lock():
-        rows = _records()
+        # A new order trusts nothing cached: the whole chain is walked before it is recorded.
+        rows = _records(full=True)
         if has_unresolved(rows):
             raise UnresolvedExecution("an unresolved Binance submission blocks a new order")
         previous = _latest_states(rows).get(state_key)

@@ -27,6 +27,10 @@ def regime_factor(strategy_id: str, regime: str, direction: float) -> float:
         if regime in {"trend_up", "trend_down"}:
             return 0.0
         return 0.5
+    if strategy_id == "momentum":
+        if direction <= 0 or regime == "trend_down":
+            return 0.0
+        return 1.0 if regime == "trend_up" else 0.5
     if strategy_id == "funding_carry":
         return 1.0 if regime == "funding" else 0.0
     return 0.0
@@ -68,9 +72,42 @@ class Opportunity:
     stop_price: float | None = None
     target_price: float | None = None
     manual: bool = False
+    #: Estimated share of winning trades of this strategy, or None without enough history.
+    win_rate: float | None = None
+    win_rate_n: int = 0
+    #: Why the row is not ready: score, cost, reward_risk, regime, short, futures,
+    #: ignored, in_position or blocked. None when it is ready.
+    blocker: str | None = None
+    #: Ready only through the Spot Testnet test mode; manual execution only.
+    test_only: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def estimate_win_rate(
+    params: dict[str, Any] | None,
+    live: tuple[int, int],
+    *,
+    exit_policy: str,
+    min_sample: int,
+) -> tuple[float | None, int]:
+    """Laplace estimate (wins + 1) / (trades + 2) over backtest and live trades.
+
+    Backtest trades count only when they were replayed with ``exit_policy``,
+    and ``live`` must already hold only positions opened under it (see
+    ``Store.strategy_outcomes``): a different exit rule describes a different
+    trade. Returns ``(None, n)``
+    below ``min_sample`` trades. This is a historical hit rate of the strategy,
+    not a probability for one setup.
+    """
+    wins, total = live
+    if params and params.get("exit_policy") == exit_policy:
+        wins += int(params.get("wins") or 0)
+        total += int(params.get("trades") or 0)
+    if total < min_sample:
+        return None, total
+    return (wins + 1) / (total + 2), total
 
 
 def classify(
@@ -92,31 +129,38 @@ def classify(
     reward_risk = net / setup.stop_pct if setup.stop_pct > 0 else 0.0
     reason = setup.reason
     status = "potencial"
+    blocker: str | None = None
     if ignored:
-        status = "ignorada"
+        status, blocker = "ignorada", "ignored"
         reason = "Ignorada pelo operador até o prazo configurado"
     elif in_position:
-        status = "em_posicao"
+        status, blocker = "em_posicao", "in_position"
+    elif setup.direction < 0 and setup.market == "spot":
+        blocker = "short"
+        reason = f"{setup.reason}; venda a descoberto não existe no spot"
     elif setup.strategy_id == "funding_carry" and not futures_enabled:
-        status = "potencial"
+        blocker = "futures"
         reason = "Sinal válido; futuros ainda não habilitados nesta fase"
     elif setup.market == "usdm" and not futures_enabled:
-        status = "potencial"
+        blocker = "futures"
         reason = "Sinal válido; futuros ainda não habilitados nesta fase"
     elif blocked_reason:
-        status = "bloqueada"
+        status, blocker = "bloqueada", "blocked"
         reason = blocked_reason
-    elif (
-        value > score_threshold
-        and net > cost_multiple * cost
-        and reward_risk >= min_reward_risk
-        and regime_factor(setup.strategy_id, setup.regime, setup.direction) > 0
-    ):
-        status = "pronta"
     elif regime_factor(setup.strategy_id, setup.regime, setup.direction) == 0:
+        blocker = "regime"
         reason = f"{setup.reason}; regime contrário à estratégia"
     elif value <= score_threshold:
+        blocker = "score"
         reason = f"{setup.reason}; score abaixo do limiar de {score_threshold}"
+    elif net <= cost_multiple * cost:
+        blocker = "cost"
+        reason = f"{setup.reason}; retorno líquido não cobre {cost_multiple}x o custo"
+    elif reward_risk < min_reward_risk:
+        blocker = "reward_risk"
+        reason = f"{setup.reason}; ganho/risco abaixo de {min_reward_risk}"
+    else:
+        status = "pronta"
     return Opportunity(
         symbol=setup.symbol,
         strategy=setup.strategy_id,
@@ -131,4 +175,5 @@ def classify(
         cost=cost,
         gross_return=setup.expected_return,
         alphas=setup.alphas,
+        blocker=blocker,
     )

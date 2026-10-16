@@ -1,5 +1,5 @@
-# Ported from Vibe-Trading d7f1b9e22b42c10197497a8e2cac4f0e2cc9ca1e.
-# Behavior of every profile other than binance-live-trade-bot is unchanged.
+# First-party code of this repository. It was written in a local, unpublished
+# Vibe-Trading checkout and is in no Vibe-Trading commit. See ORIGIN.md.
 """Recover unresolved Binance spot writes and reconcile the journal with the exchange.
 
 Only exchange evidence changes a journal state. A pending or unknown

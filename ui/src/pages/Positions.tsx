@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "react-router";
 
 import { api } from "../api";
 import { Help } from "../Help";
@@ -8,8 +9,17 @@ import { useBot } from "../store";
 
 export function Positions() {
   const positions = useBot((state) => state.positions);
-  const load = useBot((state) => state.load);
+  const perform = useBot((state) => state.perform);
+  const busy = useBot((state) => state.busy);
   const [symbol, setSymbol] = useState<string | null>(null);
+  function close(positionId: number, symbol: string) {
+    return perform(`Fechar ${symbol}`, async () => {
+      const body = await api.close(positionId);
+      // The API answers 200 with the exit's own status; anything but ok is a failed close.
+      if (body.result.status !== "ok") throw new Error(body.result.error ?? "a saída não foi concluída");
+      return body;
+    }, () => `${symbol} vendido e stop cancelado`);
+  }
   const current = positions.find((row) => row.symbol === symbol) ?? positions[0];
   return (
     <section>
@@ -35,7 +45,7 @@ export function Positions() {
               Preço médio<Help text="Preço médio pelo qual a posição foi aberta." />
             </th>
             <th className="pr-3 font-medium">
-              Stop<Help text="Preço em que a perda é cortada. Se o mercado chegar aqui, a posição deve ser encerrada." />
+              Stop<Help text="Preço do stop que fica na Binance. Se o mercado chegar aqui, a corretora vende mesmo com o robô desligado." />
             </th>
             <th className="pr-3 font-medium">
               Alvo<Help text="Preço em que o robô pretende realizar o ganho." />
@@ -44,14 +54,14 @@ export function Positions() {
               Desde<Help text="Data e hora em que a posição foi aberta." />
             </th>
             <th className="font-medium">
-              <Help align="end" text="Fechar pede para sair desta posição a preço de mercado. A ordem ainda passa pelo portão de segurança." />
+              <Help align="end" text="Fechar cancela o stop na corretora e vende a quantidade da posição com ordens limitadas imediatas. As ordens ainda passam pelo portão de segurança." />
             </th>
           </tr>
         </thead>
         <tbody>
           {positions.map((row) => (
             <tr
-              key={`${row.symbol}-${row.strategy}`}
+              key={row.id}
               className="cursor-pointer border-t border-neutral-200 dark:border-neutral-800"
               onClick={() => setSymbol(row.symbol)}
             >
@@ -64,7 +74,13 @@ export function Positions() {
               <td className="pr-3">{row.target_price ?? "—"}</td>
               <td className="pr-3">{row.opened_at}</td>
               <td>
-                <button className="underline" type="button" onClick={() => void api.close(row.symbol, row.strategy).then(() => load())}>
+                <Link className="mr-3 underline" to={`/trade/${row.id}`} onClick={(event) => event.stopPropagation()}>
+                  ao vivo
+                </Link>
+                <button className="underline disabled:opacity-50" type="button" disabled={busy} onClick={(event) => {
+                    event.stopPropagation();
+                    void close(row.id, row.symbol);
+                  }}>
                   fechar
                 </button>
               </td>

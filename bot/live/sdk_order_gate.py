@@ -1,5 +1,5 @@
-# Ported from Vibe-Trading d7f1b9e22b42c10197497a8e2cac4f0e2cc9ca1e.
-# Behavior of every profile other than binance-live-trade-bot is unchanged.
+# Based on Vibe-Trading d7f1b9e22b42c10197497a8e2cac4f0e2cc9ca1e and changed in this
+# repository. ORIGIN.md lists what changed.
 """Pre-trade mandate gate for DIRECT-SDK connectors (SPEC Mandate Enforcement §3).
 
 The MCP :class:`~src.live.order_guard.LiveOrderGuardTool` gates Robinhood by
@@ -25,6 +25,7 @@ returned payload carries the redacted record under ``live_action``.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -54,6 +55,16 @@ from bot.live.mandate.store import load_mandate
 logger = logging.getLogger(__name__)
 
 LIVE_ACTION_RESULT_KEY = "live_action"
+
+#: Set only while ``_allow`` runs the connector's ``place_order`` after an ALLOW
+#: decision. A connector that must never write without the mandate gate checks
+#: :func:`gate_allowed` instead of trusting an argument from its caller.
+_GATE_ALLOWED: contextvars.ContextVar[str | None] = contextvars.ContextVar("mandate_gate_allowed", default=None)
+
+
+def gate_allowed(broker: str) -> bool:
+    """Whether this call runs inside the gate's ALLOW for ``broker``."""
+    return _GATE_ALLOWED.get() == (broker or "").strip().lower()
 _REMOTE_TOOL = "place_order"
 
 _DECISION_ALLOW = "allow"
@@ -480,11 +491,14 @@ def _allow(broker, session_id, connector_module, config, intent, place_kwargs, m
             )
         place_kwargs = {**place_kwargs, "client_order_id": pending.client_order_id}
 
+    token = _GATE_ALLOWED.set(broker)
     try:
         result = connector_module.place_order(config, **place_kwargs)
     except Exception as exc:  # noqa: BLE001 - a connector raise must not escape the gate
         logger.warning("live place_order raised for %s: %s", broker, exc)
         result = {"status": "error", "error": str(exc)}
+    finally:
+        _GATE_ALLOWED.reset(token)
 
     is_error = not isinstance(result, dict) or str(result.get("status", "")).lower() != "ok"
     accounting_failed = False
@@ -672,7 +686,7 @@ def _recover_correlated_fill(
         and (status not in {"partially_filled", "canceled", "expired"} or filled < request_qty)
     )
     expected_after = None
-    if coherent_size:
+    if coherent_size and before is not None and filled is not None:
         expected_after = before + filled if action.request.side == "buy" else before - filled
     if not coherent_size or after != expected_after:
         return _halt_fill_recovery(
@@ -975,7 +989,7 @@ def _implied_notional(intent: OrderIntent, connector_module: Any, config: Any) -
         and price is not None
     ):
         price = max(price, intent.limit_price)
-    if price is None:
+    if price is None or intent.quantity is None:
         return None
     return intent.quantity * price
 

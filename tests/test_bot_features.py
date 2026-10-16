@@ -4,11 +4,9 @@ import math
 from datetime import datetime, timezone
 
 import pandas as pd
-from fastapi.testclient import TestClient
 
-from bot.api.app import app, ctx
+from bot.api.app import ctx
 from bot.collector import Series
-from bot.config import BotConfig
 from bot.features import build_features
 
 
@@ -56,24 +54,21 @@ def test_feature_payload_matches_strategy_inputs() -> None:
     assert "NaN" not in flat
 
 
-def test_features_route_uses_the_cache(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("BOT_RUNTIME_ROOT", str(tmp_path))
-    BotConfig().save()
-    with TestClient(app) as client:
-        assert ctx.runtime is not None
-        now = datetime.now(timezone.utc)
-        collector = ctx.runtime.collector
-        collector.snapshot.candles[("BTC/USDT", "1h")] = Series(_frame(80, "h"), now, "test")
-        collector.snapshot.candles[("BTC/USDT", "15m")] = Series(_frame(80, "15min"), now, "test")
-        collector.snapshot.funding_points["BTC/USDT"] = [{"t": now.isoformat(), "v": 0.11}]
-        collector.snapshot.funding["BTC/USDT"] = [0.11]
+def test_features_route_uses_the_cache(api_client) -> None:
+    assert ctx.runtime is not None
+    now = datetime.now(timezone.utc)
+    collector = ctx.runtime.collector
+    collector.snapshot.candles[("BTC/USDT", "1h")] = Series(_frame(80, "h"), now, "test")
+    collector.snapshot.candles[("BTC/USDT", "15m")] = Series(_frame(80, "15min"), now, "test")
+    collector.snapshot.funding_points["BTC/USDT"] = [{"t": now.isoformat(), "v": 0.11}]
+    collector.snapshot.funding["BTC/USDT"] = [0.11]
 
-        def boom(url: str):
-            raise AssertionError(url)
+    def boom(url: str):
+        raise AssertionError(url)
 
-        collector._fetch = boom
-        ok = client.get("/bot/features", params={"symbol": "BTC/USDT"})
-        missing = client.get("/bot/features", params={"symbol": "DOGE/USDT"})
+    collector._fetch = boom
+    ok = api_client.get("/bot/features", params={"symbol": "BTC/USDT"})
+    missing = api_client.get("/bot/features", params={"symbol": "DOGE/USDT"})
     assert ok.status_code == 200
     assert ok.json()["symbol"] == "BTC/USDT"
     assert missing.status_code == 404

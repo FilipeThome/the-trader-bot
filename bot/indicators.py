@@ -46,11 +46,15 @@ def bollinger(close: pd.Series, period: int = 20, width: float = 2.0) -> tuple[p
     return mid, mid + width * sigma, mid - width * sigma
 
 
-def regime(frame: pd.DataFrame) -> str:
-    """Return ``trend_up``, ``trend_down`` or ``range`` from the last closed bar."""
+def regime(frame: pd.DataFrame, strength: pd.Series | None = None) -> str:
+    """Return ``trend_up``, ``trend_down`` or ``range`` from the last closed bar.
+
+    ``strength`` is ``adx(frame)`` when the caller already computed it.
+    """
     if len(frame) < 60:
         return "range"
-    strength = adx(frame)
+    if strength is None:
+        strength = adx(frame)
     slow = ema(frame["close"], 50)
     last_adx = float(strength.iloc[-1]) if pd.notna(strength.iloc[-1]) else 0.0
     if last_adx < 25:

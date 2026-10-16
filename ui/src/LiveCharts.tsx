@@ -7,7 +7,7 @@ import { api } from "./api";
 import { Help } from "./Help";
 import { statusLabels, strategyName } from "./labels";
 import { useBot } from "./store";
-import type { Features, Market, PriceBlock, Recommendation } from "./types";
+import type { Features, Market, PriceBlock, Recommendation, Trade } from "./types";
 
 const PAIRS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT"];
 
@@ -92,6 +92,37 @@ export function PositionChart({
   );
 }
 
+/** A trade on the candles of its venue, with entry, stop, target or trailing peak, and entry and exit marks. */
+export function TradeChart({ trade }: { trade: Trade }) {
+  const dark = useBot((state) => state.dark);
+  const { position } = trade;
+  const block: PriceBlock = {
+    interval: trade.interval,
+    t: trade.candles.map((candle) => candle.t),
+    candles: trade.candles.map((candle) => [candle.o, candle.c, candle.l, candle.h]),
+  };
+  const trailing = position.exit_policy === "trailing";
+  const option = trade.candles.length
+    ? positionOption(block, position.avg_price || null, position.stop_price, trailing ? null : position.target_price, dark, {
+        peak: trailing ? position.peak_price : null,
+        entryAt: position.avg_price ? position.opened_at : null,
+        exitAt: position.closed_at,
+        exitPrice: position.exit_price,
+      })
+    : null;
+  const node = useChart(option, dark);
+  return (
+    <section>
+      <p className="mb-2 flex items-center text-neutral-500">
+        {position.symbol} · velas de {trade.interval} na corretora deste ambiente
+        <Help text="Velas do mercado onde a ordem foi executada (no testnet, o livro do Spot Testnet). Cinza: entrada. Vermelha: stop atual na Binance; com o stop móvel ela sobe junto com o maior preço (azul). Verde: alvo. Os marcadores mostram onde a posição entrou e saiu." />
+      </p>
+      {!trade.candles.length && <p className="text-neutral-500">Sem velas para este período.</p>}
+      <div ref={node} className="h-96 w-full" />
+    </section>
+  );
+}
+
 function TrendChart({ data }: { data: Features }) {
   const dark = useBot((state) => state.dark);
   const node = useChart(trendOption(data, dark), dark);
@@ -167,7 +198,7 @@ function TopPicks({ selected, onSelect }: { selected: string; onSelect: (symbol:
     <section>
       <p className="mb-2 flex items-center text-sm text-neutral-500">
         Top 5 mais promissores
-        <Help text="Até cinco pares líquidos com retorno líquido positivo agora. Primeiro entram os setups do robô; se faltarem cinco, entram altas do dia com volume. Par em queda não entra. Clicar abre o gráfico." />
+        <Help text="Até cinco pares líquidos. Primeiro entram os setups do robô, com score e retorno líquido. Se faltarem cinco, entram altas do dia com volume: essas linhas não têm score nem estratégia e não são sinal de compra. Par em queda não entra. Clicar abre o gráfico." />
       </p>
       {phase === "loading" && <p className="text-sm text-neutral-500">Calculando o top 5…</p>}
       {phase === "error" && <p className="text-sm text-red-600">Não foi possível calcular os pares mais promissores.</p>}
@@ -186,10 +217,19 @@ function TopPicks({ selected, onSelect }: { selected: string; onSelect: (symbol:
               <span className="block font-semibold">
                 {index + 1}. {row.symbol}
               </span>
-              <span className="block text-neutral-500">
-                {strategyName(row.strategy)} · score {row.score.toFixed(2)}
-              </span>
-              <span className={`block ${row.net_return >= 0 ? "text-green-600" : "text-red-600"}`}>{formatPct(row.net_return)} líquido</span>
+              {row.kind === "setup" ? (
+                <>
+                  <span className="block text-neutral-500">
+                    {strategyName(row.strategy)} · score {row.score.toFixed(2)}
+                  </span>
+                  <span className={`block ${row.net_return >= 0 ? "text-green-600" : "text-red-600"}`}>{formatPct(row.net_return)} líquido</span>
+                </>
+              ) : (
+                <>
+                  <span className="block text-neutral-500">movimento do dia · sem setup</span>
+                  <span className="block text-green-600">alta de {formatPct(row.change)}</span>
+                </>
+              )}
               <span className="block text-neutral-500">{statusLabels[row.status] ?? row.status}</span>
             </button>
           ))}
@@ -304,7 +344,14 @@ function useChart(option: EChartsOption | null, dark: boolean) {
   }, [dark]);
 
   useEffect(() => {
-    if (option) chart.current?.setOption(option, true);
+    const instance = chart.current;
+    if (!option || !instance) return;
+    // A refresh replaces the data but keeps the zoom the user chose.
+    const zoom = (instance.getOption()?.dataZoom as { start?: number; end?: number }[] | undefined)?.[0];
+    instance.setOption(option, true);
+    if (zoom?.start != null && zoom.end != null && (zoom.start > 0 || zoom.end < 100)) {
+      instance.dispatchAction({ type: "dataZoom", start: zoom.start, end: zoom.end });
+    }
   }, [option, dark]);
 
   return node;
@@ -468,28 +515,60 @@ function fundingOption(data: Features, dark: boolean): EChartsOption {
   };
 }
 
+type TradeMarks = {
+  peak?: number | null;
+  entryAt?: string | null;
+  exitAt?: string | null;
+  exitPrice?: number | null;
+};
+
 function positionOption(
   block: PriceBlock,
-  entry: number,
+  entry: number | null,
   stop: number | null,
   target: number | null,
   dark: boolean,
+  extra: TradeMarks = {},
 ): EChartsOption {
   const labels = stamps(block.t);
   const tone = axis(dark);
-  const marks = [
-    { yAxis: entry, name: "Entrada", lineStyle: { color: "#a3a3a3" }, label: { formatter: "Entrada" } },
-  ];
+  const marks: { yAxis: number; name: string; lineStyle: { color: string }; label: { formatter: string } }[] = [];
+  if (entry != null) marks.push({ yAxis: entry, name: "Entrada", lineStyle: { color: "#a3a3a3" }, label: { formatter: "Entrada" } });
   if (stop != null) marks.push({ yAxis: stop, name: "Stop", lineStyle: { color: "#dc2626" }, label: { formatter: "Stop" } });
   if (target != null) marks.push({ yAxis: target, name: "Alvo", lineStyle: { color: "#16a34a" }, label: { formatter: "Alvo" } });
+  if (extra.peak != null) marks.push({ yAxis: extra.peak, name: "Topo", lineStyle: { color: "#2563eb" }, label: { formatter: "Topo" } });
+  const points: { name: string; coord: [string, number]; value: string; itemStyle: { color: string } }[] = [];
+  const entryAt = snap(block.t, extra.entryAt);
+  if (entryAt >= 0 && entry != null) points.push({ name: "Entrada", coord: [labels[entryAt], entry], value: "E", itemStyle: { color: "#16a34a" } });
+  const exitAt = snap(block.t, extra.exitAt);
+  if (exitAt >= 0 && extra.exitPrice != null) points.push({ name: "Saída", coord: [labels[exitAt], extra.exitPrice], value: "S", itemStyle: { color: "#dc2626" } });
   return {
     ...base(dark),
     dataZoom: [{ type: "inside" }],
     grid: { left: 72, right: 16, top: 16, bottom: 28 },
     xAxis: { type: "category", data: labels, ...tone },
     yAxis: { scale: true, ...tone },
-    series: [{ ...candleStyle(), name: "Preço", data: block.candles, markLine: { symbol: "none", data: marks } }],
+    series: [
+      {
+        ...candleStyle(),
+        name: "Preço",
+        data: block.candles,
+        markLine: { symbol: "none", data: marks },
+        markPoint: { data: points },
+      },
+    ],
   };
+}
+
+/** Index of the candle that contains ``moment``: the last one that opened at or before it, or -1. */
+function snap(times: string[], moment: string | null | undefined): number {
+  if (!moment) return -1;
+  const at = new Date(moment).getTime();
+  let found = -1;
+  times.forEach((value, index) => {
+    if (new Date(value).getTime() <= at) found = index;
+  });
+  return found;
 }
 
 function line(name: string, data: Array<number | null>, color: string, axisIndex = 0) {

@@ -1,5 +1,5 @@
-# Ported from Vibe-Trading d7f1b9e22b42c10197497a8e2cac4f0e2cc9ca1e.
-# Behavior of every profile other than binance-live-trade-bot is unchanged.
+# First-party code of this repository. It was written in a local, unpublished
+# Vibe-Trading checkout and is in no Vibe-Trading commit. See ORIGIN.md.
 """Authorize one Binance spot order, journal it, then submit it once.
 
 Paper orders are journaled and then sent. Live orders call ``execute_live_order``;
@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 
 from bot.exchange import sdk
 from bot.exchange.sdk import authorize_exchange_write
+from bot.exchange.shaping import normalize_symbol
 from bot.exchange.execution.controls import standing_blockers
 from bot.exchange.execution.journal import (
     DailyLimitReached,
@@ -54,6 +55,7 @@ from bot.exchange.execution.rules import (
     size_order,
 )
 from bot.exchange.types import TradingProfile
+from bot.live.sdk_order_gate import gate_allowed
 
 _PAPER_PROFILE = "binance-paper-trade"
 _LIVE_PROFILE = "binance-live-trade"
@@ -81,7 +83,6 @@ def place_spot_order(
     time_in_force: str = "day",
     session_id: str = "",
     idempotency_key: str | None = None,
-    through_gate: bool = False,
 ) -> dict[str, Any]:
     """Place one spot order, or deny it before the exchange is contacted.
 
@@ -112,6 +113,9 @@ def place_spot_order(
     identity = _identity_error(profile, config)
     if identity:
         return identity
+    if profile.id == _BOT_LIVE_PROFILE and not gate_allowed("binance"):
+        # Production writes exist only inside the mandate gate's ALLOW, never on a caller's word.
+        return _deny(("mandate_gate_required",))
     audit = _audit_only_denial(profile)
     if audit:
         return audit
@@ -127,7 +131,7 @@ def place_spot_order(
     if structural:
         return structural
 
-    canonical = sdk.normalize_symbol(symbol)
+    canonical = normalize_symbol(symbol)
     side_clean = str(side).strip().lower()
     type_clean = str(order_type).strip().lower()
     tif_clean = str(time_in_force or "day").strip().lower()
@@ -140,7 +144,7 @@ def place_spot_order(
         if not _IDEMPOTENCY_KEY.match(key):
             return _deny(("idempotency_key_invalid",))
         intent_id = key
-        client_order_id = hashlib.sha256(f"{profile.id}:{key}".encode("utf-8")).hexdigest()[:32]
+        client_order_id = client_order_id_for(profile.id, key)
         try:
             rows = _records()
         except Exception as exc:  # noqa: BLE001 - a broken journal blocks the write
@@ -294,7 +298,7 @@ def place_spot_order(
         except (PersistError, Exception) as exc:  # noqa: BLE001
             return _deny(("persist_failed",), detail=type(exc).__name__)
 
-    place_kwargs = {
+    place_kwargs: dict[str, Any] = {
         "symbol": canonical,
         "side": side_clean,
         "order_type": type_clean,
@@ -310,7 +314,7 @@ def place_spot_order(
     if stop_price is not None:
         place_kwargs["stop_price"] = stop_price
 
-    if profile.id == _PAPER_PROFILE or (through_gate and profile.id == _BOT_LIVE_PROFILE):
+    if profile.id in (_PAPER_PROFILE, _BOT_LIVE_PROFILE):
         # Final critical section: every standing control again, then the cap
         # against a freshly read quote (a limit sell's cap uses the live bid).
         late = _final_reasons(profile, config, canonical, sized, type_clean, side_clean, rules)
@@ -348,6 +352,11 @@ def place_spot_order(
     )
 
 
+def client_order_id_for(profile_id: str, idempotency_key: str) -> str:
+    """The Binance client order id a keyed request is sent with. Callers may persist it first."""
+    return hashlib.sha256(f"{profile_id}:{idempotency_key}".encode("utf-8")).hexdigest()[:32]
+
+
 def cancel_spot_order(
     profile: TradingProfile,
     config: Any,
@@ -379,7 +388,7 @@ def cancel_spot_order(
     order_id_clean = str(order_id or "").strip()
     if not order_id_clean or not str(symbol or "").strip():
         return _deny(("cancel_identity_required",))
-    canonical = sdk.normalize_symbol(str(symbol))
+    canonical = normalize_symbol(str(symbol))
     if "/" not in canonical:
         return _deny(("symbol_unresolved",))
     state_key = _cancel_state_key(profile, canonical, order_id_clean)
@@ -522,7 +531,9 @@ def _final_reasons(
     """Standing controls plus the cap, re-read right before submission."""
     reasons = list(standing_blockers(profile, config, quote_asset=symbol.split("/", 1)[1]))
     if profile.id == _PAPER_PROFILE:
-        quote = _guarded(sdk.get_quote, symbol, config=config) if order_type == "limit" and side == "sell" else {}
+        # Every priced sell (limit, stop-limit, take-profit-limit) caps on the live bid.
+        priced_sell = side == "sell" and order_type in {"limit", *_PROTECTED_TYPES}
+        quote = _guarded(sdk.get_quote, symbol, config=config) if priced_sell else {}
         reasons.extend(
             _paper_notional_reasons(symbol, sized, order_type=order_type, side=side, rules=rules, quote=quote)
         )
@@ -592,7 +603,7 @@ def _journal_submission(
         return {**result, "journal_state": event, "client_order_id": common.get("client_order_id", "")}
     if "client_order_id" not in result:
         return {**result, "client_order_id": common.get("client_order_id", "")}
-    return result
+    return dict(result)
 
 
 def _record_conflict(
@@ -762,7 +773,7 @@ def _request_fingerprint(
         "symbol": symbol,
         "side": side,
         "order_type": order_type,
-        "time_in_force": time_in_force if order_type == "limit" else None,
+        "time_in_force": time_in_force if order_type in {"limit", *_PROTECTED_TYPES} else None,
         "quantity": norm(quantity),
         "notional": norm(notional),
         "limit_price": norm(limit_price),

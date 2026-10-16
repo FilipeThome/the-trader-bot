@@ -1,5 +1,5 @@
-# Ported from Vibe-Trading d7f1b9e22b42c10197497a8e2cac4f0e2cc9ca1e.
-# Behavior of every profile other than binance-live-trade-bot is unchanged.
+# First-party code of this repository. It was written in a local, unpublished
+# Vibe-Trading checkout and is in no Vibe-Trading commit. See ORIGIN.md.
 """Account, quote, and journal checks that do not talk to the exchange."""
 
 from __future__ import annotations
@@ -108,7 +108,8 @@ def open_orders_are_complete(payload: Mapping[str, Any]) -> bool:
 
 def reference_price(quote: Mapping[str, Any], side: str) -> Decimal | None:
     """Lower observed ask (buy) or bid (sell), so a minimum check cannot pass on a rounded-up price."""
-    body = quote.get("quote") if isinstance(quote.get("quote"), Mapping) else {}
+    raw_body = quote.get("quote")
+    body: Mapping[str, Any] = raw_body if isinstance(raw_body, Mapping) else {}
     key = "ask" if side == "buy" else "bid"
     return _as_decimal(body.get(key), high=False)
 
@@ -129,7 +130,8 @@ def evaluate_account(
     reasons: list[str] = []
     if str(quote.get("status", "")).lower() != "ok":
         reasons.append("quote_unavailable")
-    body = quote.get("quote") if isinstance(quote.get("quote"), Mapping) else {}
+    raw_body = quote.get("quote")
+    body: Mapping[str, Any] = raw_body if isinstance(raw_body, Mapping) else {}
     fresh, fresh_reason = quote_is_fresh(quote, now=now)
     if not fresh and fresh_reason:
         reasons.append(fresh_reason)

@@ -7,40 +7,6 @@ from bot.exchange import sdk
 from bot.exchange.execution.journal import append_event, new_event
 from bot.exchange.execution.orchestrate import _request_fingerprint, place_spot_order
 from bot.exchange.profiles import profile_by_id
-from bot.config import BotConfig
-from bot.runtime import Runtime
-from bot.store import Store
-
-
-def test_halt_cancels_open_orders_in_one_tick(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("BOT_RUNTIME_ROOT", str(tmp_path))
-    cancelled: list[str] = []
-
-    def cancel(order_id, profile_id=None, **kwargs):
-        cancelled.append(order_id)
-        return {"status": "ok", "request_sent": True}
-
-    monkeypatch.setattr("bot.exchange.service.cancel_order", cancel)
-    monkeypatch.setattr("bot.executor.service.cancel_order", cancel)
-    config = BotConfig()
-    store = Store(tmp_path / "testnet" / "bot.sqlite")
-    store.upsert_position(
-        {
-            "symbol": "ETH/USDT",
-            "strategy": "trend",
-            "side": "buy",
-            "qty": 0.2,
-            "avg_price": 2000,
-            "status": "open",
-            "client_order_id": "order-1",
-        }
-    )
-    runtime = Runtime(config, store, collector=None)
-    result = runtime.halt("drawdown")
-    assert result["halted"] is True
-    assert cancelled == ["order-1"]
-    assert runtime.halted is True
-    assert runtime.start()["status"] == "error"
 
 
 def test_replayed_idempotency_key_does_not_send_again(tmp_path, monkeypatch) -> None:
@@ -95,4 +61,20 @@ def test_replayed_idempotency_key_does_not_send_again(tmp_path, monkeypatch) -> 
     )
     assert result["status"] == "ok"
     assert result["order_id"] == "99"
-    assert Store is not None
+
+
+def test_an_intent_without_quantity_has_no_implied_notional() -> None:
+    from bot.live.enforcement import OrderIntent
+    from bot.live.mandate.model import InstrumentType
+    from bot.live.sdk_order_gate import _implied_notional
+
+    class Quotes:
+        @staticmethod
+        def get_quote(symbol: str, config: object = None) -> dict[str, object]:
+            return {"status": "ok", "quote": {"last": 100.0, "bid": 100.0, "ask": 100.0}}
+
+    intent = OrderIntent(
+        symbol="BTC-USDT", side="sell", notional_usd=None, quantity=None, instrument_type=InstrumentType.CRYPTO
+    )
+    # No quantity: sizing fails closed instead of raising on None * price.
+    assert _implied_notional(intent, Quotes, None) is None

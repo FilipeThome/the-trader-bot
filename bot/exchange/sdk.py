@@ -1,5 +1,5 @@
-# Ported from Vibe-Trading d7f1b9e22b42c10197497a8e2cac4f0e2cc9ca1e.
-# Behavior of every profile other than binance-live-trade-bot is unchanged.
+# Based on Vibe-Trading d7f1b9e22b42c10197497a8e2cac4f0e2cc9ca1e and changed in this
+# repository. ORIGIN.md lists what changed.
 """Binance ccxt connector with host-separated spot profiles.
 
 The live read-only profile may opt into ``market_type="usdm"`` for strict
@@ -14,6 +14,8 @@ import json
 import math
 import os
 import re
+import time
+import threading
 import tempfile
 import contextvars
 from contextlib import contextmanager
@@ -22,11 +24,11 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 from urllib.parse import urlparse
 from urllib.request import getproxies
 
-from bot.paths import get_runtime_root
+from bot.paths import base_runtime_root
 from bot.exchange.shaping import (
     as_iter as _as_iter,
     nonzero_balances as _nonzero_balances,
@@ -302,8 +304,8 @@ def _testnet_env_credentials() -> tuple[str, str]:
 
 
 def config_path() -> Path:
-    """Return the user-level Binance config path."""
-    return get_runtime_root() / CONFIG_FILENAME
+    """Return the user-level Binance config path (the base root, shared by both modes)."""
+    return base_runtime_root() / CONFIG_FILENAME
 
 
 def _read_config_mapping() -> dict[str, Any] | None:
@@ -732,6 +734,30 @@ def get_quote(symbol: str, *, config: BinanceConfig | None = None, **_: Any) -> 
     }
 
 
+def get_last_prices(symbols: list[str], *, config: BinanceConfig | None = None) -> dict[str, float]:
+    """Last trade price per listed spot pair, in one public request. Read-only.
+
+    Pairs the selected host does not list are left out; an unreadable price is
+    left out too, so callers treat a missing pair as "not priced".
+    """
+    cfg = config or load_config()
+    _reject_unsupported_usdm_surface(cfg)
+    _assert_host(cfg)
+    ex = _public_exchange(cfg)
+    markets = ex.load_markets()
+    wanted = [normalize_symbol(symbol) for symbol in symbols]
+    listed = [symbol for symbol in dict.fromkeys(wanted) if isinstance(markets, Mapping) and symbol in markets]
+    if not listed:
+        return {}
+    raw = ex.fetch_last_prices(listed)
+    prices: dict[str, float] = {}
+    for symbol, row in (raw or {}).items():
+        price = _to_float(_obj_get(row, "price"))
+        if price is not None and price > 0:
+            prices[str(symbol)] = price
+    return prices
+
+
 def search_instruments(
     query: str,
     *,
@@ -979,7 +1005,7 @@ _EXECUTION_LATCH: contextvars.ContextVar[bool] = contextvars.ContextVar(
 
 
 @contextmanager
-def authorize_exchange_write():
+def authorize_exchange_write() -> Iterator[None]:
     """Allow one exchange write from the execution package only.
 
     A diagnostic report, a preview, or a direct SDK call does not hold this
@@ -1207,8 +1233,24 @@ def place_order(
         "filled": _obj_get(order, "filled"),
         "amount": _obj_get(order, "amount"),
         "price": _obj_get(order, "price"),
+        # Fill evidence for the bot's position and PnL accounting. Read-only fields.
+        "average": _obj_get(order, "average"),
+        "cost": _obj_get(order, "cost"),
+        "fees": _fees(order),
         "request_sent": True,
     }
+
+
+def _fees(order: Any) -> list[dict[str, Any]]:
+    """ccxt ``fees`` (or the single ``fee``) as ``{"cost", "currency"}`` rows."""
+    raw = _obj_get(order, "fees") or ([_obj_get(order, "fee")] if _obj_get(order, "fee") else [])
+    rows: list[dict[str, Any]] = []
+    for item in _as_iter(raw):
+        cost = _to_float(_obj_get(item, "cost"))
+        currency = str(_obj_get(item, "currency", "") or "").upper()
+        if cost is not None and currency:
+            rows.append({"cost": cost, "currency": currency})
+    return rows
 
 
 def _unsent_before_write(cfg: BinanceConfig) -> dict[str, Any] | None:
@@ -1241,7 +1283,7 @@ def _prepare_order(
     stop_price: Any,
     time_in_force: str,
     client_order_id: str | None,
-) -> dict[str, Any] | tuple:
+) -> dict[str, Any] | tuple[Any, ...]:
     """Validate one order request without contacting the exchange."""
     cfg = config or load_config()
     blocked = _reject_write_surface(cfg)
@@ -1391,10 +1433,11 @@ def cancel_order(
 
 def _require_ccxt() -> ModuleType:
     try:
-        import ccxt  # type: ignore
+        import ccxt
     except ModuleNotFoundError as exc:
         raise BinanceDependencyError("ccxt is not installed; run `pip install ccxt`.") from exc
-    return ccxt
+    module: ModuleType = ccxt
+    return module
 
 
 def _utc_now() -> datetime:
@@ -1443,7 +1486,7 @@ def _read_with_clock_retry(exchange: Any, read: Callable[[], Any]) -> Any:
         return read()
 
 
-def _public_exchange(cfg: BinanceConfig):
+def _public_exchange(cfg: BinanceConfig) -> Any:
     """Use the selected Binance host without credentials for public market data.
 
     CCXT otherwise loads Binance currencies through a signed SAPI request when
@@ -1452,7 +1495,7 @@ def _public_exchange(cfg: BinanceConfig):
     return _exchange(replace(cfg, api_key="", api_secret=""))
 
 
-def _exchange(cfg: BinanceConfig):
+def _exchange(cfg: BinanceConfig) -> Any:
     """Build a ccxt Binance client bound to the configured market/environment."""
     ccxt = _require_ccxt()
     client_config: dict[str, Any] = {
@@ -1512,7 +1555,74 @@ def _exchange(cfg: BinanceConfig):
             assert_exchange_endpoints(ex)
         except UsdMObservationError as exc:
             raise BinanceConfigError(str(exc)) from None
+    _install_market_cache(ex, cfg)
     return ex
+
+
+#: Seconds a loaded market table is reused by new clients of the same host and kind.
+MARKETS_TTL_SECONDS = 3600.0
+_MARKETS: dict[tuple[str, bool, bool, str], tuple[float, list[Any], Any, Any]] = {}
+_MARKETS_LOCK = threading.Lock()
+
+
+def reset_market_cache() -> None:
+    """Forget every cached market table. Tests call it."""
+    with _MARKETS_LOCK:
+        _MARKETS.clear()
+
+
+def _install_market_cache(ex: Any, cfg: BinanceConfig) -> None:
+    """Share one market table per host and client kind instead of reloading it per call.
+
+    Every quote, order read, balance and order built a fresh client whose first
+    ``load_markets`` downloaded exchangeInfo again (weight 20, megabytes on the
+    live host). The table is kept for ``MARKETS_TTL_SECONDS`` per (market type,
+    testnet, credentialed, REST hosts): a signed client also loads currencies,
+    and Binance's ``fetch_markets`` measures the clock offset, so the cached
+    ``timeDifference`` is restored too, or signed requests would fail -1021.
+    An empty table is never cached.
+    """
+    original = getattr(ex, "load_markets", None)
+    if not callable(original):
+        return
+    urls = getattr(ex, "urls", None)
+    hosts = json.dumps(urls.get("api") if isinstance(urls, dict) else None, sort_keys=True, default=str)
+    key = (str(cfg.market_type), bool(cfg.is_testnet), bool(cfg.api_key), hosts)
+
+    def load_markets(reload: bool = False, params: dict[str, Any] | None = None) -> Any:
+        loaded = getattr(ex, "markets", None)
+        if not reload and isinstance(loaded, dict) and loaded:
+            # ccxt calls load_markets at the start of every method: a client that has its
+            # table (and measured its clock) answers from it, as ccxt itself does.
+            return loaded
+        if not reload:
+            with _MARKETS_LOCK:
+                hit = _MARKETS.get(key)
+            if hit is not None and time.monotonic() - hit[0] < MARKETS_TTL_SECONDS:
+                loaded_at, markets, currencies, time_difference = hit
+                if cfg.api_key:
+                    # Signed orders (stops, exits) need the offset of now, not one up to an hour
+                    # old: measure it again (weight 1); if that fails, load everything.
+                    try:
+                        ex.load_time_difference()
+                    except Exception:  # noqa: BLE001 - the full load below measures it
+                        return _load(reload, params)
+                elif time_difference is not None:
+                    ex.options["timeDifference"] = time_difference
+                return ex.set_markets(markets, currencies)
+        return _load(reload, params)
+
+    def _load(reload: bool, params: dict[str, Any] | None) -> Any:
+        markets = original(reload, params or {})
+        table = getattr(ex, "markets", None)
+        if isinstance(table, dict) and table:
+            options = getattr(ex, "options", None)
+            time_difference = options.get("timeDifference") if isinstance(options, dict) else None
+            with _MARKETS_LOCK:
+                _MARKETS[key] = (time.monotonic(), list(table.values()), getattr(ex, "currencies", None), time_difference)
+        return markets
+
+    ex.load_markets = load_markets
 
 
 def _assert_client_hosts(ex: Any, cfg: BinanceConfig) -> None:

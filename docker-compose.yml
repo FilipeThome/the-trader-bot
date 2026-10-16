@@ -1,0 +1,48 @@
+# docker compose up -d --build
+#
+# Both services share the operator directory (binance.json, bot.json, api-token and the
+# testnet/ and production/ stores), by default ~/.the-trader-bot; set BOT_HOME to use another.
+# Stop any API started outside Docker first: two processes on one directory would both trade.
+# Ports are published on 127.0.0.1 only. The panel's proxy adds the API token, so anyone who
+# reaches the panel can operate the bot.
+#
+# Linux hosts: create the directory before the first start (Docker would create it owned by
+# root) and run as its owner, for example
+#   mkdir -p ~/.the-trader-bot && BOT_UID=$(id -u) BOT_GID=$(id -g) docker compose up -d --build
+# Docker Desktop (Windows, macOS) needs neither.
+
+services:
+  api:
+    build: .
+    user: "${BOT_UID:-1000}:${BOT_GID:-1000}"
+    environment:
+      BOT_RUNTIME_ROOT: /data
+      BOT_API_HOST: 0.0.0.0
+    volumes:
+      - ${BOT_HOME:-~/.the-trader-bot}:/data
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/openapi.json', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    restart: unless-stopped
+
+  panel:
+    build: ./ui
+    user: "${BOT_UID:-1000}:${BOT_GID:-1000}"
+    environment:
+      BOT_RUNTIME_ROOT: /data
+      BOT_API_URL: http://api:8000
+      BOT_PANEL_HOST: 0.0.0.0
+    volumes:
+      # The panel only reads the API token.
+      - ${BOT_HOME:-~/.the-trader-bot}:/data:ro
+    ports:
+      - "127.0.0.1:5173:5173"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
