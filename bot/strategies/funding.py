@@ -15,6 +15,8 @@ class FundingCarry:
     id = "funding_carry"
     timeframes = ("8h",)
     markets = ("spot", "usdm")
+    style = "swing"
+    history_days = 180
 
     def evaluate(
         self,

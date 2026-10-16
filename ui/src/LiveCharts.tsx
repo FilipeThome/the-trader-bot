@@ -102,8 +102,13 @@ export function TradeChart({ trade }: { trade: Trade }) {
     candles: trade.candles.map((candle) => [candle.o, candle.c, candle.l, candle.h]),
   };
   const trailing = position.exit_policy === "trailing";
+  const day = position.exit_policy === "day";
+  // After the first target the rest has no target: its stop sits at break-even.
+  const target = trailing || (day && position.tp1_done) ? null : position.target_price;
   const option = trade.candles.length
-    ? positionOption(block, position.avg_price || null, position.stop_price, trailing ? null : position.target_price, dark, {
+    ? positionOption(block, position.avg_price || null, position.stop_price, target, dark, {
+        targetLabel: day ? "TP1" : "Alvo",
+        deadline: day ? position.exit_deadline : null,
         peak: trailing ? position.peak_price : null,
         entryAt: position.avg_price ? position.opened_at : null,
         exitAt: position.closed_at,
@@ -115,7 +120,7 @@ export function TradeChart({ trade }: { trade: Trade }) {
     <section>
       <p className="mb-2 flex items-center text-neutral-500">
         {position.symbol} · velas de {trade.interval} na corretora deste ambiente
-        <Help text="Velas do mercado onde a ordem foi executada (no testnet, o livro do Spot Testnet). Cinza: entrada. Vermelha: stop atual na Binance; com o stop móvel ela sobe junto com o maior preço (azul). Verde: alvo. Os marcadores mostram onde a posição entrou e saiu." />
+        <Help text="Velas do mercado onde a ordem foi executada (no testnet, o livro do Spot Testnet). Cinza: entrada. Vermelha: stop atual na Binance; com o stop móvel ela sobe junto com o maior preço (azul). Verde: alvo; no day trade é o TP1, onde metade é vendida e o stop do resto vai para o ponto de equilíbrio. Laranja: o prazo do day trade. Os marcadores mostram onde a posição entrou e saiu." />
       </p>
       {!trade.candles.length && <p className="text-neutral-500">Sem velas para este período.</p>}
       <div ref={node} className="h-96 w-full" />
@@ -520,6 +525,10 @@ type TradeMarks = {
   entryAt?: string | null;
   exitAt?: string | null;
   exitPrice?: number | null;
+  /** Label of the target line: "TP1" for a day trade's first target. */
+  targetLabel?: string;
+  /** A day trade's time limit, drawn as a vertical line. */
+  deadline?: string | null;
 };
 
 function positionOption(
@@ -535,11 +544,16 @@ function positionOption(
   const marks: { yAxis: number; name: string; lineStyle: { color: string }; label: { formatter: string } }[] = [];
   if (entry != null) marks.push({ yAxis: entry, name: "Entrada", lineStyle: { color: "#a3a3a3" }, label: { formatter: "Entrada" } });
   if (stop != null) marks.push({ yAxis: stop, name: "Stop", lineStyle: { color: "#dc2626" }, label: { formatter: "Stop" } });
-  if (target != null) marks.push({ yAxis: target, name: "Alvo", lineStyle: { color: "#16a34a" }, label: { formatter: "Alvo" } });
+  const targetLabel = extra.targetLabel ?? "Alvo";
+  if (target != null) marks.push({ yAxis: target, name: targetLabel, lineStyle: { color: "#16a34a" }, label: { formatter: targetLabel } });
   if (extra.peak != null) marks.push({ yAxis: extra.peak, name: "Topo", lineStyle: { color: "#2563eb" }, label: { formatter: "Topo" } });
   const points: { name: string; coord: [string, number]; value: string; itemStyle: { color: string } }[] = [];
   const entryAt = snap(block.t, extra.entryAt);
   if (entryAt >= 0 && entry != null) points.push({ name: "Entrada", coord: [labels[entryAt], entry], value: "E", itemStyle: { color: "#16a34a" } });
+  const deadlineAt = snap(block.t, extra.deadline);
+  const verticals = deadlineAt >= 0 && deadlineAt < labels.length - 1
+    ? [{ xAxis: labels[deadlineAt], name: "Prazo", lineStyle: { color: "#f59e0b" }, label: { formatter: "Prazo" } }]
+    : [];
   const exitAt = snap(block.t, extra.exitAt);
   if (exitAt >= 0 && extra.exitPrice != null) points.push({ name: "Saída", coord: [labels[exitAt], extra.exitPrice], value: "S", itemStyle: { color: "#dc2626" } });
   return {
@@ -553,7 +567,7 @@ function positionOption(
         ...candleStyle(),
         name: "Preço",
         data: block.candles,
-        markLine: { symbol: "none", data: marks },
+        markLine: { symbol: "none", data: [...marks, ...verticals] },
         markPoint: { data: points },
       },
     ],

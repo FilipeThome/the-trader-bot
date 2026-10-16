@@ -3,6 +3,8 @@ const strategies: Record<string, string> = {
   mean_reversion: "Mean Reversion",
   momentum: "Momentum",
   funding_carry: "Funding Carry",
+  intraday_momentum: "Day · Momento intradiário",
+  vwap_pullback: "Day · Pullback na VWAP",
 };
 
 const sides: Record<string, string> = {

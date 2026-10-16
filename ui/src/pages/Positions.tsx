@@ -7,6 +7,13 @@ import { PositionChart } from "../LiveCharts";
 import { sideName, strategyName } from "../labels";
 import { useBot } from "../store";
 
+/** "sai em 2h 15min" until a day trade's time limit, or "no prazo" once it passed. */
+function timeLeft(deadline: string): string {
+  const minutes = Math.round((new Date(deadline).getTime() - Date.now()) / 60000);
+  if (minutes <= 0) return "no prazo: sai no próximo ciclo";
+  return `sai em ${Math.floor(minutes / 60)}h ${minutes % 60}min`;
+}
+
 export function Positions() {
   const positions = useBot((state) => state.positions);
   const perform = useBot((state) => state.perform);
@@ -48,7 +55,7 @@ export function Positions() {
               Stop<Help text="Preço do stop que fica na Binance. Se o mercado chegar aqui, a corretora vende mesmo com o robô desligado." />
             </th>
             <th className="pr-3 font-medium">
-              Alvo<Help text="Preço em que o robô pretende realizar o ganho." />
+              Alvo<Help text="Preço em que o robô pretende realizar o ganho. No day trade é o TP1: metade da posição é vendida ali e o stop do resto sobe para o preço de entrada mais as taxas." />
             </th>
             <th className="pr-3 font-medium">
               Desde<Help text="Data e hora em que a posição foi aberta." />
@@ -71,8 +78,13 @@ export function Positions() {
               <td className="pr-3">{row.qty}</td>
               <td className="pr-3">{row.avg_price}</td>
               <td className="pr-3">{row.stop_price ?? "—"}</td>
-              <td className="pr-3">{row.target_price ?? "—"}</td>
-              <td className="pr-3">{row.opened_at}</td>
+              <td className="pr-3">
+                {row.exit_policy === "day" ? (row.tp1_done ? "TP1 feito · stop no equilíbrio" : `TP1 ${row.target_price ?? "—"}`) : row.target_price ?? "—"}
+              </td>
+              <td className="pr-3">
+                {row.opened_at}
+                {row.exit_policy === "day" && row.exit_deadline && <span className="block text-neutral-500">{timeLeft(row.exit_deadline)}</span>}
+              </td>
               <td>
                 <Link className="mr-3 underline" to={`/trade/${row.id}`} onClick={(event) => event.stopPropagation()}>
                   ao vivo

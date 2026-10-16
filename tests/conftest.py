@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Iterator
 
 import pytest
+
+from fake_venue import venue  # noqa: F401 - the scripted Binance fixture for executor tests
 from fastapi.testclient import TestClient
 
 from bot.exchange.execution.journal import reset_journal_cache

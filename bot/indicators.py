@@ -62,3 +62,21 @@ def regime(frame: pd.DataFrame, strength: pd.Series | None = None) -> str:
     if float(frame["close"].iloc[-1]) >= float(slow.iloc[-1]):
         return "trend_up"
     return "trend_down"
+
+
+def session_vwap(frame: pd.DataFrame, min_bars: int = 4) -> pd.Series | None:
+    """VWAP anchored at 00:00 UTC of each bar's day: typical price times volume.
+
+    Returns the series for every bar, or None when the last bar's day has
+    fewer than ``min_bars`` bars (right after midnight the VWAP is one bar).
+    The index must be timezone-aware.
+    """
+    if frame.empty:
+        return None
+    day = frame.index.normalize()
+    if int((day == day[-1]).sum()) < min_bars:
+        return None
+    typical = (frame["high"] + frame["low"] + frame["close"]) / 3
+    weighted = (typical * frame["volume"]).groupby(day).cumsum()
+    volume = frame["volume"].groupby(day).cumsum()
+    return weighted / volume.replace(0, np.nan)

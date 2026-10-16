@@ -32,6 +32,8 @@ class Momentum:
     id = "momentum"
     timeframes = ("4h",)
     markets = ("spot",)
+    style = "swing"
+    history_days = 365
 
     def evaluate(self, symbol: str, timeframe: str, frame: pd.DataFrame) -> Setup | None:
         if timeframe not in self.timeframes or len(frame) < MIN_BARS:

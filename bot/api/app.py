@@ -28,7 +28,8 @@ from bot.exchange import service
 from bot.exchange.weight import weight_pressure
 from bot.features import build_features, ensure_chart_data
 from bot.live.halt import clear_halt
-from bot.mandate_io import commit_mandate_for, mandate_is_restricted
+from bot.mandate_io import ORDERS_PER_DAY_ENTRY, commit_mandate_for, mandate_is_restricted
+from bot.strategies.day import DAY
 from bot.markets import CHART_LEAD, chart_interval, merge_symbols, top_liquid_usdt, tradable_symbols, venue_klines, venue_symbols
 from bot.paths import pin_mode_root
 from bot.promotion import switch_to_production
@@ -36,13 +37,12 @@ from bot.recommend import recommendations
 from bot.reports import append_ledger, build_daily_report, verify_ledger
 from bot.runtime import Runtime, mode_root, profile_for
 from bot.store import Store
-from bot.strategies import STRATEGIES
+from bot.strategies import DAY_STRATEGIES, STRATEGIES, validated_for
 
 logger = logging.getLogger(__name__)
 hub = EventHub()
 ctx = BotContext()
 #: History each validation timeframe replays: about 4,300 to 5,800 candles.
-_HISTORY_DAYS = {"15m": 60, "1h": 180, "4h": 365}
 #: Liquid pairs read for the "top" preset; the venue filter keeps the first ``count`` it can trade.
 _TOP_POOL = 60
 #: Single flight for the recommendations scan.
@@ -54,7 +54,17 @@ _CHART_TAIL = timedelta(minutes=15)
 _TRADE_FIELDS = (
     "id", "symbol", "strategy", "side", "status", "qty", "avg_price", "stop_price", "target_price",
     "peak_price", "exit_policy", "opened_at", "closed_at", "exit_price", "realized_pnl", "reason", "test_only",
+    "exit_deadline", "tp1_done",
 )
+#: The day-trade preset: research-backed defaults (docs/plano-day-trade.md), editable afterwards.
+DAY_PRESET_LIMITS: dict[str, float | int] = {
+    "risk_per_trade_pct": 0.005,
+    "max_daily_loss_pct": 0.02,
+    "max_trades_per_day": 8,
+    "pair_cooldown_minutes": 60,
+    "loss_guard_trades": 3,
+}
+DAY_PRESET_FIELDS: dict[str, float] = {"cost_multiple": 3.0, "min_reward_risk": 1.2}
 
 
 @asynccontextmanager
@@ -203,7 +213,8 @@ def status() -> dict[str, Any]:
         "symbols": runtime.config.symbols,
         "strategies": runtime.config.strategies,
         "validated": {
-            row["strategy_id"]: not row["signal_only"] and row["params"].get("exit_policy") == runtime.config.exit_policy
+            row["strategy_id"]: not row["signal_only"]
+            and validated_for(row["params"], row["strategy_id"], runtime.config.exit_policy)
             for row in store.strategies()
         },
         "validations": _validation_jobs(runtime.config.mode),
@@ -499,19 +510,25 @@ def _update_job(key: tuple[str, str], **fields: Any) -> None:
 def _run_validation(key: tuple[str, str], strategy_id: str, config: BotConfig, root: Any) -> None:
     from bot.backtest.loaders.registry import resolve_loader
 
-    timeframe = STRATEGIES[strategy_id].timeframes[0]
+    strategy = STRATEGIES[strategy_id]
+    timeframe = strategy.timeframes[0]
     end = datetime.now(timezone.utc)
-    start = end - timedelta(days=_HISTORY_DAYS.get(timeframe, 180))
+    start = end - timedelta(days=strategy.history_days)
     try:
-        frames = resolve_loader("crypto").fetch(
+        loader = resolve_loader("crypto")
+        frames = loader.fetch(
             list(config.symbols),
             start.isoformat(),
             end.isoformat(),
             interval=timeframe,
             on_symbol=lambda _symbol, done: _update_job(key, done=done),
         )
+        hourly = None
+        if strategy_id in DAY_STRATEGIES:
+            # The 1h trend filter replays on real 1h bars, with a few extra days to warm EMA 50.
+            hourly = loader.fetch(list(config.symbols), (start - timedelta(days=5)).isoformat(), end.isoformat(), interval="1h")
         _update_job(key, stage="calculando")
-        result = validate_strategy(strategy_id, frames, timeframe, exit_policy=config.exit_policy)
+        result = validate_strategy(strategy_id, frames, timeframe, exit_policy=config.exit_policy, hourly_frames=hourly)
         store = Store(root / "bot.sqlite")
         try:
             store.save_strategy(
@@ -567,6 +584,69 @@ def choose_symbols(body: SymbolChoice) -> dict[str, Any]:
         rebound = _bind(config)
         rebound._ledger("symbols", {"preset": body.preset, "symbols": symbols, "left_out": left_out})
         return {"status": "ok", "symbols": symbols, "left_out": left_out}
+
+
+def _day_preset(current: BotConfig) -> BotConfig:
+    """The current config with the day-trade limits, the day strategies on and the swing ones off."""
+    data = current.model_dump()
+    data["limits"] = {**data["limits"], **DAY_PRESET_LIMITS}
+    data.update(DAY_PRESET_FIELDS)
+    data["strategies"] = {name: name in DAY_STRATEGIES for name in data["strategies"]}
+    return BotConfig.model_validate(data)
+
+
+def _preset_preview(current: BotConfig, preset: BotConfig) -> dict[str, Any]:
+    """What the preset changes, and what an order can really be under it."""
+    before, after = current.model_dump(), preset.model_dump()
+    changes = [
+        {"field": f"limits.{name}", "from": before["limits"][name], "to": after["limits"][name]}
+        for name in DAY_PRESET_LIMITS
+        if before["limits"][name] != after["limits"][name]
+    ]
+    changes += [
+        {"field": name, "from": before[name], "to": after[name]} for name in DAY_PRESET_FIELDS if before[name] != after[name]
+    ]
+    changes += [
+        {"field": f"strategies.{name}", "from": before["strategies"].get(name), "to": on}
+        for name, on in after["strategies"].items()
+        if before["strategies"].get(name) != on
+    ]
+    capital = preset.capital_for_sizing()
+    order_cap = capital * preset.limits.max_order_notional_pct
+    # At the narrowest day stop, the risk per trade asks for this notional; the order cap may cut it.
+    wanted = capital * preset.limits.risk_per_trade_pct / DAY.min_stop_pct
+    return {
+        "changes": changes,
+        "order_cap_usd": round(order_cap, 2),
+        "risk_notional_usd": round(wanted, 2),
+        "capped_by_order_cap": wanted > order_cap,
+        "mandate_orders_per_day": ORDERS_PER_DAY_ENTRY * preset.limits.max_trades_per_day,
+    }
+
+
+@app.get("/bot/presets/day")
+def day_preset_preview() -> dict[str, Any]:
+    current = _runtime().config
+    return _preset_preview(current, _day_preset(current))
+
+
+@app.post("/bot/presets/day")
+def apply_day_preset() -> dict[str, Any]:
+    """Apply the day-trade preset and reconfirm the mandate: a day trade needs more orders a day."""
+    with ctx.lock:
+        runtime = _runtime()
+        current = runtime.config
+        try:
+            preset = _day_preset(current)
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=_validation_detail(exc)) from exc
+        preview = _preset_preview(current, preset)
+        # The mandate first: if it cannot be written, the config does not move either.
+        commit_mandate_for(preset)
+        preset.save()
+        rebound = _bind(preset)
+        rebound._ledger("day_preset", {"changes": preview["changes"]})
+        return {"status": "ok", **preview}
 
 
 @app.put("/bot/config")

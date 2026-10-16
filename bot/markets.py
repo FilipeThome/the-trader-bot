@@ -23,10 +23,11 @@ _LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR")
 _MAX_AGE_SECONDS = 3600
 #: The Spot Testnet lists its own subset of pairs; testnet orders only reach those.
 TESTNET_SPOT = "https://testnet.binance.vision"
-#: Trades a testnet pair needs in 24h, about one every 4 seconds. The order gate
+#: Trades a testnet pair needs in 24h, about one every 6 seconds. The order gate
 #: refuses a ticker older than 15 seconds, and the ticker time is the last trade,
 #: so a thinner testnet book leaves stops and exits refused as ``quote_stale``.
-TESTNET_MIN_TRADES = 20_000
+#: Measured 2026-10-16: BTC 73k, ETH 29k, SOL 18k; the next pair (DOGE) had 8.5k.
+TESTNET_MIN_TRADES = 15_000
 #: Liquid pairs ranked by momentum, and the days of the momentum return.
 RANK_POOL = 40
 MOMENTUM_DAYS = 28

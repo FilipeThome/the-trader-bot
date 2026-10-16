@@ -33,6 +33,12 @@ def regime_factor(strategy_id: str, regime: str, direction: float) -> float:
         return 1.0 if regime == "trend_up" else 0.5
     if strategy_id == "funding_carry":
         return 1.0 if regime == "funding" else 0.0
+    if strategy_id in ("intraday_momentum", "vwap_pullback"):
+        # The setup already requires the closed 1h bars to trend up; the regime is
+        # read on them, so "range" means a trend without ADX strength.
+        if direction <= 0 or regime == "trend_down":
+            return 0.0
+        return 1.0 if regime == "trend_up" else 0.7
     return 0.0
 
 

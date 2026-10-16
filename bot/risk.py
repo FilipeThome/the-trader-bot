@@ -80,7 +80,8 @@ class RiskManager:
 
         ``p`` is the strategy's estimated hit rate and ``b`` the payoff per unit
         risked, net return over stop distance. ``b`` is the target's payoff; with
-        the trailing stop the target is never an exit, so this is an upper bound.
+        the trailing stop the target is never an exit, so this is an upper bound,
+        and for a day trade it is the payoff of the first target (TP1) leg.
         ``None`` when it does not apply: Kelly off, a test row, or no hit rate.
         """
         if self.limits.kelly_fraction <= 0 or opportunity.test_only or opportunity.win_rate is None:
