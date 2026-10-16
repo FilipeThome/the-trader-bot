@@ -13,6 +13,8 @@ class MeanReversion:
     id = "mean_reversion"
     timeframes = ("15m", "1h")
     markets = ("spot",)
+    style = "swing"
+    history_days = 60
 
     def evaluate(self, symbol: str, timeframe: str, frame: pd.DataFrame) -> Setup | None:
         if timeframe not in self.timeframes or len(frame) < 40:

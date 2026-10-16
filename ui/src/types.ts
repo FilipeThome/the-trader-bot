@@ -36,6 +36,18 @@ export type Position = {
   stop_price: number | null;
   target_price: number | null;
   opened_at: string;
+  exit_policy?: string | null;
+  /** Day trades: when the rest leaves, and whether the first target was sold. */
+  exit_deadline?: string | null;
+  tp1_done?: number;
+};
+
+export type DayPreset = {
+  changes: { field: string; from: unknown; to: unknown }[];
+  order_cap_usd: number;
+  risk_notional_usd: number;
+  capped_by_order_cap: boolean;
+  mandate_orders_per_day: number;
 };
 
 export type Market = { symbol: string; base: string; quote: string };
@@ -107,6 +119,8 @@ export type Trade = {
     realized_pnl: number | null;
     reason: string | null;
     test_only: number;
+    exit_deadline?: string | null;
+    tp1_done?: number;
   };
   interval: string;
   candles: { t: string; o: number; h: number; l: number; c: number }[];

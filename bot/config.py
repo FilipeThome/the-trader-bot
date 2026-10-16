@@ -26,7 +26,14 @@ DEFAULT_SYMBOLS = ("BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT")
 MAX_SYMBOLS = 20
 _SYMBOL = re.compile(r"^[A-Z0-9]{2,20}/USDT$")
 #: Every strategy id the engine knows, off until the operator turns it on.
-DEFAULT_STRATEGIES = {"trend": False, "mean_reversion": False, "momentum": False, "funding_carry": False}
+DEFAULT_STRATEGIES = {
+    "trend": False,
+    "mean_reversion": False,
+    "momentum": False,
+    "funding_carry": False,
+    "intraday_momentum": False,
+    "vwap_pullback": False,
+}
 
 
 def is_usdt_pair(symbol: str) -> bool:

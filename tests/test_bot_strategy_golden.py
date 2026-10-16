@@ -65,3 +65,65 @@ GOLDEN = {
 def test_a_strategy_finds_the_same_setups_as_before(strategy_id: str) -> None:
     strategy, timeframe, freq = CASES[strategy_id]
     assert digest(strategy, timeframe, candles(900, 7, freq)) == GOLDEN[strategy_id]
+
+
+def trades_digest(strategy_id: str, timeframe: str, freq: str, policy: str) -> tuple[int, str]:
+    from bot.backtest.runner import simulate
+
+    trades = simulate(strategy_id, "BTC/USDT", candles(900, 7, freq), timeframe, exit_policy=policy)
+    return len(trades), hashlib.sha256(repr([(t.exit_time, t.net_return) for t in trades]).encode()).hexdigest()
+
+
+TRADES_GOLDEN = {
+    ("mean_reversion", "target"): (14, "eac8bd6df4e9b4237d2a436df469cc1eab570a61030ad7254fe54f223d3a72cb"),
+    ("mean_reversion", "trailing"): (16, "78e792d4ce1489e51200cc5e56ef9c96e0cf262007473c374c7f52edf4084bd1"),
+    ("momentum", "target"): (16, "18e5da71cbdf4711a1d92ddb1467a3dafd41c846b16be8ab80b167cacc928121"),
+    ("momentum", "trailing"): (7, "a3557ba41f16bda0cdb113acce3cc69749698cf35e77e6672c3da4bf9c293f0f"),
+    ("trend", "target"): (13, "e8715555ac0876c58cf488e8faf9844c2f9fd6c153148235c8f12be0efa22b28"),
+    ("trend", "trailing"): (8, "c404e774bf4450954d4dfabf8ab171b4fdbe51d58b850b1f52abda4bde8a2bec"),
+}
+
+
+@pytest.mark.parametrize(("strategy_id", "policy"), sorted(TRADES_GOLDEN))
+def test_a_replay_without_day_rules_trades_as_before(strategy_id: str, policy: str) -> None:
+    _strategy, timeframe, freq = CASES[strategy_id]
+    assert trades_digest(strategy_id, timeframe, freq, policy) == TRADES_GOLDEN[(strategy_id, policy)]
+
+
+def day_digests(strategy_id: str) -> tuple[tuple[int, str], tuple[int, str]]:
+    """Setups on every closed 15m window (with the closed 1h bars) and the day replay's trades."""
+    from bot.backtest.runner import simulate
+    from bot.strategies import STRATEGIES
+    from bot.strategies.day import closed_hourly
+
+    m15 = candles(1500, 7, "15min")
+    hourly = candles(500, 7, "h")
+    setups = []
+    for end in range(60, len(m15) + 1):
+        window = m15.iloc[max(0, end - WINDOW) : end]
+        found = STRATEGIES[strategy_id].evaluate(
+            "BTC/USDT", "15m", window, hourly=closed_hourly(hourly, window.index[-1] + pd.Timedelta(minutes=15), 299)
+        )
+        setups.append(None if found is None else asdict(found))
+    trades = simulate(strategy_id, "BTC/USDT", m15, "15m", hourly=hourly)
+    return (
+        (sum(1 for setup in setups if setup is not None), hashlib.sha256(repr(setups).encode()).hexdigest()),
+        (len(trades), hashlib.sha256(repr([(t.exit_time, t.net_return) for t in trades]).encode()).hexdigest()),
+    )
+
+
+DAY_GOLDEN = {
+    "intraday_momentum": (
+        (25, "44ffdc94773c51dd9ca7593747c56db5dabb8247213bfda1fe10847413ba9900"),
+        (10, "3e65dc1795059ada3182dbed622f3f62b4b7951c7499c87701aea04f96e67d9b"),
+    ),
+    "vwap_pullback": (
+        (27, "fa0da2f17c1aa0921a2129604737096589ef4ad89ebcc5b7f28bf93c37465d98"),
+        (14, "00a0df9be35430fb32dcccd7401344209a4292ef6d604cd426390773ab3004ef"),
+    ),
+}
+
+
+@pytest.mark.parametrize("strategy_id", sorted(DAY_GOLDEN))
+def test_a_day_strategy_finds_and_trades_the_same_as_before(strategy_id: str) -> None:
+    assert day_digests(strategy_id) == DAY_GOLDEN[strategy_id]

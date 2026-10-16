@@ -13,6 +13,8 @@ class TrendBreakout:
     id = "trend"
     timeframes = ("1h", "4h")
     markets = ("spot", "usdm")
+    style = "swing"
+    history_days = 180
 
     def evaluate(self, symbol: str, timeframe: str, frame: pd.DataFrame) -> Setup | None:
         if timeframe not in self.timeframes or len(frame) < 60:

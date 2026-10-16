@@ -45,7 +45,18 @@ from bot.paths import base_runtime_root
 from bot.reports import append_ledger
 from bot.risk import LOSS_GUARD_WINDOW, RiskManager, allocate, protect, utc_day
 from bot.store import Store
-from bot.strategies import STRATEGIES, FundingCarry, Momentum, Strategy, TrendBreakout
+from bot.strategies import (
+    STRATEGIES,
+    FundingCarry,
+    IntradayMomentum,
+    Momentum,
+    Strategy,
+    TrendBreakout,
+    VwapPullback,
+    exit_policy_for,
+    validated_for,
+)
+from bot.strategies.day import in_quiet_hours
 from bot.strategies.base import Setup
 
 logger = logging.getLogger(__name__)
@@ -449,12 +460,39 @@ class Runtime:
                 self._ledger("trail", {"symbol": position["symbol"], "position_id": position["id"]})
 
     def _exits(self, snapshot: MarketSnapshot, moment: datetime) -> None:
-        for position in self.store.open_positions():
+        positions = self.store.open_positions()
+        reserve = 1 + len(positions)
+        for position in positions:
+            if self._policy(position) == "day":
+                self._day_exit(position, snapshot, moment, reserve)
+                continue
             reason = _exit_reason(position, snapshot, moment, use_target=self._policy(position) != "trailing")
             if reason is None:
                 continue
             result = self.executor.exit_position(position["id"], reason)
             self._ledger("exit", {"symbol": position["symbol"], "reason": reason, "status": result.get("status")})
+
+    def _day_exit(self, position: dict[str, Any], snapshot: MarketSnapshot, moment: datetime, reserve: int) -> None:
+        """A day trade leaves at its time limit; before that, its first target sells part of it.
+
+        The first target triggers on the close of the last closed 15m bar, as the
+        backtest replays it; the stop at the broker covers everything else.
+        """
+        deadline = position.get("exit_deadline")
+        if deadline and moment >= datetime.fromisoformat(str(deadline)):
+            result = self.executor.exit_position(position["id"], "tempo máximo do day trade")
+            self._ledger("exit", {"symbol": position["symbol"], "reason": "day_deadline", "status": result.get("status")})
+            return
+        target = position.get("target_price")
+        if position.get("tp1_done") or not target:
+            return
+        frame = _closed(snapshot, position["symbol"], "15m", moment)
+        if frame is None or float(frame["close"].iloc[-1]) < float(target):
+            return
+        outcome = self.executor.take_profit(position["id"], reserve=reserve)
+        if outcome in ("vendido", "concluído"):
+            # A waiting first target is retried every cycle; only what happened goes to the ledger.
+            self._ledger("take_profit", {"symbol": position["symbol"], "position_id": position["id"], "outcome": outcome})
 
     def _decay(self, moment: datetime) -> None:
         day = utc_day(moment)
@@ -513,22 +551,22 @@ class Runtime:
                     self._decided.pop((symbol, strategy_id), None)
                     continue
                 stats = self.store.strategy(strategy_id)
-                # A validation run under another exit rule does not validate this one.
-                signal_only = (
-                    bool(stats["signal_only"]) or stats["params"].get("exit_policy") != self.config.exit_policy
-                    if stats
-                    else True
-                )
+                policy = exit_policy_for(strategy_id, self.config.exit_policy)
+                # A validation run under other exit rules does not validate these.
+                matches = stats is not None and validated_for(stats["params"], strategy_id, self.config.exit_policy)
+                signal_only = stats is None or bool(stats["signal_only"]) or not matches
                 win_rate, win_rate_n = estimate_win_rate(
-                    stats["params"] if stats else None,
-                    self.store.strategy_outcomes(strategy_id, self.config.exit_policy),
-                    exit_policy=self.config.exit_policy,
+                    stats["params"] if stats and matches else None,
+                    self.store.strategy_outcomes(strategy_id, policy),
+                    exit_policy=policy,
                     min_sample=self.config.min_win_rate_sample,
                 )
                 stale = snapshot.stale(symbol, _price_interval(setup.timeframe), now=moment)
+                quiet = policy == "day" and in_quiet_hours(moment)
                 draft = classify(
                     setup,
                     slippage=snapshot.slippage(symbol, 1000),
+                    blocked_reason="hora sem liquidez: sem entrada de day trade entre 03:00 e 07:00 UTC" if quiet else None,
                     ignored=(symbol, strategy_id) in ignored,
                     in_position=(symbol, strategy_id) in live,
                     score_threshold=self.config.score_threshold,
@@ -567,7 +605,7 @@ class Runtime:
                 price = _last_price(snapshot, symbol, setup.timeframe)
                 if price and draft.direction > 0:
                     draft.stop_price = price * (1 - draft.risk_pct)
-                    draft.target_price = price * (1 + max(draft.gross_return, 0))
+                    draft.target_price = price * (1 + max(setup.target_pct, 0))
                 ranked.append(draft)
                 if self._decided.get((symbol, strategy_id)) != (draft.status, draft.reason):
                     self.store.add_decision(
@@ -639,6 +677,13 @@ def _unrealized(positions: list[dict[str, Any]], snapshot: MarketSnapshot) -> fl
 def _setup(
     strategy: Strategy, symbol: str, snapshot: MarketSnapshot, funding_threshold: float, moment: datetime
 ) -> Setup | None:
+    if isinstance(strategy, (IntradayMomentum, VwapPullback)):
+        # 15m entries filtered by the closed 1h bars (bot.strategies.day).
+        entry = _closed(snapshot, symbol, "15m", moment)
+        if entry is None:
+            return None
+        day_setup: Setup | None = strategy.evaluate(symbol, "15m", entry, hourly=_closed(snapshot, symbol, "1h", moment))
+        return day_setup
     if isinstance(strategy, FundingCarry):
         frame = _closed(snapshot, symbol, "1h", moment)
         if frame is None:

@@ -46,6 +46,43 @@ Ficou de fora, por falta de evidência ou por risco de execução: filtro de mer
 
 Fontes: [Freqtrade, proteções](https://www.freqtrade.io/en/stable/plugins/#protections); [NautilusTrader, motor de risco](https://nautilustrader.io/docs/python-api-latest/risk.html); [Hummingbot, kill switch](https://hummingbot.org/client/global-configs/kill-switch/); [Coin Bureau, risco por trade e calor da carteira](https://coinbureau.com/guides/risk-management-strategies-crypto-trading); [Rozario et al., arXiv 2009.12155](https://arxiv.org/abs/2009.12155v1); [Liu, Tsyvinski e Wu, NBER w25882](https://www.nber.org/papers/w25882.pdf); [Time series and cross sectional momentum in the cryptocurrency market, AUT](https://acfr.aut.ac.nz/__data/assets/pdf_file/0009/918729/Time_Series_and_Cross_Sectional_Momentum_in_the_Cryptocurrency_Market_with_IA.pdf); [Man Group, Crypto: too hot to handle](https://www.man.com/insights/crypto-too-hot-to-handle); [Volatility-managed crypto momentum, Springer 2025](https://link.springer.com/article/10.1007/s11408-025-00474-9).
 
+## Day trade
+
+Duas estratégias de janela curta, que ligam e desligam como as outras: **Day · Momento intradiário** (`intraday_momentum`) e **Day · Pullback na VWAP** (`vwap_pullback`). O desenho, as fontes e a revisão do architect estão em [docs/plano-day-trade.md](docs/plano-day-trade.md).
+
+- **Entrada:** só compra. Entra numa vela fechada de 15 min, e só com as velas fechadas de 1 h em alta (EMA 20 acima da 50, fechamento acima da 50). Não entra entre 03:00 e 07:00 UTC, as horas de livro mais fino.
+- **Stop:** 1,5 ATR do 15 min, com piso de 1%. Abaixo disso, o custo de ida e volta (cerca de 0,25%) comeria mais de um quarto do risco.
+- **Saída:**
+  - No TP1 (1,5 vez o risco), metade é vendida e o stop do resto sobe para o preço de entrada mais 0,2%.
+  - O que sobrar sai em até 6 horas.
+  - O "equilíbrio" é um stop-limit com folga de 0,5%: num movimento rápido ele pode executar cerca de 0,3% abaixo da entrada, ou não executar num gap.
+- **Filtros:** o score e os filtros de custo e de ganho/risco medem o TP1, o alvo em R do trade. Só o gate do backtest mede o resultado real das duas metades.
+- **Ordens:** um day trade gasta até 5 ordens (entrada, stop, TP1, novo stop, saída). Com uma estratégia day ligada, o mandato conta 6 por entrada.
+- **Validação:** 90 dias de velas de 15 min e de 1 h, com as mesmas regras de saída. O gate é mais exigente que o do swing, porque com muitos trades o Sharpe por trade fica fácil:
+  - Sharpe dos retornos diários acima de 1;
+  - pelo menos 30 trades;
+  - retorno médio líquido de pelo menos 0,10% por trade;
+  - drawdown abaixo de 20%;
+  - as duas metades do histórico lucrando.
+
+  A validação vale só para as regras que replicou.
+- **Preset:** "Aplicar preset de day trade" (Controles) mostra o que muda e só então grava:
+  - liga as estratégias day e desliga as swing;
+  - risco de 0,5% por trade;
+  - perda diária de 2%;
+  - até 8 trades por dia;
+  - pausa de 60 min no par depois de uma perda;
+  - alvo de pelo menos 3x o custo;
+  - reconfirma o mandato.
+
+**O que a evidência diz.** A maioria dos day traders perde depois dos custos: menos de 1% lucra de forma previsível em Taiwan, e 97% de quem insistiu perdeu no Brasil. Nenhum estudo revisado por pares mostra day trade só comprado em cripto spot lucrativo depois de 0,2% por ida e volta.
+
+O backtest de 90 dias até 2026-10-16 confirmou isso nas duas estratégias:
+- **Pares do testnet (BTC, ETH, SOL):** todos perderam.
+- **Pares voláteis (AVAX, ZEC, INJ, NEAR, STRK, TIA):** só o momento intradiário em INJ passou, 1 de 18 testes, o que se espera do acaso.
+
+O robô não opera de verdade o que não passa no gate; no testnet, o modo teste deixa exercitar o fluxo.
+
 ## Operação
 
 1. Python 3.12 e Node 22. Na raiz:

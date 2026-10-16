@@ -12,6 +12,8 @@ const strategyHelp: Record<string, string> = {
   momentum: "Momentum compra o que vem subindo de forma constante: alta nos últimos 20 dias em velas de 4h, média de 20 acima da de 50 e tendência firme (ADX). Seguir a tendência só na compra é o efeito com mais evidência em cripto. O stop fica a 2,5 vezes a volatilidade e a posição sai pelo stop móvel ou quando a média de 20 cruza abaixo da de 50. Só opera depois que o teste histórico (365 dias) libera.",
   mean_reversion: "Mean Reversion procura preço que se afastou demais da média e pode voltar. Funciona melhor quando o mercado está de lado. Só opera depois que o teste histórico libera.",
   funding_carry: "Funding Carry compara o custo de segurar um contrato futuro com o preço à vista. Nesta fase o robô só mostra o sinal: ele não envia essa operação.",
+  intraday_momentum: "Day trade. Compra no 15 min quando o preço rompe a máxima das últimas 8 velas com volume 1,5x acima do normal, acima da VWAP do dia, e só com o 1h em alta. Stop de 1,5 ATR (no mínimo 1%). Vende metade em 1,5x o risco e leva o stop do resto para o preço de entrada mais as taxas; o que sobrar sai em até 6 horas. Não entra entre 03:00 e 07:00 UTC. Só opera depois do teste histórico (90 dias).",
+  vwap_pullback: "Day trade. Compra no 15 min quando o preço recua abaixo da VWAP do dia ou da média de 20 e volta para cima, com RSI entre 35 e 55, e só com o 1h em alta. Mesmas regras de saída do momento intradiário: metade em 1,5x o risco, stop no equilíbrio, saída em até 6 horas. Só opera depois do teste histórico (90 dias).",
 };
 
 export function Controls() {
@@ -147,7 +149,15 @@ export function Controls() {
               <input
                 type="checkbox"
                 checked={enabled}
-                onChange={(event) => { const on = event.target.checked; void run(`${strategyName(name)} ${on ? "ligada" : "desligada"}`, () => api.updateConfig({ strategies: { [name]: on } })); }}
+                onChange={(event) => {
+                  const on = event.target.checked;
+                  const day = name === "intraday_momentum" || name === "vwap_pullback";
+                  void run(
+                    `${strategyName(name)} ${on ? "ligada" : "desligada"}`,
+                    () => api.updateConfig({ strategies: { [name]: on } }),
+                    () => (on && day ? `${strategyName(name)} ligada. Um day trade usa até 5 ordens: aplique o preset de day trade para reconfirmar o mandato.` : `${strategyName(name)} ${on ? "ligada" : "desligada"}`),
+                  );
+                }}
               />{" "}
               {strategyName(name)}
             </label>
@@ -161,6 +171,30 @@ export function Controls() {
             )}
           </span>
         ))}
+      </div>
+      <div className="rounded border border-neutral-300 p-3 dark:border-neutral-700">
+        <p className="mb-2 flex items-center font-medium">
+          Day trade
+          <Help text="Liga as duas estratégias de day trade, desliga as de swing e grava os limites usados por traders de intraday: risco de 0,5% por trade, perda diária máxima de 2%, até 8 trades por dia, pausa de 60 min no par depois de uma perda, alvo de pelo menos 3x o custo. O mandato é confirmado de novo, porque um day trade usa mais ordens por dia. Você vê o que muda antes de confirmar. Os estudos mostram que a maioria dos day traders perde depois dos custos: o robô só opera de verdade o que passar no teste histórico." />
+        </p>
+        <button
+          className="underline disabled:opacity-50"
+          type="button"
+          onClick={() =>
+            void run("Preset day trade", async () => {
+              const preview = await api.dayPreset();
+              const lines = preview.changes.map((change) => `${change.field}: ${String(change.from)} → ${String(change.to)}`);
+              const cap = preview.capped_by_order_cap
+                ? `\nO teto por ordem (US$ ${preview.order_cap_usd}) limita o tamanho: o risco de 0,5% pediria US$ ${preview.risk_notional_usd}.`
+                : "";
+              const text = `Aplicar o preset de day trade?\n\n${lines.join("\n") || "nada muda"}${cap}\nMandato: até ${preview.mandate_orders_per_day} ordens por dia.`;
+              if (!window.confirm(text)) throw new Error("cancelado");
+              return api.applyDayPreset();
+            }, () => "Preset de day trade aplicado e mandato confirmado")
+          }
+        >
+          Aplicar preset de day trade
+        </button>
       </div>
       <div className="rounded border border-neutral-300 p-3 dark:border-neutral-700">
         <p className="mb-2 flex items-center font-medium">

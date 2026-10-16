@@ -204,3 +204,22 @@ def test_a_day_report_reads_every_decision_of_that_day(tmp_path) -> None:
     for minute in range(10):
         store.add_decision({"ts": f"2026-10-15T10:{minute:02d}:00+00:00", "symbol": "BTC/USDT", **_ROW, "reason": "r"})
     assert len(store.decisions_on("2026-10-14")) == 30 and len(store.decisions_on("2026-10-15")) == 10
+
+
+def test_a_table_from_before_day_trades_gains_their_columns(tmp_path) -> None:
+    path = tmp_path / "bot.sqlite"
+    Store(path).close()
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        "ALTER TABLE positions DROP COLUMN tp1_done; ALTER TABLE positions DROP COLUMN keep_qty;"
+        "ALTER TABLE positions DROP COLUMN exit_deadline;"
+        "INSERT INTO positions (symbol, strategy, side, qty, avg_price, stop_price, opened_at, updated_at, status)"
+        " VALUES ('BTC/USDT', 'trend', 'buy', 1, 100, 98, 't', 't', 'open');"
+    )
+    connection.commit()
+    connection.close()
+    migrated = Store(path)
+    row = migrated.open_positions()[0]
+    assert row["tp1_done"] == 0 and row["keep_qty"] is None and row["exit_deadline"] is None
+    migrated.update_position(row["id"], tp1_done=1, keep_qty=0.5, exit_deadline="2026-10-16T18:00:00+00:00")
+    assert migrated.position(row["id"])["keep_qty"] == 0.5

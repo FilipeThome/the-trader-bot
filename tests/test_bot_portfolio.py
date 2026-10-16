@@ -102,7 +102,14 @@ def test_config_rejects_a_trade_risk_above_the_open_risk_and_fills_new_strategie
     with pytest.raises(ValidationError):
         BotConfig(auto_select_count=21)
     old = BotConfig.model_validate({"strategies": {"trend": True}})
-    assert old.strategies == {"trend": True, "mean_reversion": False, "momentum": False, "funding_carry": False}
+    assert old.strategies == {
+        "trend": True,
+        "mean_reversion": False,
+        "momentum": False,
+        "funding_carry": False,
+        "intraday_momentum": False,
+        "vwap_pullback": False,
+    }
 
 
 # -- allocation --------------------------------------------------------------

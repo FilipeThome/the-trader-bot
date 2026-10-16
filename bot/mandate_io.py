@@ -70,18 +70,24 @@ def commit_binance_mandate(
 
 #: Orders one bot entry may need: entry, stop, exit and one re-placed stop.
 ORDERS_PER_ENTRY = 4
+#: A day trade adds the first-target sale and the break-even stop.
+ORDERS_PER_DAY_ENTRY = 6
 
 
 def commit_mandate_for(config: "BotConfig") -> Path:
     """Write the mandate for the active mode from the operator limits."""
+    from bot.strategies import DAY_STRATEGIES
+
     capital = config.capital_for_sizing()
     limits = config.limits
+    day = any(config.strategies.get(strategy_id, False) for strategy_id in DAY_STRATEGIES)
+    per_entry = ORDERS_PER_DAY_ENTRY if day else ORDERS_PER_ENTRY
     return commit_binance_mandate(
         capital_usd=capital,
         max_order_notional_usd=capital * limits.max_order_notional_pct,
         max_total_exposure_usd=capital * limits.max_exposure_pct,
         max_leverage=limits.max_leverage,
-        max_trades_per_day=ORDERS_PER_ENTRY * limits.max_trades_per_day,
+        max_trades_per_day=per_entry * limits.max_trades_per_day,
         flatten_on_halt=config.flatten_on_halt,
     )
 

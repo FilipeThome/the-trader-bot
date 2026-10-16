@@ -69,7 +69,10 @@ CREATE TABLE IF NOT EXISTS positions (
     trail_pct REAL,
     exit_policy TEXT,
     test_only INTEGER NOT NULL DEFAULT 0,
-    entry_win_rate REAL
+    entry_win_rate REAL,
+    tp1_done INTEGER NOT NULL DEFAULT 0,
+    keep_qty REAL,
+    exit_deadline TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS positions_live ON positions(symbol, strategy)
     WHERE status IN ('pending', 'open');
@@ -139,6 +142,9 @@ _POSITION_FIELDS = frozenset(
         "reason",
         "peak_price",
         "trail_pct",
+        "tp1_done",
+        "keep_qty",
+        "exit_deadline",
     }
 )
 
@@ -149,6 +155,10 @@ _ADDED_POSITION_COLUMNS = (
     ("exit_policy", "TEXT"),
     ("test_only", "INTEGER NOT NULL DEFAULT 0"),
     ("entry_win_rate", "REAL"),
+    # Day trades: the first target was sold, the quantity a partial sale keeps, and the time limit.
+    ("tp1_done", "INTEGER NOT NULL DEFAULT 0"),
+    ("keep_qty", "REAL"),
+    ("exit_deadline", "TEXT"),
 )
 
 #: Buckets of the estimated hit rate at entry; manual entries have no floor, hence below 50%.
@@ -398,6 +408,7 @@ class Store:
         exit_policy: str | None = None,
         test_only: bool = False,
         entry_win_rate: float | None = None,
+        exit_deadline: str | None = None,
     ) -> int | None:
         """Reserve a live slot before the entry order. ``None`` when one already exists.
 
@@ -410,11 +421,11 @@ class Store:
                 cursor = self._conn.execute(
                     """INSERT INTO positions
                     (symbol, strategy, side, qty, avg_price, stop_price, target_price,
-                     opened_at, updated_at, status, exit_policy, test_only, entry_win_rate)
-                    VALUES (?, ?, 'buy', 0, 0, ?, ?, ?, ?, 'pending', ?, ?, ?)""",
+                     opened_at, updated_at, status, exit_policy, test_only, entry_win_rate, exit_deadline)
+                    VALUES (?, ?, 'buy', 0, 0, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
                     (
                         symbol, strategy, stop_price, target_price, stamp, stamp, exit_policy,
-                        1 if test_only else 0, entry_win_rate,
+                        1 if test_only else 0, entry_win_rate, exit_deadline,
                     ),
                 )
         except sqlite3.IntegrityError:

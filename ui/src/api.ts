@@ -1,4 +1,4 @@
-import type { Balance, CalibrationRow, Decision, Features, Market, Opportunity, PnlDay, Position, Recommendation, Status, Trade } from "./types";
+import type { Balance, CalibrationRow, DayPreset, Decision, Features, Market, Opportunity, PnlDay, Position, Recommendation, Status, Trade } from "./types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -61,6 +61,8 @@ export const api = {
     request(`/bot/strategies/${encodeURIComponent(strategy)}/validate`, { method: "POST" }),
   chooseSymbols: (preset: "top" | "default") =>
     request<{ symbols: string[]; left_out: string[] }>("/bot/symbols", { method: "POST", body: JSON.stringify({ preset }) }),
+  dayPreset: () => request<DayPreset>("/bot/presets/day"),
+  applyDayPreset: () => request<DayPreset & { status: string }>("/bot/presets/day", { method: "POST" }),
   updateConfig: (payload: Record<string, unknown>) =>
     request("/bot/config", { method: "PUT", body: JSON.stringify(payload) }),
 };

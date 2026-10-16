@@ -14,6 +14,7 @@ from bot.exchange import service
 from bot.executor import UnprotectedPosition
 from bot.live.halt import halt_flag_set
 from bot.paths import get_runtime_root, pin_mode_root
+from bot.strategies import STRATEGIES
 from bot.runtime import Runtime, mode_root
 from bot.store import Store
 from bot.strategies.base import Setup
@@ -175,7 +176,7 @@ def test_decay_runs_once_per_utc_day(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("bot.runtime.apply_decay", lambda _store, strategy_id, _returns: calls.append(strategy_id) or False)
     runtime.tick()
     runtime.tick()
-    assert sorted(calls) == ["funding_carry", "mean_reversion", "momentum", "trend"]
+    assert sorted(calls) == sorted(STRATEGIES)
 
 
 def test_the_mode_pin_is_seen_by_another_thread(tmp_path, monkeypatch) -> None:
