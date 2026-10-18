@@ -39,6 +39,9 @@ class FakeCollector:
     def refresh(self, symbols: list[str]) -> MarketSnapshot:
         return self.snapshot
 
+    def view(self) -> MarketSnapshot:
+        return self.snapshot
+
 
 class FakeExecutor:
     def __init__(self) -> None:
@@ -798,3 +801,44 @@ def test_a_leftover_row_of_a_pair_no_longer_analysed_is_refused(tmp_path, monkey
     runtime, _collector, executor = _runtime(tmp_path, monkeypatch, ["ETH/USDT"])
     result = runtime.execute_manual(_manual_opportunity())
     assert result["results"][0]["decision"] == "bloqueado" and executor.events == []
+
+
+def _day_ready(tmp_path, monkeypatch, wins: int) -> tuple[Runtime, FakeExecutor]:
+    from bot.strategies.day import DAY
+
+    runtime, collector, executor = _runtime(tmp_path, monkeypatch, entry_mode="auto", min_win_rate=0.95, min_reward_risk=1.2)
+    runtime.config.strategies.update(trend=False, intraday_momentum=True)
+    # Fresh 15m bars: a day row prices and checks staleness on them.
+    now = datetime.now(timezone.utc)
+    index = pd.DatetimeIndex([pd.Timestamp(now).floor("15min")])
+    bars = pd.DataFrame({"open": [100.0], "high": [101.0], "low": [99.0], "close": [100.0], "volume": [10.0]}, index=index)
+    collector.snapshot.candles[("BTC/USDT", "15m")] = Series(bars, now, "test")
+    monkeypatch.setattr("bot.runtime.in_quiet_hours", lambda *_a: False)
+    monkeypatch.setattr(
+        "bot.runtime._setup",
+        lambda *_a: Setup(
+            "intraday_momentum", "BTC/USDT", "15m", "Comprar", 1.0, 0.015, 0.004, 0.01, 0.015, "rompimento", "trend_up",
+            confidence=0.9,
+        ),
+    )
+    runtime.store.save_strategy(
+        {
+            "strategy_id": "intraday_momentum",
+            "signal_only": False,
+            "params": {"wins": wins, "trades": 69, "exit_policy": "day", "day": DAY.params},
+        }
+    )
+    runtime.store.set_state("running", True)
+    return runtime, executor
+
+
+def test_a_day_row_enters_above_its_first_target_breakeven_not_the_swing_floor(tmp_path, monkeypatch) -> None:
+    # 34 of 69 (Laplace 0.493) clears the TP1 break-even (about 0.44) plus 0.03, far below the 95% swing floor.
+    runtime, executor = _day_ready(tmp_path, monkeypatch, wins=34)
+    runtime.tick()
+    assert runtime.store.opportunities()[0]["status"] == "pronta"
+    assert "act:1" in executor.events
+    # 32 of 69 (Laplace 0.465) clears the break-even (about 0.44) but not the 0.03 margin above it.
+    weak, weak_executor = _day_ready(tmp_path / "weak", monkeypatch, wins=32)
+    weak.tick()
+    assert "act:0" in weak_executor.events

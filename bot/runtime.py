@@ -20,6 +20,7 @@ the configured capital, so a withdrawal does not read as a loss.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from dataclasses import dataclass
@@ -33,17 +34,34 @@ import pandas as pd
 from bot.collector import Collector, MarketSnapshot
 from bot.config import BotConfig, RiskLimits
 from bot.decay import apply_decay
-from bot.evaluator import Opportunity, classify, estimate_win_rate
+from bot.evaluator import SPOT_TAKER, Opportunity, classify, estimate_win_rate
 from bot.exchange import service
 from bot.exchange.weight import weight_pressure
 from bot.executor import Executor, UnprotectedPosition
 from bot.indicators import ema
+from bot.instances import (
+    ORDERS_PER_LEG,
+    DcaParams,
+    GridParams,
+    creation_problems,
+    dca_ladder,
+    dca_next,
+    dca_plan,
+    dca_stop,
+    grid_k_from_qty,
+    grid_levels,
+    grid_next,
+    grid_plan,
+    grid_qty,
+    instance_budget,
+    worst_case_loss,
+)
 from bot.live.halt import halt_flag_set, trip_halt
 from bot.live.mandate.store import load_mandate
 from bot.markets import merge_symbols, rank_promising, venue_symbols
 from bot.paths import base_runtime_root
 from bot.reports import append_ledger
-from bot.risk import LOSS_GUARD_WINDOW, RiskManager, allocate, protect, utc_day
+from bot.risk import LOSS_GUARD_WINDOW, RiskManager, allocate, breakeven_win_rate, open_risk, protect, utc_day
 from bot.store import Store
 from bot.strategies import (
     STRATEGIES,
@@ -56,7 +74,8 @@ from bot.strategies import (
     exit_policy_for,
     validated_for,
 )
-from bot.strategies.day import in_quiet_hours
+from bot.strategies.day import DAY_WIN_RATE_MARGIN, in_quiet_hours
+from bot.strategies.trailing import TRAILING_POLICIES
 from bot.strategies.base import Setup
 
 logger = logging.getLogger(__name__)
@@ -67,6 +86,11 @@ TESTABLE_BLOCKERS = frozenset({"score", "cost", "reward_risk", "regime"})
 _PRICE_INTERVALS = ("1m", "15m", "1h", "4h")
 #: Failed cycles in a row that trip the halt.
 MAX_FAILURES = 3
+#: Exit policies of DCA and grid inventory: their instance decides every exit.
+INSTANCE_POLICIES = frozenset({"dca", "grid"})
+#: How long an armed entry may wait for its trigger, in hours.
+MIN_ARM_HOURS = 1
+MAX_ARM_HOURS = 168
 _TREND = TrendBreakout()
 _MOMENTUM = Momentum()
 #: Days of decisions, signals and equity points kept in the store.
@@ -162,6 +186,12 @@ class Runtime:
                     flattened = [{"status": "error", "error": type(exc).__name__}]
             trip_halt(by, reason, broker="binance")
             self.store.set_state("halt_reason", reason)
+            # DCA and grid instances do not come back on resume: the operator starts them again.
+            # Positions they leave keep their resting stop and can be closed from the panel.
+            for instance in self.store.instances(live_only=True):
+                self.store.update_instance(
+                    int(instance["id"]), status="stopped", stopped_at=datetime.now(timezone.utc).isoformat(), reason=f"halt: {reason}"
+                )
             failed = [item for item in flattened if item.get("status") != "ok"]
             self._ledger("halt", {"reason": reason, "flattened": len(flattened), "flatten_failed": len(failed)})
             self.publish({"type": "halt", "reason": reason})
@@ -210,40 +240,535 @@ class Runtime:
         to keep its stop moving and its exits watched.
         """
         with self.lock:
-            if self.halted:
-                return {"results": [{"decision": "bloqueado", "reason": "halt ativo — retomada manual exigida"}], "cycle_started": False}
-            if self.retired:
-                # The mode switched while this request waited: the runtime root is the other mode's now.
-                return {"results": [{"decision": "bloqueado", "reason": "ambiente trocado; tente de novo"}], "cycle_started": False}
-            if opportunity.symbol not in self.config.symbols:
-                # A row left from before the pair list changed: its candles are no longer read.
-                reason = "par fora da lista analisada; aguarde o próximo ciclo"
-                return {"results": [{"decision": "bloqueado", "reason": reason}], "cycle_started": False}
-            if opportunity.status == "pronta" and opportunity.direction > 0:
-                self._protect([opportunity], datetime.now(timezone.utc))
-                if opportunity.status != "pronta" or not self._allocate([opportunity], self._free_cash()):
-                    self.store.add_decision(
-                        {
-                            "symbol": opportunity.symbol,
-                            "strategy": opportunity.strategy,
-                            "decision": "bloqueado",
-                            "reason": opportunity.reason,
-                            "manual": True,
-                        }
-                    )
-                    return {"results": [{"decision": "bloqueado", "reason": opportunity.reason}], "cycle_started": False}
-            try:
-                results = self.executor.act(
-                    [opportunity], clock_blocked=self.collector.snapshot.clock_blocked, manual=True
+            return self._enter_manual(opportunity)
+
+    def _enter_manual(self, opportunity: Opportunity) -> dict[str, Any]:
+        """``execute_manual`` under the lock; an armed entry fires through it too."""
+        if self.halted:
+            return {"results": [{"decision": "bloqueado", "reason": "halt ativo — retomada manual exigida"}], "cycle_started": False}
+        if self.retired:
+            # The mode switched while this request waited: the runtime root is the other mode's now.
+            return {"results": [{"decision": "bloqueado", "reason": "ambiente trocado; tente de novo"}], "cycle_started": False}
+        if opportunity.symbol not in self.config.symbols:
+            # A row left from before the pair list changed: its candles are no longer read.
+            reason = "par fora da lista analisada; aguarde o próximo ciclo"
+            return {"results": [{"decision": "bloqueado", "reason": reason}], "cycle_started": False}
+        if opportunity.status == "pronta" and opportunity.direction > 0:
+            self._protect([opportunity], datetime.now(timezone.utc))
+            if opportunity.status != "pronta" or not self._allocate([opportunity], self._free_cash()):
+                self.store.add_decision(
+                    {
+                        "symbol": opportunity.symbol,
+                        "strategy": opportunity.strategy,
+                        "decision": "bloqueado",
+                        "reason": opportunity.reason,
+                        "manual": True,
+                    }
                 )
+                return {"results": [{"decision": "bloqueado", "reason": opportunity.reason}], "cycle_started": False}
+        try:
+            results = self.executor.act(
+                [opportunity], clock_blocked=self.collector.snapshot.clock_blocked, manual=True
+            )
+        except UnprotectedPosition as exc:
+            self.halt(f"posição sem proteção: {exc}", flatten=False)
+            return {"results": [{"decision": "bloqueado", "reason": str(exc)}], "cycle_started": False}
+        started = False
+        entered = any(item.get("decision") in ("operar", "pendente") for item in results)
+        if entered and self.config.entry_mode == "manual" and not self.running:
+            started = self.start().get("status") == "ok"
+        return {"results": results, "cycle_started": started}
+
+    def arm_entry(self, symbol: str, strategy: str, trigger_price: float, hours: float) -> dict[str, Any]:
+        """Arm an entry that buys when the last price reaches ``trigger_price`` (Binance's start condition).
+
+        Below the last price it waits for a pullback, above it for a breakout. Nothing rests at the
+        broker: each cycle compares the last 15m close with the trigger and, once reached, enters
+        through the same checks as a manual entry, only while the row is still ``pronta``.
+        """
+        with self.lock:
+            if self.halted:
+                return {"status": "error", "error": "halt ativo — retomada manual exigida"}
+            if self.retired:
+                return {"status": "error", "error": "ambiente trocado; tente de novo"}
+            if symbol not in self.config.symbols:
+                return {"status": "error", "error": "par fora da lista analisada"}
+            if not self.config.strategies.get(strategy):
+                return {"status": "error", "error": "estratégia desligada"}
+            if not trigger_price > 0 or not MIN_ARM_HOURS <= hours <= MAX_ARM_HOURS:
+                return {"status": "error", "error": f"gatilho positivo e prazo entre {MIN_ARM_HOURS} e {MAX_ARM_HOURS} horas"}
+            if any(row["symbol"] == symbol and row["strategy"] == strategy for row in self.store.live_positions()):
+                return {"status": "error", "error": "já existe posição viva neste par e estratégia"}
+            price = _last_price(self.collector.view(), symbol, "15m")
+            if price is None:
+                return {"status": "error", "error": "preço do par indisponível"}
+            if trigger_price == price:
+                return {"status": "error", "error": "gatilho igual ao preço atual; use a entrada manual"}
+            condition = "below" if trigger_price < price else "above"
+            expires = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+            armed_id = self.store.arm_entry(symbol, strategy, trigger_price, condition, expires)
+            if armed_id is None:
+                return {"status": "error", "error": "já existe entrada armada neste par e estratégia"}
+            self._ledger("arm", {"symbol": symbol, "strategy": strategy, "trigger": trigger_price, "condition": condition})
+            started = False
+            if self.config.entry_mode == "manual" and not self.running:
+                started = self.start().get("status") == "ok"
+            return {"status": "ok", "id": armed_id, "condition": condition, "expires_at": expires, "cycle_started": started}
+
+    def disarm_entry(self, armed_id: int) -> dict[str, Any]:
+        with self.lock:
+            if not self.store.settle_armed(armed_id, "cancelled", "cancelada pelo operador"):
+                return {"status": "error", "error": "entrada armada não encontrada"}
+            return {"status": "ok"}
+
+    # -- DCA and grid instances ---------------------------------------------
+
+    def preview_instance(self, kind: str, symbol: str, params: DcaParams | GridParams) -> dict[str, Any]:
+        """The plan of an instance at the current price and every reason it cannot run. Creates nothing.
+
+        Read-only, so it runs without the runtime lock: its quote and rule reads never stall the
+        cycle or the panel. ``create_instance`` recomputes the plan under the lock before it acts.
+        """
+        return self._instance_plan(kind, symbol, params)
+
+    def create_instance(self, kind: str, symbol: str, params: DcaParams | GridParams) -> dict[str, Any]:
+        """Start a DCA or grid instance once its whole plan passes; its first buy goes at once."""
+        with self.lock:
+            if self.halted:
+                return {"status": "error", "error": "halt ativo — retomada manual exigida"}
+            if self.retired:
+                return {"status": "error", "error": "ambiente trocado; tente de novo"}
+            now = datetime.now(timezone.utc)
+            block = self._robot_buy_block(self.collector.view(), now, clock_blocked=self.collector.snapshot.clock_blocked)
+            if block is not None:
+                return {"status": "error", "error": block}
+            plan = self._instance_plan(kind, symbol, params)
+            if plan["status"] != "ok":
+                return plan
+            if plan["problems"]:
+                return {"status": "error", "error": "; ".join(plan["problems"]), "plan": plan}
+            price = float(plan["price"])
+            state: dict[str, Any] = {"legs": 0, "position_id": None}
+            state.update({"base_price": price, "filled": 0, "round": 0} if kind == "dca" else {"start_price": price})
+            instance_id = self.store.create_instance(kind, symbol, params.model_dump(), state)
+            if instance_id is None:
+                return {"status": "error", "error": f"já existe um robô {kind} neste par"}
+            self._ledger("instance_created", {"id": instance_id, "kind": kind, "symbol": symbol, "params": params.model_dump()})
+            instance = self.store.instance(instance_id)
+            assert instance is not None
+            try:
+                step = self._step_instance(instance, price, now)
             except UnprotectedPosition as exc:
                 self.halt(f"posição sem proteção: {exc}", flatten=False)
-                return {"results": [{"decision": "bloqueado", "reason": str(exc)}], "cycle_started": False}
+                return {"status": "error", "error": str(exc), "id": instance_id}
             started = False
-            entered = any(item.get("decision") in ("operar", "pendente") for item in results)
-            if entered and self.config.entry_mode == "manual" and not self.running:
+            if self.config.entry_mode == "manual" and not self.running:
                 started = self.start().get("status") == "ok"
-            return {"results": results, "cycle_started": started}
+            return {"status": "ok", "id": instance_id, "step": step, "cycle_started": started}
+
+    def stop_instance(self, instance_id: int) -> dict[str, Any]:
+        """Stop an instance and sell what it holds. While the sale cannot finish it stays ``stopping``."""
+        with self.lock:
+            instance = self.store.instance(instance_id)
+            if instance is None or instance["status"] not in ("active", "stopping"):
+                return {"status": "error", "error": "robô ativo não encontrado"}
+            if self.halted:
+                return {"status": "error", "error": "halt ativo — o stop segue na corretora"}
+            return self._stop_instance(instance_id, "parado pelo operador")
+
+    def _stop_instance(self, instance_id: int, reason: str) -> dict[str, Any]:
+        """Under the lock: mark the instance ``stopping`` and sell what it holds."""
+        self.store.update_instance(instance_id, status="stopping", reason=reason)
+        try:
+            outcome = self._wind_down(instance_id, reason)
+        except UnprotectedPosition as exc:
+            self.halt(f"posição sem proteção: {exc}", flatten=False)
+            return {"status": "error", "error": str(exc)}
+        current = self.store.instance(instance_id) or {}
+        return {"status": "ok", "instance_status": current.get("status"), "outcome": outcome}
+
+    def _instance_plan(self, kind: str, symbol: str, params: DcaParams | GridParams) -> dict[str, Any]:
+        profile = profile_for(self.config)
+        quote = self._quote(symbol)
+        if quote is None:
+            return {"status": "error", "error": "cotação do par indisponível"}
+        bid, ask, price = quote
+        spread = (ask - bid) / ((ask + bid) / 2) if ask > bid > 0 else 0.0
+        rules = service.market_rules(symbol, profile)
+        if rules is None:
+            return {"status": "error", "error": "regras do mercado indisponíveis"}
+        cap = service.order_notional_cap(symbol, profile)
+        taker = float(rules.taker_fee)
+        capital = self.config.capital_for_sizing()
+        limits = self._limits()
+        book = self._book()
+        exposure = sum(float(row["qty"] or 0) * float(row["avg_price"] or 0) for row in book if row["status"] == "open")
+        exposure += sum(float(row.get("reserved_usd") or 0) for row in book if row["status"] == "reserved")
+        if isinstance(params, DcaParams):
+            plan = dca_plan(params, price, taker=taker)
+        else:
+            plan = grid_plan(params, price, taker=taker, spread=spread)
+        problems = creation_problems(
+            "dca" if isinstance(params, DcaParams) else "grid",
+            plan,
+            min_notional=float(rules.min_notional or 0),
+            order_cap=float(cap) if cap is not None else float("inf"),
+            sizing_capital=capital,
+            exposure_room=capital * limits.max_exposure_pct - exposure,
+            risk_per_trade_pct=limits.risk_per_trade_pct,
+            taker=taker,
+            spread=spread,
+            params=params,
+        )
+        if cap is None:
+            problems.append("teto por ordem indisponível: confirme o mandato em Controles")
+        risk = open_risk(book, pending_risk=capital * limits.risk_per_trade_pct)
+        risk_cap = capital * limits.max_open_risk_pct
+        if risk + float(plan["loss_at_stop_usd"]) > risk_cap:
+            problems.append(f"risco da carteira passaria do limite de US$ {risk_cap:.2f} até os stops")
+        if isinstance(params, GridParams) and not params.lower < price < params.upper:
+            problems.append(f"o preço atual {price:.8g} está fora da faixa do grid")
+        if any(str(row["symbol"]) == symbol for row in book):
+            problems.append("o par já tem posição ou robô: um por par")
+        reserved = sum(int(row["params"]["max_orders_per_day"]) for row in self.store.instances(live_only=True))
+        if reserved + params.max_orders_per_day > limits.instance_orders_per_day:
+            problems.append(
+                f"ordens por dia dos robôs: {reserved} em uso + {params.max_orders_per_day} passa da reserva de "
+                f"{limits.instance_orders_per_day} (limite instance_orders_per_day)"
+            )
+        if service.orders_remaining(profile) < 2 * ORDERS_PER_LEG + len(self.store.open_positions()):
+            problems.append("o orçamento diário de ordens de hoje não cobre a primeira compra e o stop")
+        return {
+            "status": "ok",
+            "kind": "dca" if isinstance(params, DcaParams) else "grid",
+            "symbol": symbol,
+            "price": price,
+            "spread": spread,
+            "taker": taker,
+            "order_cap": None if cap is None else float(cap),
+            "plan": plan,
+            "problems": problems,
+        }
+
+    def _quote(self, symbol: str) -> tuple[float, float, float] | None:
+        """Bid, ask and last price of ``symbol``; None when unreadable."""
+        try:
+            payload = service.get_quote(symbol, profile_for(self.config))
+        except Exception:  # noqa: BLE001 - an unreadable quote refuses the plan
+            return None
+        quote = payload.get("quote") if isinstance(payload, dict) else None
+        if not isinstance(quote, dict):
+            return None
+        try:
+            bid = float(quote.get("bid") or 0)
+            last = float(quote.get("last") or 0)
+            ask = float(quote.get("ask") or bid)
+        except (TypeError, ValueError):
+            return None
+        if last <= 0 or bid <= 0:
+            return None
+        return bid, ask, last
+
+    def _book(self) -> list[dict[str, Any]]:
+        """Live positions, plus what each DCA or grid instance reserved and does not hold yet."""
+        live = self.store.live_positions()
+        rows = list(live)
+        for instance in self.store.instances(live_only=True):
+            try:
+                loss = worst_case_loss(instance, taker=SPOT_TAKER)
+                budget = instance_budget(instance)
+            except (KeyError, ValueError):
+                logger.warning("instance %s has an unreadable plan", instance["id"])
+                continue
+            used_risk = used_usd = 0.0
+            for row in live:
+                if row.get("instance_id") == instance["id"] and row["status"] == "open":
+                    qty, avg = float(row["qty"] or 0), float(row["avg_price"] or 0)
+                    used_risk += max(0.0, qty * (avg - float(row["stop_price"] or 0)))
+                    used_usd += qty * avg
+            rows.append(
+                {
+                    "symbol": instance["symbol"],
+                    "strategy": instance["kind"],
+                    "status": "reserved",
+                    "qty": 0.0,
+                    "avg_price": 0.0,
+                    "stop_price": None,
+                    "reserved_risk": max(0.0, loss - used_risk),
+                    "reserved_usd": max(0.0, budget - used_usd),
+                }
+            )
+        return rows
+
+    def _instances(self, snapshot: MarketSnapshot, moment: datetime, *, clock_blocked: bool = False) -> None:
+        """One step of every live instance. A blocked clock never lets them buy, only sell and stop.
+        The daily-loss limit refuses this cycle's buys and pauses the cycle until the next UTC day
+        (the broker stops keep protecting what they hold); a drawdown halts, which stops them all."""
+        instances = self.store.instances(live_only=True)
+        if not instances:
+            return
+        buy_block = self._robot_buy_block(snapshot, moment, clock_blocked=clock_blocked)
+        if self.halted:
+            return
+        for instance in instances:
+            price = _last_price(snapshot, str(instance["symbol"]), "15m")
+            try:
+                outcome = self._step_instance(instance, price, moment, buy_block=buy_block)
+            except UnprotectedPosition:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one instance must not stop the cycle
+                logger.exception("instance %s failed", instance["id"])
+                self._ledger("instance_error", {"id": instance["id"], "error": type(exc).__name__})
+                continue
+            if outcome:
+                self._ledger("instance", {"id": instance["id"], "kind": instance["kind"], "symbol": instance["symbol"], "outcome": outcome})
+
+    def _instance_position(self, instance_id: int) -> dict[str, Any] | None:
+        return next((row for row in self.store.live_positions() if row.get("instance_id") == instance_id), None)
+
+    def _robot_buy_block(self, snapshot: MarketSnapshot, moment: datetime, *, clock_blocked: bool) -> str | None:
+        """Why DCA and grid instances may not buy now, or None.
+
+        The clock rule of entries, the daily pause, the trades-per-day limit for new
+        inventory, and the account-wide limits strategy entries obey
+        (``RiskManager.portfolio_verdict``): a daily loss pauses the day and a drawdown halts
+        here too, so a bot running only robots stays inside them.
+        """
+        if clock_blocked:
+            return "relógio fora de 1s — só cancelamentos e saídas"
+        paused = self.store.get_state("paused_until")
+        if paused and paused > moment.isoformat():
+            return "pausado até o próximo dia UTC"
+        capital = self.config.capital_for_sizing()
+        day_pnl, equity, peak = self._equity(snapshot, moment)
+        verdict = RiskManager(self._limits(), capital, capital).portfolio_verdict(day_pnl=day_pnl, peak_equity=peak, equity=equity)
+        if verdict is None:
+            return None
+        if verdict.halt:
+            self.halt(verdict.reason)
+        elif verdict.pause_day:
+            self._pause_day(moment)
+        return verdict.reason
+
+    def _trade_limit(self, moment: datetime) -> str | None:
+        """New inventory (a DCA round, a grid restart) counts as a trade, like a strategy entry."""
+        if self.store.trades_today(utc_day(moment)) >= self._limits().max_trades_per_day:
+            return "limite de trades por dia"
+        return None
+
+    def _step_instance(
+        self, instance: dict[str, Any], price: float | None, moment: datetime, *, buy_block: str | None = None
+    ) -> str | None:
+        """One decision of one instance: at most one order and the stop it moves."""
+        instance_id = int(instance["id"])
+        if instance["status"] == "stopping":
+            return self._wind_down(instance_id, str(instance.get("reason") or "robô parado"))
+        position = self._instance_position(instance_id)
+        if price is None or (position is not None and position["status"] == "pending"):
+            return None
+        if position is not None and _inflight(position) == "buy":
+            # A buy with an unknown result: the sync settles it before anything else acts.
+            return None
+        state = dict(instance["state"])
+        day = utc_day(moment)
+        if state.get("orders_day") != day:
+            state["orders_day"], state["orders_today"] = day, 0
+        params: DcaParams | GridParams
+        if instance["kind"] == "dca":
+            params = DcaParams.model_validate(instance["params"])
+        else:
+            params = GridParams.model_validate(instance["params"])
+        if int(state["orders_today"]) + ORDERS_PER_LEG > params.max_orders_per_day:
+            outcome: str | None = "limite diário de ordens do robô; volta amanhã"
+        elif isinstance(params, DcaParams):
+            outcome = self._step_dca(instance_id, str(instance["symbol"]), params, state, position, price, moment, buy_block)
+        else:
+            outcome = self._step_grid(instance_id, str(instance["symbol"]), params, state, position, price, moment, buy_block)
+        self.store.update_instance(instance_id, state=state, **({"reason": outcome} if outcome else {}))
+        return outcome
+
+    def _wind_down(self, instance_id: int, reason: str) -> str:
+        """Sell what a stopping instance holds; once nothing is left, it is stopped."""
+        position = self._instance_position(instance_id)
+        if position is not None and position["status"] == "pending":
+            return "entrada pendente; o robô para depois dela"
+        if position is not None:
+            result = self.executor.exit_position(int(position["id"]), reason)
+            current = self.store.position(int(position["id"]))
+            if current is not None and current["status"] == "open":
+                return f"saída pendente: {result.get('error') or result.get('status')}"
+        realized = sum(float(row["realized_pnl"] or 0) for row in self.store.instance_positions(instance_id))
+        self.store.update_instance(
+            instance_id, status="stopped", stopped_at=datetime.now(timezone.utc).isoformat(), reason=reason, realized_pnl=realized
+        )
+        self._ledger("instance_stopped", {"id": instance_id, "reason": reason, "realized_pnl": realized})
+        return reason
+
+    def _end(self, instance_id: int, reason: str) -> str:
+        self.store.update_instance(instance_id, status="stopping", reason=reason)
+        return self._wind_down(instance_id, reason)
+
+    def _step_dca(
+        self,
+        instance_id: int,
+        symbol: str,
+        params: DcaParams,
+        state: dict[str, Any],
+        position: dict[str, Any] | None,
+        price: float,
+        moment: datetime,
+        buy_block: str | None,
+    ) -> str | None:
+        if position is None:
+            if state.get("position_id") is not None:
+                # The round's position closed: by its take-profit, its stop, or the operator.
+                if state.get("exit") != "take_profit" or not params.repeat:
+                    closed = self.store.position(int(state["position_id"])) or {}
+                    took = state.get("exit") == "take_profit" and closed.get("status") == "closed"
+                    state["position_id"] = None
+                    return self._end(instance_id, "alvo do DCA atingido" if took else "rodada do DCA encerrada pelo stop ou à mão")
+            block = buy_block or self._trade_limit(moment)
+            if block is not None:
+                return f"rodada do DCA em espera: {block}"
+            stop = dca_stop(params, price)
+            result = self.executor.open_instance(instance_id, "dca", symbol, Decimal(f"{params.base_usd:.2f}"), Decimal(str(stop)))
+            if result["status"] not in ("ok", "pending"):
+                return f"base do DCA recusada: {result.get('error')}"
+            state.update(
+                base_price=price, filled=0, position_id=result["position_id"], exit=None, pending_so=None,
+                round=int(state.get("round") or 0) + 1,
+            )
+            state["orders_today"] = int(state["orders_today"]) + ORDERS_PER_LEG
+            return f"rodada {state['round']} do DCA aberta a {price:.8g}"
+        state["exit"] = None
+        pending = state.get("pending_so")
+        if pending:
+            if float(position["qty"]) > float(pending["qty_before"]) * 1.000001:
+                state["filled"], state["pending_so"] = int(pending["index"]), None
+            elif not position.get("pending_leg"):
+                state["pending_so"] = None
+            else:
+                return None
+        if position.get("pending_leg"):
+            return None
+        base = float(state["base_price"])
+        action = dca_next(params, base, int(state["filled"]), price, float(position["avg_price"]))
+        if action is None:
+            return None
+        if action[0] == "take_profit":
+            state["exit"] = "take_profit"
+            state["orders_today"] = int(state["orders_today"]) + 1
+            result = self.executor.exit_position(int(position["id"]), "alvo do DCA")
+            return f"alvo do DCA: {result.get('status')}"
+        index = action[1]
+        if buy_block is not None:
+            return f"ordem de segurança {index} em espera: {buy_block}"
+        usd = dca_ladder(params, base)[index]["usd"]
+        state["legs"] = int(state.get("legs") or 0) + 1
+        # Saved before the send: after a crash the next attempt gets a new key, never a replay booked twice.
+        self.store.update_instance(instance_id, state=state)
+        qty_before = float(position["qty"])
+        outcome = self.executor.scale_in(
+            int(position["id"]),
+            Decimal(f"{usd:.2f}"),
+            f"dca-{state['round']}-{index}-{state['legs']}",
+            Decimal(str(dca_stop(params, base))),
+            reserve=1 + len(self.store.open_positions()),
+        )
+        if outcome == "comprado":
+            state["filled"] = index
+        elif outcome == "compra pendente" or outcome.startswith("o stop antigo"):
+            state["pending_so"] = {"index": index, "qty_before": qty_before}
+        else:
+            return f"ordem de segurança {index}: {outcome}"
+        state["orders_today"] = int(state["orders_today"]) + ORDERS_PER_LEG
+        return f"ordem de segurança {index}: {outcome}"
+
+    def _step_grid(
+        self,
+        instance_id: int,
+        symbol: str,
+        params: GridParams,
+        state: dict[str, Any],
+        position: dict[str, Any] | None,
+        price: float,
+        moment: datetime,
+        buy_block: str | None,
+    ) -> str | None:
+        stop = Decimal(str(params.stop_price))
+        levels = grid_levels(params)
+        qtys = grid_qty(params)
+        if price <= params.stop_price:
+            return self._end(instance_id, "preço no stop do grid")
+        if params.take_profit_price is not None and price >= params.take_profit_price:
+            return self._end(instance_id, "take-profit do grid atingido")
+        if position is None and state.get("position_id") is not None:
+            closed = self.store.position(int(state["position_id"])) or {}
+            # The grid only sells below its range through the stop.
+            if closed.get("status") == "closed" and float(closed.get("exit_price") or 0) < params.lower:
+                return self._end(instance_id, "o stop do grid executou")
+        if position is not None:
+            state["position_id"] = int(position["id"])
+            raw = position.get("pending_leg")
+            if raw or position.get("keep_qty") is not None:
+                leg = json.loads(str(raw)) if raw else {}
+                resting = leg.get("kind") == "sell" and position.get("keep_qty") is not None and position.get("stop_order_id")
+                if not resting:
+                    return None
+                still = grid_next(levels, grid_k_from_qty(qtys, float(position["qty"])), price)
+                if still is not None and still[0] == "sell":
+                    # A grid sale that stopped midway, while the price still pays it: finish it
+                    # down to the same kept quantity.
+                    state["orders_today"] = int(state["orders_today"]) + ORDERS_PER_LEG
+                    result = self.executor.exit_position(
+                        int(position["id"]), "grid: retomando a venda",
+                        keep_qty=Decimal(str(position["keep_qty"])), leg=str(leg["leg"]), next_stop=stop,
+                    )
+                    return f"grid retomou a venda: {result.get('status')}"
+                # The price fell back under the level: the rest of that sale is dropped, never sold at a loss.
+                self.store.update_position(int(position["id"]), keep_qty=None, pending_leg=None)
+                position = self._instance_position(instance_id)
+        held = float(position["qty"]) if position is not None else 0.0
+        k = grid_k_from_qty(qtys, held)
+        step = grid_next(levels, k, price)
+        if step is None:
+            return None
+        side, new_k = step
+        if side == "buy":
+            block = buy_block or (self._trade_limit(moment) if position is None else None)
+            if block is not None:
+                return f"grid sem compra: {block}"
+            notional = Decimal(f"{sum(qtys[new_k:k]) * price:.2f}")
+            if position is None:
+                result = self.executor.open_instance(instance_id, "grid", symbol, notional, stop)
+                if result["status"] not in ("ok", "pending"):
+                    return f"grid não comprou: {result.get('error')}"
+                state["position_id"] = result["position_id"]
+                state["orders_today"] = int(state["orders_today"]) + ORDERS_PER_LEG
+                return f"grid comprou {k - new_k} nível(is) a {price:.8g}"
+            state["legs"] = int(state.get("legs") or 0) + 1
+            self.store.update_instance(instance_id, state=state)
+            outcome = self.executor.scale_in(
+                int(position["id"]), notional, f"grid-buy-{state['legs']}", stop,
+                reserve=1 + len(self.store.open_positions()),
+            )
+            if outcome == "comprado" or outcome == "compra pendente" or outcome.startswith("o stop antigo"):
+                state["orders_today"] = int(state["orders_today"]) + ORDERS_PER_LEG
+            return f"grid comprou {k - new_k} nível(is) a {price:.8g}: {outcome}"
+        if position is None:
+            return None
+        keep = held - sum(qtys[k:new_k])
+        state["orders_today"] = int(state["orders_today"]) + ORDERS_PER_LEG
+        if new_k >= len(qtys) or keep * price < (self._min_notional(symbol) or 0.0):
+            result = self.executor.exit_position(int(position["id"]), "grid vendeu o estoque")
+        else:
+            state["legs"] = int(state.get("legs") or 0) + 1
+            self.store.update_instance(instance_id, state=state)
+            result = self.executor.exit_position(
+                int(position["id"]), f"grid vendeu {new_k - k} nível(is)",
+                keep_qty=Decimal(str(keep)), leg=f"grid-sell-{state['legs']}", next_stop=stop,
+            )
+        return f"grid vendeu {new_k - k} nível(is) a {price:.8g}: {result.get('status')}"
 
     def close_position(self, position_id: int) -> dict[str, Any]:
         with self.lock:
@@ -251,6 +776,16 @@ class Runtime:
                 return {"status": "blocked", "error": "halt ativo — o stop segue na corretora"}
             if self.retired:
                 return {"status": "blocked", "error": "ambiente trocado; tente de novo"}
+            position = self.store.position(position_id) or {}
+            owner = self.store.instance(int(position["instance_id"])) if position.get("instance_id") is not None else None
+            if owner is not None and owner["status"] in ("active", "stopping"):
+                # Closing a robot's inventory by hand stops the robot too: otherwise a grid
+                # would read an empty inventory as levels to buy back on the next cycle.
+                stopped = self._stop_instance(int(owner["id"]), "posição do robô fechada à mão")
+                current = self.store.position(position_id) or {}
+                if current.get("status") in ("open", "pending"):
+                    return {"status": "error", "error": str(stopped.get("outcome") or stopped.get("error"))}
+                return {"status": "ok", "instance_stopped": int(owner["id"])}
             try:
                 return self.executor.exit_position(position_id, "fechamento manual")
             except UnprotectedPosition as exc:
@@ -268,7 +803,9 @@ class Runtime:
         # Pairs with a position are always read, even when the analysed list dropped them
         # (a hand edit, the automatic choice): their stops and exits need fresh candles.
         # No cap here: every analysed pair is scored, so every one must be read too.
-        symbols = list(dict.fromkeys([*sorted(_held(self._positions())), *self.config.symbols]))
+        # A DCA or grid instance needs its pair's price even while it holds nothing.
+        instanced = [str(row["symbol"]) for row in self.store.instances(live_only=True)]
+        symbols = list(dict.fromkeys([*sorted(_held(self._positions())), *instanced, *self.config.symbols]))
         self.collector.sync_clock()
         snapshot = self.collector.refresh(symbols)
         read = frozenset(symbols)
@@ -300,6 +837,7 @@ class Runtime:
             if not snapshot.clock_blocked:
                 self._trail(snapshot)
             self._exits(snapshot, moment)
+            self._instances(snapshot, moment, clock_blocked=snapshot.clock_blocked)
         self._decay(moment)
         capital = self._sizing_capital(cash, snapshot)
         opportunities = self._score(snapshot, moment, capital)
@@ -310,12 +848,7 @@ class Runtime:
         # best score first, so the whole flow can be exercised without validated strategies.
         test_auto = self.config.test_mode_active
         if self.config.entry_mode == "auto":
-            eligible = [
-                item
-                for item in ready
-                if (item.test_only and test_auto)
-                or (not item.test_only and item.win_rate is not None and item.win_rate >= self.config.min_win_rate)
-            ]
+            eligible = [item for item in ready if (item.test_only and test_auto) or self._clears_floor(item)]
             entries = self._allocate(eligible, cash)
         else:
             # The operator picks one row at a time, so each row is checked on its own.
@@ -325,6 +858,8 @@ class Runtime:
         acted: list[dict[str, Any]] = []
         if trading and self.running and not snapshot.clock_blocked and self.config.entry_mode == "auto":
             acted = self.executor.act(entries, clock_blocked=False, allow_test=test_auto)
+        if trading and self.running and not snapshot.clock_blocked:
+            self._fire_armed(opportunities, snapshot, moment)
         payload = {
             "opportunities": len(opportunities),
             "ready": sum(1 for item in opportunities if item.status == "pronta"),
@@ -337,6 +872,21 @@ class Runtime:
         self._ledger("tick", payload)
         self.publish({"type": "tick", **payload, "rows": [item.to_dict() for item in opportunities]})
         return payload
+
+    def _clears_floor(self, item: Opportunity) -> bool:
+        """Whether a real (non-test) row's estimated hit rate allows an automatic entry.
+
+        Swing rows need ``min_win_rate``. Day rows need the break-even of their
+        first target plus ``DAY_WIN_RATE_MARGIN``: a day trade wins less often by
+        design (half at 1.5R, the rest at break-even), so the swing floor would
+        never let one in.
+        """
+        if item.test_only or item.win_rate is None:
+            return False
+        if exit_policy_for(item.strategy, self.config.exit_policy) != "day":
+            return item.win_rate >= self.config.min_win_rate
+        breakeven = breakeven_win_rate(item)
+        return breakeven is not None and item.win_rate >= breakeven + DAY_WIN_RATE_MARGIN
 
     def _choose_pairs(self, moment: datetime) -> list[str] | None:
         """Rank the most promising pairs, at most once an hour. Network only: runs outside the lock.
@@ -428,7 +978,7 @@ class Runtime:
         return allocate(
             rows,
             cash=cash,
-            live=self.store.live_positions(),
+            live=self._book(),
             capital=self.config.capital_for_sizing(),
             limits=self._limits(),
             min_notional=self._min_notional,
@@ -441,6 +991,35 @@ class Runtime:
             return None
         return float(rules.min_notional) if rules.min_notional is not None else 0.0
 
+    def _fire_armed(self, rows: list[Opportunity], snapshot: MarketSnapshot, moment: datetime) -> None:
+        """Enter the armed entries whose trigger the last 15m close reached; expire the stale ones."""
+        for armed in self.store.armed_entries(live_only=True):
+            armed_id = int(armed["id"])
+            symbol, strategy = str(armed["symbol"]), str(armed["strategy"])
+            if moment >= datetime.fromisoformat(str(armed["expires_at"])):
+                self.store.settle_armed(armed_id, "expired", "prazo do gatilho acabou")
+                continue
+            if symbol not in self.config.symbols:
+                self.store.settle_armed(armed_id, "expired", "o par saiu da lista analisada")
+                continue
+            price = _last_price(snapshot, symbol, "15m")
+            trigger = float(armed["trigger_price"])
+            if price is None or not (price <= trigger if armed["condition"] == "below" else price >= trigger):
+                continue
+            row = next((item for item in rows if item.symbol == symbol and item.strategy == strategy), None)
+            if row is None or row.status != "pronta" or row.direction <= 0:
+                reason = "gatilho atingido; o setup não está pronto agora"
+                if armed.get("reason") != reason:
+                    self.store.settle_armed(armed_id, "armed", reason)
+                continue
+            outcome = self._enter_manual(row)
+            result = (outcome.get("results") or [{}])[0]
+            if result.get("decision") in ("operar", "pendente"):
+                self.store.settle_armed(armed_id, "fired", f"gatilho {trigger} atingido a {price}", position_id=result.get("position_id"))
+                self._ledger("armed_fired", {"symbol": symbol, "strategy": strategy, "trigger": trigger, "price": price})
+            else:
+                self.store.settle_armed(armed_id, "armed", f"gatilho atingido; entrada bloqueada: {result.get('reason')}")
+
     def _policy(self, position: dict[str, Any]) -> str:
         """The exit rule a position opened under; rows from before it was recorded follow the config."""
         return str(position.get("exit_policy") or self.config.exit_policy)
@@ -450,7 +1029,7 @@ class Runtime:
         # One order per open position stays reserved for its own re-stop or exit.
         reserve = 1 + len(positions)
         for position in positions:
-            if self._policy(position) != "trailing":
+            if self._policy(position) not in TRAILING_POLICIES:
                 continue
             price = _last_price(snapshot, position["symbol"], "15m")
             if price is None:
@@ -463,10 +1042,12 @@ class Runtime:
         positions = self.store.open_positions()
         reserve = 1 + len(positions)
         for position in positions:
+            if self._policy(position) in INSTANCE_POLICIES:
+                continue
             if self._policy(position) == "day":
                 self._day_exit(position, snapshot, moment, reserve)
                 continue
-            reason = _exit_reason(position, snapshot, moment, use_target=self._policy(position) != "trailing")
+            reason = _exit_reason(position, snapshot, moment, use_target=self._policy(position) == "target")
             if reason is None:
                 continue
             result = self.executor.exit_position(position["id"], reason)
@@ -528,13 +1109,10 @@ class Runtime:
         positions = self.store.open_positions()
         live = {(row["symbol"], row["strategy"]) for row in self.store.live_positions()}
         exposure = sum(abs(float(row["qty"]) * float(row["avg_price"])) for row in positions)
+        exposure += sum(float(row.get("reserved_usd") or 0) for row in self._book() if row["status"] == "reserved")
         day = utc_day(moment)
-        days = self.store.pnl_days()
-        day_row = next((row for row in days if row["day"] == day), None)
-        day_pnl = float(day_row["net_pnl"]) if day_row else 0.0
-        equity = capital + sum(float(row["net_pnl"]) for row in days) + _unrealized(positions, snapshot)
+        day_pnl, equity, peak = self._equity(snapshot, moment)
         self.store.record_equity(equity, moment.isoformat())
-        peak = max(self.store.peak_equity(), equity)
         returns = _returns(snapshot)
         trades_today = self.store.trades_today(day)
         ranked: list[Opportunity] = []
@@ -619,15 +1197,32 @@ class Runtime:
                     )
                     # Marked after the write: a failed insert is retried next cycle.
                     self._decided[(symbol, strategy_id)] = (draft.status, draft.reason)
+                # The robots' gate may have halted on the same drawdown earlier in this cycle.
                 if verdict.halt:
-                    self.halt(verdict.reason)
+                    if not self.halted:
+                        self.halt(verdict.reason)
                     return sorted(ranked, key=lambda item: item.score, reverse=True)
                 if verdict.pause_day:
-                    tomorrow = (moment + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-                    self.store.set_state("paused_until", tomorrow.isoformat())
-                    self.store.set_state("running", False)
+                    self._pause_day(moment)
         ranked.sort(key=lambda item: item.score, reverse=True)
         return ranked
+
+    def _equity(self, snapshot: MarketSnapshot, moment: datetime) -> tuple[float, float, float]:
+        """Today's net PnL, the equity (configured capital, every closed day, the open positions
+        at the last price) and the peak equity."""
+        days = self.store.pnl_days()
+        day = utc_day(moment)
+        day_row = next((row for row in days if row["day"] == day), None)
+        day_pnl = float(day_row["net_pnl"]) if day_row else 0.0
+        positions = self.store.open_positions()
+        equity = self.config.capital_for_sizing() + sum(float(row["net_pnl"]) for row in days) + _unrealized(positions, snapshot)
+        return day_pnl, equity, max(self.store.peak_equity(), equity)
+
+    def _pause_day(self, moment: datetime) -> None:
+        """Stop the cycle until the next UTC day: the daily-loss limit."""
+        tomorrow = (moment + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        self.store.set_state("paused_until", tomorrow.isoformat())
+        self.store.set_state("running", False)
 
     def _ledger(self, kind: str, payload: dict[str, Any]) -> None:
         try:
@@ -636,6 +1231,16 @@ class Runtime:
             # A ledger failure must not send or block an order. It is visible in the store and the log.
             logger.exception("ledger append failed (%s)", kind)
             self.store.set_state("ledger_error", kind)
+
+
+def _inflight(position: dict[str, Any]) -> str | None:
+    """Kind of the order a position recorded in flight (``pending_leg``), or None."""
+    raw = position.get("pending_leg")
+    try:
+        leg = json.loads(str(raw)) if raw else None
+    except ValueError:
+        return None
+    return str(leg.get("kind")) if isinstance(leg, dict) else None
 
 
 def _exit_reason(

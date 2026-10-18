@@ -87,7 +87,7 @@ def commit_mandate_for(config: "BotConfig") -> Path:
         max_order_notional_usd=capital * limits.max_order_notional_pct,
         max_total_exposure_usd=capital * limits.max_exposure_pct,
         max_leverage=limits.max_leverage,
-        max_trades_per_day=per_entry * limits.max_trades_per_day,
+        max_trades_per_day=per_entry * limits.max_trades_per_day + limits.instance_orders_per_day,
         flatten_on_halt=config.flatten_on_halt,
     )
 

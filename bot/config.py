@@ -19,7 +19,8 @@ from bot.paths import base_runtime_root
 
 Mode = Literal["testnet", "production"]
 #: ``manual``: the cycle only manages exits of positions opened from the panel.
-#: ``auto``: the cycle also enters ready rows whose estimated hit rate clears ``min_win_rate``.
+#: ``auto``: the cycle also enters ready rows whose estimated hit rate clears ``min_win_rate``
+#: (swing) or the first-target break-even plus ``DAY_WIN_RATE_MARGIN`` (day).
 EntryMode = Literal["manual", "auto"]
 DEFAULT_SYMBOLS = ("BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT")
 #: Each symbol costs about seven REST reads per cycle.
@@ -66,6 +67,9 @@ class RiskLimits(BaseModel):
     kelly_fraction: float = Field(default=0.25, ge=0, le=1)
     #: New positions one cycle may open; the rest wait for the next cycle.
     max_entries_per_cycle: int = Field(default=2, ge=1, le=20)
+    #: Daily orders the mandate reserves for DCA and grid instances, on top of the
+    #: strategies' budget. The instances' own daily caps must fit in it (0 = no instances).
+    instance_orders_per_day: int = Field(default=0, ge=0, le=400)
 
     @field_validator("max_order_notional_pct", "max_exposure_pct", "max_daily_loss_pct", "max_drawdown_pct")
     @classmethod
@@ -104,6 +108,9 @@ class BotConfig(BaseModel):
     min_win_rate_sample: int = Field(default=20, ge=10, le=1000)
     #: The stop follows the highest price at the entry's stop distance; the fixed target is not used.
     trailing_stop: bool = True
+    #: With ``trailing_stop``: the entry stop stays until the gain reaches the activation
+    #: (``bot.strategies.trailing.TRAIL``); then the stop follows the highest price closer.
+    trailing_activation: bool = False
     #: Spot Testnet only: buy setups that miss a quality filter or validation can be
     #: executed by hand, for testing the order flow. Production ignores it.
     testnet_test_mode: bool = False
@@ -121,6 +128,10 @@ class BotConfig(BaseModel):
     min_quote_volume_usd: float = 5_000_000.0
     tick_seconds: int = 60
     production_capital_fraction: float = Field(default=0.10, gt=0, le=1)
+    #: A production pilot without 30 days of testnet history is allowed while the production
+    #: capital stays at or below this (0 = no pilot). Like the gates, only a hand edit of
+    #: bot.json sets it; once in production the cap recorded at the switch is the one enforced.
+    pilot_max_production_capital_usd: float = Field(default=0.0, ge=0, le=50)
     #: Operator attestations, edited in bot.json only. The API never writes them.
     gates: dict[str, bool] = Field(
         default_factory=lambda: {"g1": False, "g2": False, "g3": False, "g4": False}
@@ -173,12 +184,18 @@ class BotConfig(BaseModel):
     @property
     def exit_policy(self) -> str:
         """The exit rule live trading and the backtest gate both follow."""
-        return "trailing" if self.trailing_stop else "target"
+        if not self.trailing_stop:
+            return "target"
+        return "trailing_tp" if self.trailing_activation else "trailing"
+
+    def production_capital(self) -> float:
+        """The capital production trades with: ``production_capital_fraction`` of the allocated capital."""
+        return self.allocated_capital_usd * self.production_capital_fraction
 
     def capital_for_sizing(self) -> float:
         """Production starts at ``production_capital_fraction`` of the allocated capital."""
         if self.mode == "production":
-            return self.allocated_capital_usd * self.production_capital_fraction
+            return self.production_capital()
         return self.allocated_capital_usd
 
     def tightened(self, mandate_caps: Any | None) -> RiskLimits:

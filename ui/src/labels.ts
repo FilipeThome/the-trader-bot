@@ -5,6 +5,8 @@ const strategies: Record<string, string> = {
   funding_carry: "Funding Carry",
   intraday_momentum: "Day · Momento intradiário",
   vwap_pullback: "Day · Pullback na VWAP",
+  dca: "Robô DCA",
+  grid: "Robô Grid",
 };
 
 const sides: Record<string, string> = {
@@ -21,6 +23,7 @@ const decisions: Record<string, string> = {
   bloqueada: "Bloqueada",
   ignorada: "Ignorada",
   em_posicao: "Em posição",
+  aumento: "Aumento de posição",
   DENY: "Recusada",
   ALLOW: "Aceita",
 };

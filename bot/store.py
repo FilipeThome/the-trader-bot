@@ -120,6 +120,34 @@ CREATE TABLE IF NOT EXISTS strategy_stats (
     signal_only INTEGER NOT NULL DEFAULT 1,
     params TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS armed_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    trigger_price REAL NOT NULL,
+    condition TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT,
+    position_id INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS armed_live ON armed_entries(symbol, strategy) WHERE status = 'armed';
+CREATE TABLE IF NOT EXISTS bot_instances (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    params TEXT NOT NULL,
+    state TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    stopped_at TEXT,
+    realized_pnl REAL NOT NULL DEFAULT 0,
+    reason TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS instances_live ON bot_instances(kind, symbol) WHERE status IN ('active', 'stopping');
 """
 
 #: Columns ``update_position`` may change. Identity and timestamps stay with the store.
@@ -145,6 +173,8 @@ _POSITION_FIELDS = frozenset(
         "tp1_done",
         "keep_qty",
         "exit_deadline",
+        "instance_id",
+        "pending_leg",
     }
 )
 
@@ -159,6 +189,11 @@ _ADDED_POSITION_COLUMNS = (
     ("tp1_done", "INTEGER NOT NULL DEFAULT 0"),
     ("keep_qty", "REAL"),
     ("exit_deadline", "TEXT"),
+    # DCA and grid inventory: the bot instance it belongs to, and the order in flight, resolved
+    # by the sync. JSON with "kind": "buy" (leg, client_order_id, stop), "restop" (stop) or
+    # "sell" (leg, qty_before).
+    ("instance_id", "INTEGER"),
+    ("pending_leg", "TEXT"),
 )
 
 #: Buckets of the estimated hit rate at entry; manual entries have no floor, hence below 50%.
@@ -409,6 +444,7 @@ class Store:
         test_only: bool = False,
         entry_win_rate: float | None = None,
         exit_deadline: str | None = None,
+        instance_id: int | None = None,
     ) -> int | None:
         """Reserve a live slot before the entry order. ``None`` when one already exists.
 
@@ -421,11 +457,11 @@ class Store:
                 cursor = self._conn.execute(
                     """INSERT INTO positions
                     (symbol, strategy, side, qty, avg_price, stop_price, target_price,
-                     opened_at, updated_at, status, exit_policy, test_only, entry_win_rate, exit_deadline)
-                    VALUES (?, ?, 'buy', 0, 0, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
+                     opened_at, updated_at, status, exit_policy, test_only, entry_win_rate, exit_deadline, instance_id)
+                    VALUES (?, ?, 'buy', 0, 0, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)""",
                     (
                         symbol, strategy, stop_price, target_price, stamp, stamp, exit_policy,
-                        1 if test_only else 0, entry_win_rate, exit_deadline,
+                        1 if test_only else 0, entry_win_rate, exit_deadline, instance_id,
                     ),
                 )
         except sqlite3.IntegrityError:
@@ -679,6 +715,107 @@ class Store:
             if row["strategy_id"] == strategy_id:
                 return row
         return None
+
+    # -- armed entries -----------------------------------------------------
+
+    @_locked
+    def arm_entry(self, symbol: str, strategy: str, trigger_price: float, condition: str, expires_at: str) -> int | None:
+        """Arm one entry. ``None`` when the pair and strategy already have an armed one."""
+        stamp = _now()
+        try:
+            with self._conn:
+                cursor = self._conn.execute(
+                    """INSERT INTO armed_entries
+                    (symbol, strategy, trigger_price, condition, created_at, updated_at, expires_at, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'armed')""",
+                    (symbol, strategy, trigger_price, condition, stamp, stamp, expires_at),
+                )
+        except sqlite3.IntegrityError:
+            return None
+        return int(cursor.lastrowid or 0) or None
+
+    @_locked
+    def armed_entries(self, *, live_only: bool = False, limit: int = 50) -> list[dict[str, Any]]:
+        """Armed entries, newest first. ``live_only`` returns every armed one; ``limit`` caps only the history."""
+        if live_only:
+            rows = self._conn.execute("SELECT * FROM armed_entries WHERE status = 'armed' ORDER BY id DESC").fetchall()
+        else:
+            rows = self._conn.execute("SELECT * FROM armed_entries ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    @_locked
+    def settle_armed(self, armed_id: int, status: str, reason: str, *, position_id: int | None = None) -> bool:
+        """Leave the ``armed`` state, or only record ``reason`` when ``status`` is ``armed``.
+
+        False when the entry was no longer armed (a concurrent cancel or fire).
+        """
+        with self._conn:
+            cursor = self._conn.execute(
+                """UPDATE armed_entries SET status=?, reason=?, position_id=COALESCE(?, position_id), updated_at=?
+                WHERE id=? AND status='armed'""",
+                (status, reason, position_id, _now(), armed_id),
+            )
+        return cursor.rowcount == 1
+
+    # -- bot instances (DCA, grid) -----------------------------------------
+
+    @_locked
+    def create_instance(self, kind: str, symbol: str, params: dict[str, Any], state: dict[str, Any]) -> int | None:
+        """Start one DCA or grid instance. ``None`` when that kind already runs on the pair."""
+        stamp = _now()
+        try:
+            with self._conn:
+                cursor = self._conn.execute(
+                    """INSERT INTO bot_instances(kind, symbol, params, state, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, 'active', ?, ?)""",
+                    (kind, symbol, json.dumps(params), json.dumps(state), stamp, stamp),
+                )
+        except sqlite3.IntegrityError:
+            return None
+        return int(cursor.lastrowid or 0) or None
+
+    @_locked
+    def instances(self, *, live_only: bool = False, limit: int = 50) -> list[dict[str, Any]]:
+        """Instances, newest first. ``live_only`` returns every live one (risk, halt and the cycle need
+        all of them); ``limit`` caps only the history."""
+        if live_only:
+            rows = self._conn.execute(
+                "SELECT * FROM bot_instances WHERE status IN ('active', 'stopping') ORDER BY id DESC"
+            ).fetchall()
+        else:
+            rows = self._conn.execute("SELECT * FROM bot_instances ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [_instance(row) for row in rows]
+
+    @_locked
+    def instance(self, instance_id: int) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM bot_instances WHERE id=?", (instance_id,)).fetchone()
+        return None if row is None else _instance(row)
+
+    @_locked
+    def update_instance(self, instance_id: int, **fields: Any) -> None:
+        unknown = set(fields) - {"state", "status", "stopped_at", "realized_pnl", "reason"}
+        if unknown:
+            raise ValueError(f"unknown instance fields: {sorted(unknown)}")
+        if "state" in fields:
+            fields["state"] = json.dumps(fields["state"])
+        assignments = ", ".join(f"{name}=?" for name in fields)
+        with self._conn:
+            self._conn.execute(
+                f"UPDATE bot_instances SET {assignments}, updated_at=? WHERE id=?",
+                (*fields.values(), _now(), instance_id),
+            )
+
+    @_locked
+    def instance_positions(self, instance_id: int) -> list[dict[str, Any]]:
+        rows = self._conn.execute("SELECT * FROM positions WHERE instance_id=? ORDER BY id", (instance_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+
+def _instance(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    item["params"] = json.loads(item["params"])
+    item["state"] = json.loads(item["state"])
+    return item
 
 
 def _position_ddl() -> list[str]:

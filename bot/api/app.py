@@ -20,19 +20,22 @@ from bot.api.auth import load_or_create_token, refusal
 from bot.api.hub import EventHub
 from bot.api.state import BotContext
 from bot.backtest.loaders.binance_loader import WeightPressure
+from bot.backtest.instances import replay_dca, replay_grid
 from bot.backtest.runner import VALIDATABLE, promotion_record, shutdown_pool, validate_strategy
 from bot.collector import Collector
-from bot.config import DEFAULT_SYMBOLS, MAX_SYMBOLS, BotConfig
+from bot.config import DEFAULT_SYMBOLS, MAX_SYMBOLS, BotConfig, is_usdt_pair
 from bot.evaluator import Opportunity
 from bot.exchange import service
 from bot.exchange.weight import weight_pressure
 from bot.features import build_features, ensure_chart_data
+from bot.instances import DcaParams, GridParams
 from bot.live.halt import clear_halt
 from bot.mandate_io import ORDERS_PER_DAY_ENTRY, commit_mandate_for, mandate_is_restricted
-from bot.strategies.day import DAY
+from bot.strategies.day import DAY, DAY_WIN_RATE_MARGIN
+from bot.strategies.trailing import TRAIL
 from bot.markets import CHART_LEAD, chart_interval, merge_symbols, top_liquid_usdt, tradable_symbols, venue_klines, venue_symbols
 from bot.paths import pin_mode_root
-from bot.promotion import switch_to_production
+from bot.promotion import PILOT_STATE, switch_to_production
 from bot.recommend import recommendations
 from bot.reports import append_ledger, build_daily_report, verify_ledger
 from bot.runtime import Runtime, mode_root, profile_for
@@ -51,6 +54,8 @@ _RECOMMEND_LOCK = threading.Lock()
 _CHART_TTL_SECONDS = 5.0
 #: Minutes of chart kept after a trade closed.
 _CHART_TAIL = timedelta(minutes=15)
+#: Days of 15m candles a DCA or grid preview replays its plan on.
+REPLAY_DAYS = 30
 _TRADE_FIELDS = (
     "id", "symbol", "strategy", "side", "status", "qty", "avg_price", "stop_price", "target_price",
     "peak_price", "exit_policy", "opened_at", "closed_at", "exit_price", "realized_pnl", "reason", "test_only",
@@ -110,11 +115,29 @@ class ConfigUpdate(BaseModel):
     entry_mode: str | None = None
     min_win_rate: float | None = None
     trailing_stop: bool | None = None
+    trailing_activation: bool | None = None
     testnet_test_mode: bool | None = None
     auto_select: bool | None = None
     auto_select_count: int | None = None
     min_profit_usd: float | None = None
     reconfirm_mandate: bool = False
+
+
+class ArmEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    symbol: str
+    strategy: str
+    trigger_price: float = Field(gt=0)
+    hours: float = 24.0
+
+
+class InstanceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["dca", "grid"]
+    symbol: str
+    params: dict[str, Any]
 
 
 class ManualOrder(BaseModel):
@@ -149,6 +172,11 @@ def _bind(config: BotConfig) -> Runtime:
     runtime = Runtime(config, store, ctx.collector, publish=hub.publish, lock=ctx.lock)
     ctx.runtime = runtime
     ctx.config = config
+    cap = _pilot_cap(store) if config.mode == "production" else None
+    if cap is not None and config.capital_for_sizing() > cap + 1e-9:
+        # A hand edit of bot.json raised a pilot's capital: the cycle stays stopped until it is undone.
+        runtime.stop()
+        runtime._ledger("pilot_cap_exceeded", {"cap": cap, "capital": config.capital_for_sizing()})
     return runtime
 
 
@@ -224,12 +252,16 @@ def status() -> dict[str, Any]:
         "entry_mode": runtime.config.entry_mode,
         "min_win_rate": runtime.config.min_win_rate,
         "min_win_rate_sample": runtime.config.min_win_rate_sample,
+        "day_win_rate_margin": DAY_WIN_RATE_MARGIN,
         "trailing_stop": runtime.config.trailing_stop,
+        "trailing_activation": runtime.config.trailing_activation,
+        "trailing_rules": TRAIL.params,
         "auto_select": runtime.config.auto_select,
         "auto_select_count": runtime.config.auto_select_count,
         "auto_select_at": store.get_state("auto_select_at"),
         "min_profit_usd": runtime.config.min_profit_usd,
         "gates": runtime.config.gates,
+        "pilot_cap_usd": _pilot_cap(store) if runtime.config.mode == "production" else None,
         "day": today,
         "violations_avoided": int(today["violations_avoided"]) if today else 0,
         "net_pnl": float(today["net_pnl"]) if today else 0.0,
@@ -377,6 +409,104 @@ def execute_manual(body: ManualOrder) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="oportunidade não encontrada")
     opportunity = Opportunity(**{key: match[key] for key in Opportunity.__dataclass_fields__ if key in match})
     return {"status": "ok", **runtime.execute_manual(opportunity)}
+
+
+@app.get("/bot/armed")
+def armed() -> dict[str, Any]:
+    return {"rows": _runtime().store.armed_entries()}
+
+
+@app.post("/bot/armed")
+def arm(body: ArmEntry) -> dict[str, Any]:
+    result = _runtime().arm_entry(body.symbol, body.strategy, body.trigger_price, body.hours)
+    if result.get("status") != "ok":
+        raise HTTPException(status_code=409, detail=result["error"])
+    return result
+
+
+@app.delete("/bot/armed/{armed_id}")
+def disarm(armed_id: int) -> dict[str, Any]:
+    result = _runtime().disarm_entry(armed_id)
+    if result.get("status") != "ok":
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
+
+
+def _instance_request(body: InstanceRequest, runtime: Runtime) -> DcaParams | GridParams:
+    if not is_usdt_pair(body.symbol):
+        raise HTTPException(status_code=422, detail="o par precisa ser BASE/USDT")
+    try:
+        params: DcaParams | GridParams = (DcaParams if body.kind == "dca" else GridParams).model_validate(body.params)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=_validation_detail(exc)) from exc
+    _require_listed(runtime.collector, [body.symbol], runtime.config.mode)
+    return params
+
+
+def _instance_replay(kind: str, symbol: str, params: DcaParams | GridParams, plan: dict[str, Any]) -> dict[str, Any]:
+    """The plan replayed on the last ``REPLAY_DAYS`` of 15m candles; an error note when unreadable."""
+    from bot.backtest.loaders.registry import resolve_loader
+
+    end = datetime.now(timezone.utc)
+    try:
+        frames = resolve_loader("crypto").fetch([symbol], (end - timedelta(days=REPLAY_DAYS)).isoformat(), end.isoformat(), interval="15m")
+        frame = frames.get(symbol)
+        if frame is None or frame.empty:
+            return {"error": "histórico do par indisponível"}
+    except Exception as exc:  # noqa: BLE001 - the preview still shows the plan
+        logger.warning("replay candles for %s failed: %s", symbol, type(exc).__name__)
+        return {"error": "histórico da Binance indisponível"}
+    taker, spread = float(plan["taker"]), float(plan["spread"])
+    if isinstance(params, DcaParams):
+        result = replay_dca(params, frame, taker=taker, spread=spread)
+    else:
+        result = replay_grid(params, frame, taker=taker, spread=spread)
+    return {"days": REPLAY_DAYS, "interval": "15m", **result}
+
+
+@app.get("/bot/instances")
+def instances() -> dict[str, Any]:
+    runtime = _runtime()
+    rows = []
+    for instance in runtime.store.instances():
+        positions = runtime.store.instance_positions(int(instance["id"]))
+        live = next((row for row in positions if row["status"] in ("pending", "open")), None)
+        rows.append(
+            {
+                **instance,
+                "realized_pnl": sum(float(row["realized_pnl"] or 0) for row in positions),
+                "position": None if live is None else {key: live.get(key) for key in _TRADE_FIELDS if key in live},
+            }
+        )
+    return {"rows": rows, "instance_orders_per_day": runtime.config.limits.instance_orders_per_day}
+
+
+@app.post("/bot/instances/preview")
+def preview_instance(body: InstanceRequest) -> dict[str, Any]:
+    runtime = _runtime()
+    params = _instance_request(body, runtime)
+    plan = runtime.preview_instance(body.kind, body.symbol, params)
+    if plan.get("status") != "ok":
+        raise HTTPException(status_code=409, detail=plan.get("error"))
+    return {**plan, "replay": _instance_replay(body.kind, body.symbol, params, plan)}
+
+
+@app.post("/bot/instances")
+def create_instance(body: InstanceRequest) -> dict[str, Any]:
+    runtime = _runtime()
+    params = _instance_request(body, runtime)
+    result = runtime.create_instance(body.kind, body.symbol, params)
+    if result.get("status") != "ok":
+        raise HTTPException(status_code=409, detail=result.get("error"))
+    return result
+
+
+@app.post("/bot/instances/{instance_id}/stop")
+def stop_instance(instance_id: int) -> dict[str, Any]:
+    result = _runtime().stop_instance(instance_id)
+    if result.get("status") != "ok":
+        raise HTTPException(status_code=409, detail=result.get("error"))
+    return result
 
 
 @app.post("/bot/opportunities/ignore")
@@ -586,6 +716,33 @@ def choose_symbols(body: SymbolChoice) -> dict[str, Any]:
         return {"status": "ok", "symbols": symbols, "left_out": left_out}
 
 
+def _pilot_cap(store: Store) -> float | None:
+    """The capital cap of a production pilot, from the production store; None outside a pilot."""
+    value = store.get_state(PILOT_STATE)
+    return float(value) if value is not None else None
+
+
+def _check_pilot(config: BotConfig, store: Store) -> None:
+    """Refuse a production config whose capital exceeds the pilot cap. ``store`` is the production store."""
+    if config.mode != "production":
+        return
+    cap = _pilot_cap(store)
+    if cap is not None and config.capital_for_sizing() > cap + 1e-9:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"piloto de produção limitado a US$ {cap:.2f}: o capital de produção seria "
+                f"US$ {config.capital_for_sizing():.2f}. Volte ao testnet e cumpra os 30 dias para subir o capital."
+            ),
+        )
+
+
+def _commit_mandate(config: BotConfig, store: Store) -> None:
+    """The one place the mandate is written: a pilot's cap is checked against the resulting config."""
+    _check_pilot(config, store)
+    commit_mandate_for(config)
+
+
 def _day_preset(current: BotConfig) -> BotConfig:
     """The current config with the day-trade limits, the day strategies on and the swing ones off."""
     data = current.model_dump()
@@ -642,7 +799,7 @@ def apply_day_preset() -> dict[str, Any]:
             raise HTTPException(status_code=422, detail=_validation_detail(exc)) from exc
         preview = _preset_preview(current, preset)
         # The mandate first: if it cannot be written, the config does not move either.
-        commit_mandate_for(preset)
+        _commit_mandate(preset, runtime.store)
         preset.save()
         rebound = _bind(preset)
         rebound._ledger("day_preset", {"changes": preview["changes"]})
@@ -673,6 +830,7 @@ def update_config(body: ConfigUpdate) -> dict[str, Any]:
             "entry_mode",
             "min_win_rate",
             "trailing_stop",
+            "trailing_activation",
             "testnet_test_mode",
             "auto_select",
             "auto_select_count",
@@ -693,9 +851,10 @@ def update_config(body: ConfigUpdate) -> dict[str, Any]:
             if dropped:
                 raise HTTPException(status_code=409, detail=f"pares com posição aberta não podem sair da lista: {dropped}")
         reasons: list[str] = []
+        pilot: float | None = None
         if body.mode == "production" and current.mode != "production":
             keys = service.check_status("binance-live-trade-bot")
-            config, reasons = switch_to_production(
+            config, reasons, pilot = switch_to_production(
                 config,
                 runtime.store,
                 confirmation=body.confirmation or "",
@@ -707,10 +866,18 @@ def update_config(body: ConfigUpdate) -> dict[str, Any]:
             if reasons:
                 # Refused as a whole: nothing in this request is saved, the runtime keeps its config.
                 raise HTTPException(status_code=409, detail={"mode": current.mode, "reasons": reasons})
+            # The pilot state goes to the production store before anything else moves: a failure
+            # here refuses the switch instead of leaving production without its cap. A full
+            # promotion clears it.
+            production_store = ctx.store_for(config)
+            try:
+                production_store.set_state(PILOT_STATE, pilot)
+            finally:
+                production_store.close()
             config.save()
             rebound = _bind(config)
             # The word PRODUCAO is the consent; the production mandate uses production capital.
-            commit_mandate_for(config)
+            _commit_mandate(config, rebound.store)
         elif body.mode == "testnet" and current.mode == "production":
             flattened = runtime.executor.flatten() if config.flatten_on_halt else []
             failed = [item for item in flattened if item.get("status") != "ok"]
@@ -735,17 +902,20 @@ def update_config(body: ConfigUpdate) -> dict[str, Any]:
             config.save()
             rebound = _bind(config)
         else:
+            # A production pilot keeps its capital: refused before anything is saved.
+            _check_pilot(config, runtime.store)
             config.save()
             rebound = _bind(config)
             if body.reconfirm_mandate:
-                commit_mandate_for(config)
+                _commit_mandate(config, rebound.store)
         if config.entry_mode == "auto" and current.entry_mode != "auto":
             # Automatic entries always need an explicit Start after the switch.
             rebound.stop()
         if config.auto_select and not current.auto_select:
             # The next cycle picks the pairs instead of waiting for the hour.
             rebound.store.set_state("auto_select_at", None)
-        rebound._ledger("config", {"mode": config.mode, "operator": "panel", "reasons": reasons})
+        recorded = _pilot_cap(rebound.store) if config.mode == "production" else None
+        rebound._ledger("config", {"mode": config.mode, "operator": "panel", "reasons": reasons, "pilot_cap_usd": recorded})
         return {"status": "ok", "mode": config.mode, "config": json.loads(config.model_dump_json())}
 
 

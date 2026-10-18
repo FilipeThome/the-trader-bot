@@ -101,7 +101,7 @@ export function TradeChart({ trade }: { trade: Trade }) {
     t: trade.candles.map((candle) => candle.t),
     candles: trade.candles.map((candle) => [candle.o, candle.c, candle.l, candle.h]),
   };
-  const trailing = position.exit_policy === "trailing";
+  const trailing = position.exit_policy === "trailing" || position.exit_policy === "trailing_tp";
   const day = position.exit_policy === "day";
   // After the first target the rest has no target: its stop sits at break-even.
   const target = trailing || (day && position.tp1_done) ? null : position.target_price;

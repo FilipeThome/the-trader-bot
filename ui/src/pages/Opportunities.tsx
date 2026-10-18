@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router";
 
 import { api } from "../api";
@@ -7,7 +7,7 @@ import { Help } from "../Help";
 import { MarketCharts } from "../LiveCharts";
 import { statusLabels, strategyName } from "../labels";
 import { useBot } from "../store";
-import type { Decision, Opportunity } from "../types";
+import type { ArmedEntry, Decision, Opportunity } from "../types";
 
 const strategies = [
   ["todas", "Todas"],
@@ -24,6 +24,35 @@ export function Opportunities() {
   const [strategy, setStrategy] = useState("todas");
   const [selected, setSelected] = useState<Opportunity | null>(null);
   const [tradeId, setTradeId] = useState<number | null>(null);
+  const [armed, setArmed] = useState<ArmedEntry[]>([]);
+  const [trigger, setTrigger] = useState("");
+  const [hours, setHours] = useState("24");
+
+  async function refreshArmed() {
+    try {
+      setArmed((await api.armed()).rows);
+    } catch {
+      // The status bar already reports an unreachable API.
+    }
+  }
+
+  useEffect(() => {
+    void refreshArmed();
+    const timer = window.setInterval(() => void refreshArmed(), 10000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  async function arm(row: Opportunity) {
+    const price = Number(trigger.replace(",", "."));
+    await perform(`Armar ${row.symbol}`, () => api.arm(row.symbol, row.strategy, price, Number(hours)), (reply) =>
+      [
+        `Entrada armada: compra ${row.symbol} quando o preço ${reply.condition === "below" ? "cair a" : "subir a"} ${price}`,
+        `até ${new Date(reply.expires_at).toLocaleString("pt-BR")}`,
+        reply.cycle_started ? "ciclo iniciado" : "",
+      ].filter(Boolean).join(" · "),
+    );
+    void refreshArmed();
+  }
 
   async function execute(row: Opportunity) {
     const body = await perform(`Executar ${row.symbol}`, () => api.execute(row.symbol, row.strategy), (reply) => {
@@ -150,6 +179,34 @@ export function Opportunities() {
         </tbody>
       </table>
       {visible.length === 0 && <p className="mt-4 text-sm text-neutral-500">Nenhuma oportunidade neste ambiente.</p>}
+      {armed.length > 0 && (
+        <div className="mt-6 text-sm">
+          <h2 className="inline-flex items-center font-semibold">
+            Entradas armadas
+            <Help text="Compras que esperam o preço chegar ao gatilho. Disparada virou ordem; expirada passou do prazo." />
+          </h2>
+          <ul className="mt-1 space-y-1">
+            {armed.map((item) => (
+              <li key={item.id}>
+                {item.symbol} · {strategyName(item.strategy)} · {item.condition === "below" ? "≤" : "≥"} {item.trigger_price} ·{" "}
+                {{ armed: "armada", fired: "disparada", expired: "expirada", cancelled: "cancelada" }[item.status]}
+                {item.status === "armed" && ` até ${new Date(item.expires_at).toLocaleString("pt-BR")}`}
+                {item.reason && <span className="ml-2 text-neutral-500">{item.reason}</span>}
+                {item.status === "armed" && (
+                  <button
+                    className="ml-2 underline"
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void perform(`Cancelar gatilho de ${item.symbol}`, () => api.disarm(item.id)).then(() => refreshArmed())}
+                  >
+                    cancelar
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       {tradeId != null && (
         <p className="mt-4 text-sm">
           <Link className="rounded bg-green-700 px-3 py-2 font-medium text-white" to={`/trade/${tradeId}`}>
@@ -167,6 +224,19 @@ export function Opportunities() {
             Líquido {formatPct(selected.net_return)} · tamanho proposto {selected.size_usd ?? 0} USD
             <Help align="end" text="Líquido é o ganho esperado depois dos custos. O tamanho é quanto dinheiro, em dólares, o robô usaria nesta ordem se ela fosse enviada." />
           </p>
+          {selected.action.startsWith("Compr") && (
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              Armar por gatilho: comprar a
+              <input className="w-28 border border-neutral-300 bg-transparent px-1 dark:border-neutral-700" inputMode="decimal" value={trigger} onChange={(event) => setTrigger(event.target.value)} />
+              por
+              <input className="w-14 border border-neutral-300 bg-transparent px-1 dark:border-neutral-700" inputMode="numeric" value={hours} onChange={(event) => setHours(event.target.value)} />
+              horas
+              <button className="underline disabled:opacity-50" type="button" disabled={busy || !(Number(trigger.replace(",", ".")) > 0)} onClick={() => void arm(selected)}>
+                armar
+              </button>
+              <Help align="end" text="Como o Start Condition da Binance. Abaixo do preço atual espera um recuo, acima espera um rompimento. Quando o preço chega lá, o robô compra pelas mesmas regras da entrada manual, e só se esta linha ainda estiver Pronta. Nada fica na corretora antes disso." />
+            </div>
+          )}
           <button className="mt-3 block underline" type="button" onClick={() => setSelected(null)}>
             fechar
           </button>

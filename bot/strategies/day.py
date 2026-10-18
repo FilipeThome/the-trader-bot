@@ -52,6 +52,14 @@ class DayRules:
 
 DAY = DayRules()
 
+#: Automatic day entries need an estimated hit rate this far above the break-even of the
+#: first-target leg (``bot.risk.breakeven_win_rate``). A live entry rule, not replayed by
+#: the backtest, so it stays out of ``DAY.params`` and out of the validation key. The
+#: break-even of the TP1 leg is not the one of the blended payoff (half at TP1, half near
+#: break-even or the deadline): this floor is a guard against live drift, not proof of an
+#: edge; the backtest gate judges the expectancy.
+DAY_WIN_RATE_MARGIN = 0.03
+
 
 def in_quiet_hours(decision_time: datetime | pd.Timestamp, rules: DayRules = DAY) -> bool:
     """True when ``decision_time`` (the close of the entry bar) falls in the quiet hours."""

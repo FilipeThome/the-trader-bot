@@ -44,6 +44,15 @@ def correlation(left: list[float], right: list[float]) -> float:
     return float(num / (den_a * den_b))
 
 
+def breakeven_win_rate(opportunity: Opportunity) -> float | None:
+    """Hit rate at which a row's risk and target pay even: ``1 / (1 + b)`` with
+    ``b = net_return / risk_pct``. ``kelly_risk`` is positive exactly above it. None
+    when the row has no positive payoff or risk."""
+    if opportunity.risk_pct <= 0 or opportunity.net_return <= 0:
+        return None
+    return opportunity.risk_pct / (opportunity.risk_pct + opportunity.net_return)
+
+
 class RiskManager:
     """``capital`` is the configured capital: equity, daily loss and drawdown are measured on it.
 
@@ -92,6 +101,21 @@ class RiskManager:
         p = opportunity.win_rate
         return p - (1 - p) / payoff
 
+    def portfolio_verdict(self, *, day_pnl: float, peak_equity: float, equity: float) -> RiskVerdict | None:
+        """The account-wide limits: the daily loss pauses the day, the drawdown halts. None within both.
+
+        Strategy entries (``assess``) and DCA or grid buys (``Runtime._robot_buy_block``) obey the same verdict.
+        """
+        if day_pnl <= -self.capital * self.limits.max_daily_loss_pct:
+            return RiskVerdict(
+                False,
+                f"perda diária de {self.limits.max_daily_loss_pct:.0%} — pausa até o próximo dia UTC",
+                pause_day=True,
+            )
+        if peak_equity > 0 and equity <= peak_equity * (1 - self.limits.max_drawdown_pct):
+            return RiskVerdict(False, f"drawdown de {self.limits.max_drawdown_pct:.0%} desde o pico", halt=True)
+        return None
+
     def assess(
         self,
         opportunity: Opportunity,
@@ -110,14 +134,9 @@ class RiskManager:
             return RiskVerdict(False, "OHLCV com mais de 2 intervalos de atraso")
         if signal_only:
             return RiskVerdict(False, "estratégia em somente sinal: sem validação no histórico ou rebaixada")
-        if day_pnl <= -self.capital * self.limits.max_daily_loss_pct:
-            return RiskVerdict(
-                False,
-                f"perda diária de {self.limits.max_daily_loss_pct:.0%} — pausa até o próximo dia UTC",
-                pause_day=True,
-            )
-        if peak_equity > 0 and equity <= peak_equity * (1 - self.limits.max_drawdown_pct):
-            return RiskVerdict(False, f"drawdown de {self.limits.max_drawdown_pct:.0%} desde o pico", halt=True)
+        breached = self.portfolio_verdict(day_pnl=day_pnl, peak_equity=peak_equity, equity=equity)
+        if breached is not None:
+            return breached
         if trades_today >= self.limits.max_trades_per_day:
             return RiskVerdict(False, "limite de trades por dia")
         if len(open_positions) >= self.limits.max_positions and opportunity.status != "em_posicao":
@@ -165,10 +184,14 @@ def open_risk(positions: list[dict[str, Any]], *, pending_risk: float) -> float:
 
     An open position risks ``qty × (average − stop)``, zero once a trailing stop
     passed its average. A pending entry has no fill yet and counts as one full
-    trade's risk.
+    trade's risk. A ``reserved`` row is what a DCA or grid instance may still
+    lose beyond its current position, counted from its creation.
     """
     total = 0.0
     for row in positions:
+        if row.get("status") == "reserved":
+            total += float(row.get("reserved_risk") or 0)
+            continue
         if row.get("status") == "pending":
             total += pending_risk
             continue
@@ -209,7 +232,8 @@ def allocate(
         return accepted
     budget = max(0.0, cash) * CASH_BUFFER / (1 + SPOT_TAKER)
     held = {str(row["symbol"]) for row in live}
-    slots = limits.max_positions - len(live)
+    # One position per pair; a DCA or grid instance reserves its pair even with no position.
+    slots = limits.max_positions - len(held)
     risk = open_risk(live, pending_risk=capital * limits.risk_per_trade_pct)
     risk_cap = capital * limits.max_open_risk_pct
     for row in ordered:

@@ -164,6 +164,10 @@ export type Features = {
 
 export type Status = {
   running: boolean;
+  /** Day rows enter automatically above the break-even of their first target plus this. */
+  day_win_rate_margin?: number;
+  /** Production pilot: the capital cap recorded at the switch; null outside a pilot. */
+  pilot_cap_usd?: number | null;
   halted: boolean;
   halt_reason?: string | null;
   journal?: { blocked: boolean; error: string | null; blocking: { state_key: string; event: string }[] };
@@ -179,6 +183,8 @@ export type Status = {
   min_win_rate: number;
   min_win_rate_sample: number;
   trailing_stop: boolean;
+  trailing_activation: boolean;
+  trailing_rules?: { activation_r: number; callback_share: number };
   testnet_test_mode: boolean;
   auto_select: boolean;
   auto_select_count: number;
@@ -199,4 +205,66 @@ export type PnlDay = {
   slippage: number;
   funding: number;
   trades: number;
+};
+
+export type ArmedEntry = {
+  id: number;
+  symbol: string;
+  strategy: string;
+  trigger_price: number;
+  condition: "below" | "above";
+  created_at: string;
+  expires_at: string;
+  status: "armed" | "fired" | "expired" | "cancelled";
+  reason: string | null;
+  position_id: number | null;
+};
+
+export type InstanceKind = "dca" | "grid";
+
+export type BotInstance = {
+  id: number;
+  kind: InstanceKind;
+  symbol: string;
+  params: Record<string, number | string | boolean | null>;
+  state: Record<string, unknown>;
+  status: "active" | "stopping" | "stopped";
+  created_at: string;
+  stopped_at: string | null;
+  realized_pnl: number;
+  reason: string | null;
+  position: Position | null;
+};
+
+export type InstancePreview = {
+  kind: InstanceKind;
+  symbol: string;
+  price: number;
+  spread: number;
+  taker: number;
+  order_cap: number | null;
+  problems: string[];
+  plan: {
+    ladder?: { index: number; price: number; usd: number; avg: number; qty: number }[];
+    levels?: number[];
+    qty_per_level?: number[];
+    stop_price?: number;
+    total_usd?: number;
+    first_buy_usd?: number;
+    profit_per_grid_net?: number;
+    loss_at_stop_usd: number;
+    orders_per_round?: number;
+    max_held_usd?: number;
+  };
+  replay: {
+    error?: string;
+    days?: number;
+    rounds?: number;
+    wins?: number;
+    grid_trades?: number;
+    ended?: string | null;
+    pnl_usd?: number;
+    pnl_pct?: number;
+    max_drawdown_pct?: number;
+  };
 };
