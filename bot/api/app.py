@@ -120,6 +120,9 @@ class ConfigUpdate(BaseModel):
     auto_select: bool | None = None
     auto_select_count: int | None = None
     min_profit_usd: float | None = None
+    #: Fixed take-profit and stop-loss; sent together, null clears both.
+    take_profit_pct: float | None = None
+    stop_loss_pct: float | None = None
     reconfirm_mandate: bool = False
 
 
@@ -256,6 +259,9 @@ def status() -> dict[str, Any]:
         "trailing_stop": runtime.config.trailing_stop,
         "trailing_activation": runtime.config.trailing_activation,
         "trailing_rules": TRAIL.params,
+        "take_profit_pct": runtime.config.take_profit_pct,
+        "stop_loss_pct": runtime.config.stop_loss_pct,
+        "exit_policy": runtime.config.exit_policy,
         "auto_select": runtime.config.auto_select,
         "auto_select_count": runtime.config.auto_select_count,
         "auto_select_at": store.get_state("auto_select_at"),
@@ -608,23 +614,62 @@ def validate(strategy_id: str) -> dict[str, Any]:
     if strategy_id not in VALIDATABLE:
         raise HTTPException(status_code=422, detail="só trend, mean_reversion e momentum têm teste histórico")
     config = _runtime().config.model_copy(deep=True)
+    job = _claim_validation(config, strategy_id, "baixando")
+    if job is None:
+        raise HTTPException(status_code=409, detail="essa validação já está rodando")
+    key = (config.mode, strategy_id)
+    threading.Thread(
+        target=_run_validation, args=(key, strategy_id, config, mode_root(config)), name=f"validate-{strategy_id}", daemon=True
+    ).start()
+    return job
+
+
+def _claim_validation(config: BotConfig, strategy_id: str, stage: str) -> dict[str, Any] | None:
+    """Register a validation job, or None when one of this strategy is already running."""
     key = (config.mode, strategy_id)
     with ctx.validation_lock:
         running = ctx.validations.get(key)
         if running is not None and running["status"] == "running":
-            raise HTTPException(status_code=409, detail="essa validação já está rodando")
+            return None
         job: dict[str, Any] = {
             "status": "running",
-            "stage": "baixando",
+            "stage": stage,
             "done": 0,
             "total": len(config.symbols),
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
         ctx.validations[key] = job
-    threading.Thread(
-        target=_run_validation, args=(key, strategy_id, config, mode_root(config)), name=f"validate-{strategy_id}", daemon=True
-    ).start()
-    return dict(job)
+        return dict(job)
+
+
+def _auto_validate(config: BotConfig, store: Store) -> list[str]:
+    """Validate, one after another, each enabled strategy without a result for the current exit rule.
+
+    Changing the take-profit and stop-loss, or turning a strategy on, then needs no
+    click: the gate runs by itself and nothing trades until it passes. A strategy
+    that already has a result for this rule, passed or not, is not re-run; one
+    running is left alone. A single worker keeps the history downloads off each other.
+    """
+    stored = {row["strategy_id"]: row["params"] for row in store.strategies()}
+    wanted = [
+        strategy_id
+        for strategy_id in VALIDATABLE
+        if config.strategies.get(strategy_id) and not validated_for(stored.get(strategy_id), strategy_id, config.exit_policy)
+    ]
+    queued = [strategy_id for strategy_id in wanted if _claim_validation(config, strategy_id, "na fila") is not None]
+    if not queued:
+        return []
+    snapshot = config.model_copy(deep=True)
+    root = mode_root(snapshot)
+
+    def work() -> None:
+        for strategy_id in queued:
+            key = (snapshot.mode, strategy_id)
+            _update_job(key, stage="baixando")
+            _run_validation(key, strategy_id, snapshot, root)
+
+    threading.Thread(target=work, name="validate-auto", daemon=True).start()
+    return queued
 
 
 def _validation_jobs(mode: str) -> dict[str, dict[str, Any]]:
@@ -803,7 +848,7 @@ def apply_day_preset() -> dict[str, Any]:
         preset.save()
         rebound = _bind(preset)
         rebound._ledger("day_preset", {"changes": preview["changes"]})
-        return {"status": "ok", **preview}
+        return {"status": "ok", **preview, "validating": _auto_validate(preset, rebound.store)}
 
 
 @app.put("/bot/config")
@@ -826,6 +871,9 @@ def update_config(body: ConfigUpdate) -> dict[str, Any]:
             data["flatten_on_halt"] = body.flatten_on_halt
         if body.limits is not None:
             data["limits"] = {**data["limits"], **body.limits}
+        if {"take_profit_pct", "stop_loss_pct"} & body.model_fields_set:
+            data["take_profit_pct"] = body.take_profit_pct
+            data["stop_loss_pct"] = body.stop_loss_pct
         for name in (
             "entry_mode",
             "min_win_rate",
@@ -914,9 +962,12 @@ def update_config(body: ConfigUpdate) -> dict[str, Any]:
         if config.auto_select and not current.auto_select:
             # The next cycle picks the pairs instead of waiting for the hour.
             rebound.store.set_state("auto_select_at", None)
+        validating: list[str] = []
+        if config.exit_policy != current.exit_policy or body.strategies is not None:
+            validating = _auto_validate(config, rebound.store)
         recorded = _pilot_cap(rebound.store) if config.mode == "production" else None
         rebound._ledger("config", {"mode": config.mode, "operator": "panel", "reasons": reasons, "pilot_cap_usd": recorded})
-        return {"status": "ok", "mode": config.mode, "config": json.loads(config.model_dump_json())}
+        return {"status": "ok", "mode": config.mode, "config": json.loads(config.model_dump_json()), "validating": validating}
 
 
 def _require_listed(collector: Collector, symbols: list[str], mode: str) -> None:

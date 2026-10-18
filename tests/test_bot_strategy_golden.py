@@ -94,17 +94,18 @@ def day_digests(strategy_id: str) -> tuple[tuple[int, str], tuple[int, str]]:
     """Setups on every closed 15m window (with the closed 1h bars) and the day replay's trades."""
     from bot.backtest.runner import simulate
     from bot.strategies import STRATEGIES
-    from bot.strategies.day import closed_hourly
+    from bot.strategies.day import MIN_HOURLY_BARS, closed_hourly
 
     m15 = candles(1500, 7, "15min")
     hourly = candles(500, 7, "h")
     setups = []
     for end in range(60, len(m15) + 1):
         window = m15.iloc[max(0, end - WINDOW) : end]
-        found = STRATEGIES[strategy_id].evaluate(
-            "BTC/USDT", "15m", window, hourly=closed_hourly(hourly, window.index[-1] + pd.Timedelta(minutes=15), 299)
-        )
-        setups.append(None if found is None else asdict(found))
+        closed = closed_hourly(hourly, window.index[-1] + pd.Timedelta(minutes=15), 299)
+        found = STRATEGIES[strategy_id].evaluate("BTC/USDT", "15m", window, hourly=closed)
+        # Both series start together, so the first 60 hours read as a young pair, which now
+        # trades on its day (``session_trend``). Every established window must stay as before.
+        setups.append(None if found is None or len(closed) < MIN_HOURLY_BARS else asdict(found))
     trades = simulate(strategy_id, "BTC/USDT", m15, "15m", hourly=hourly)
     return (
         (sum(1 for setup in setups if setup is not None), hashlib.sha256(repr(setups).encode()).hexdigest()),
@@ -115,7 +116,8 @@ def day_digests(strategy_id: str) -> tuple[tuple[int, str], tuple[int, str]]:
 DAY_GOLDEN = {
     "intraday_momentum": (
         (25, "44ffdc94773c51dd9ca7593747c56db5dabb8247213bfda1fe10847413ba9900"),
-        (10, "3e65dc1795059ada3182dbed622f3f62b4b7951c7499c87701aea04f96e67d9b"),
+        # 10 trades before young pairs traded their day; the 2 new ones open in the first 60 hours.
+        (12, "0abb89d4958ee4692253b1ff5614798f9fff2ebedaf48a4b5c45ff0c5f5d25f9"),
     ),
     "vwap_pullback": (
         (27, "fa0da2f17c1aa0921a2129604737096589ef4ad89ebcc5b7f28bf93c37465d98"),

@@ -7,7 +7,8 @@ leaves by the configured exit policy: ``target`` (stop or target) or
 ``trailing`` (a stop that follows the highest close at the entry's stop
 distance, no target), ``trailing_tp`` (the entry stop until the activation
 gain, then a closer stop under the highest close; ``bot.strategies.trailing``),
-and always at the strategy's own exit. Stops and
+and always at the strategy's own exit. The operator's fixed rule
+(``bot.strategies.fixed``) replays apart, in ``simulate_fixed``. Stops and
 targets are checked against each bar's low and high, as broker orders fill
 on wicks; the stop wins when one bar touches both. Each round trip
 pays the spot taker fee twice. A pass also needs half-split stability: the
@@ -35,6 +36,7 @@ from bot.evaluator import SPOT_TAKER
 from bot.indicators import ema
 from bot.strategies.base import Setup
 from bot.strategies.day import DAY, ENTRY_BAR, DayRules, in_quiet_hours
+from bot.strategies.fixed import FixedExit, parse_fixed
 from bot.strategies.intraday import IntradayMomentum, VwapPullback
 from bot.strategies.mean_reversion import MeanReversion
 from bot.strategies.momentum import Momentum
@@ -121,6 +123,9 @@ def simulate(
     strategy = _strategy(strategy_id)
     if strategy is None:
         return []
+    fixed = parse_fixed(exit_policy)
+    if fixed is not None:
+        return simulate_fixed(strategy, symbol, frame, timeframe, fixed, hourly=hourly, day=day or DAY)
     if isinstance(strategy, (IntradayMomentum, VwapPullback)):
         return simulate_day(strategy, symbol, frame, hourly, day or DAY)
     trades: list[Trade] = []
@@ -233,6 +238,68 @@ def simulate_day(
     return trades
 
 
+def simulate_fixed(
+    strategy: TrendBreakout | MeanReversion | Momentum | IntradayMomentum | VwapPullback,
+    symbol: str,
+    frame: pd.DataFrame,
+    timeframe: str,
+    fixed: FixedExit,
+    *,
+    hourly: pd.DataFrame | None = None,
+    day: DayRules = DAY,
+) -> list[Trade]:
+    """Replay the operator's fixed take-profit and stop-loss.
+
+    * The entry is the close of the bar whose setup appeared. A day strategy keeps
+      its quiet hours and sees only the 1h bars closed by then, as in ``simulate_day``.
+    * Each later bar: the stop rests at the broker, so it is checked on the low first
+      and fills at the stop (or the open, on a gap through it). The target is not an
+      order on the book: the cycle sells at the last price once it reaches the
+      target. The replay only has closed bars, so it sells at the close of the bar
+      that closes at or above it; live checks every minute and can sell on a touch
+      the closed bar no longer shows, so the replay never counts a wick as a win.
+    * No strategy exit, trailing or time stop. A day strategy also pays
+      ``DAY_SLIPPAGE`` on both legs, like its own replay.
+    """
+    day_style = isinstance(strategy, (IntradayMomentum, VwapPullback))
+    if day_style and (hourly is None or hourly.empty):
+        return []
+    closes = (hourly.index + pd.Timedelta(hours=1)).values if day_style and hourly is not None else None
+    cost = ROUND_TRIP_COST + (2 * DAY_SLIPPAGE if day_style else 0.0)
+    trades: list[Trade] = []
+    holding = False
+    entry = stop = target = 0.0
+    for end in range(_WARMUP_BARS, len(frame)):
+        window = frame.iloc[max(0, end + 1 - LIVE_WINDOW) : end + 1]
+        close = float(window["close"].iloc[-1])
+        if not holding:
+            if isinstance(strategy, (IntradayMomentum, VwapPullback)) and closes is not None and hourly is not None:
+                decided_at = window.index[-1] + ENTRY_BAR
+                if in_quiet_hours(decided_at, day):
+                    continue
+                seen = int(np.searchsorted(closes, decided_at.to_datetime64(), side="right"))
+                setup = strategy.evaluate(symbol, "15m", window, hourly=hourly.iloc[max(0, seen - LIVE_WINDOW) : seen])
+            else:
+                setup = strategy.evaluate(symbol, timeframe, window)
+            if setup is not None and setup.direction > 0:
+                holding = True
+                entry = close
+                stop = entry * (1 - fixed.stop_loss_pct)
+                target = entry * (1 + fixed.take_profit_pct)
+            continue
+        opened = float(window["open"].iloc[-1])
+        low = float(window["low"].iloc[-1])
+        if low <= stop:
+            fill = min(opened, stop)
+        elif close >= target:
+            fill = close
+        else:
+            continue
+        trades.append(Trade(window.index[-1], (fill - entry) / entry - cost))
+        holding = False
+    return trades
+
+
 def _strategy_exit(strategy: Any, window: pd.DataFrame) -> bool:
     """The same strategy exits the live runtime uses."""
     if isinstance(strategy, (TrendBreakout, Momentum)):
@@ -245,8 +312,9 @@ def _strategy_exit(strategy: Any, window: pd.DataFrame) -> bool:
 
 
 def evaluate(strategy_id: str, trades: list[Trade], years: float, *, exit_policy: str = "target") -> BacktestResult:
-    if exit_policy == "day":
-        return _evaluate_day(strategy_id, trades, years)
+    # A day strategy is judged by the day gate whatever rule it exits by: many short trades.
+    if exit_policy == "day" or is_day(strategy_id):
+        return _evaluate_day(strategy_id, trades, years, exit_policy=exit_policy)
     wins = sum(1 for trade in trades if trade.net_return > 0)
     if not trades or years <= 0:
         return BacktestResult(strategy_id, 0.0, 0.0, len(trades), 0.0, False, wins, exit_policy)
@@ -277,13 +345,13 @@ def evaluate(strategy_id: str, trades: list[Trade], years: float, *, exit_policy
     )
 
 
-def _evaluate_day(strategy_id: str, trades: list[Trade], years: float) -> BacktestResult:
+def _evaluate_day(strategy_id: str, trades: list[Trade], years: float, *, exit_policy: str = "day") -> BacktestResult:
     """The day gate: Sharpe of daily returns (days without a trade count as 0), drawdown,
     at least ``DAY_MIN_TRADES``, a mean net return per trade of ``DAY_MIN_MEAN_RETURN``
     and both halves of the trades making money."""
     wins = sum(1 for trade in trades if trade.net_return > 0)
     if not trades or years <= 0:
-        return BacktestResult(strategy_id, 0.0, 0.0, len(trades), 0.0, False, wins, "day", "nenhum trade")
+        return BacktestResult(strategy_id, 0.0, 0.0, len(trades), 0.0, False, wins, exit_policy, "nenhum trade")
     ordered = sorted(trades, key=lambda trade: trade.exit_time)
     returns = pd.Series([trade.net_return for trade in ordered])
     equity = (1 + returns).cumprod()
@@ -311,7 +379,7 @@ def _evaluate_day(strategy_id: str, trades: list[Trade], years: float) -> Backte
         if failed
     ]
     total = float(equity.iloc[-1] - 1)
-    return BacktestResult(strategy_id, sharpe, drawdown, len(ordered), total, not reasons, wins, "day", "; ".join(reasons))
+    return BacktestResult(strategy_id, sharpe, drawdown, len(ordered), total, not reasons, wins, exit_policy, "; ".join(reasons))
 
 
 def validate_strategy(
@@ -324,10 +392,11 @@ def validate_strategy(
 ) -> BacktestResult:
     """Replay every symbol, in parallel processes, and judge the pooled trades against the gate.
 
-    A day strategy always replays with the day exits (``exit_policy`` "day")
-    and needs ``hourly_frames``, the closed 1h bars of each symbol.
+    A day strategy replays with the day exits (``exit_policy`` "day") unless the
+    operator's fixed rule replaces them, and needs ``hourly_frames``, the closed 1h
+    bars of each symbol.
     """
-    if is_day(strategy_id):
+    if is_day(strategy_id) and parse_fixed(exit_policy) is None:
         exit_policy = "day"
     hourly = hourly_frames or {}
     jobs: list[_Job] = [
@@ -410,8 +479,9 @@ def promotion_record(result: BacktestResult, params: dict[str, Any] | None = Non
             "exit_policy": result.exit_policy,
             "reason": result.reason,
             "window": LIVE_WINDOW,
-            # A day validation holds only for the day rules it replayed.
-            **({"day": DAY.params} if result.exit_policy == "day" else {}),
+            # A day validation holds only for the day rules it replayed (quiet hours and
+            # slippage replay under a fixed rule too).
+            **({"day": DAY.params} if result.exit_policy == "day" or is_day(result.strategy_id) else {}),
             **({"trailing": TRAIL.params} if result.exit_policy == "trailing_tp" else {}),
         },
     }

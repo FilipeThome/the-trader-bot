@@ -3,6 +3,7 @@
 from typing import Any
 
 from bot.strategies.day import DAY
+from bot.strategies.fixed import is_fixed
 
 from bot.strategies.funding import FundingCarry
 from bot.strategies.intraday import IntradayMomentum, VwapPullback
@@ -26,7 +27,13 @@ DAY_STRATEGIES = frozenset(key for key, strategy in STRATEGIES.items() if strate
 
 
 def exit_policy_for(strategy_id: str, swing_policy: str) -> str:
-    """The exit rule of a strategy's positions: ``day`` for day strategies, the operator's otherwise."""
+    """The exit rule of a strategy's positions.
+
+    The operator's fixed take-profit and stop-loss apply to every strategy; otherwise
+    day strategies trade ``day`` and the others the operator's swing rule.
+    """
+    if is_fixed(swing_policy):
+        return swing_policy
     return "day" if strategy_id in DAY_STRATEGIES else swing_policy
 
 
@@ -39,7 +46,10 @@ def validated_for(params: dict[str, Any] | None, strategy_id: str, swing_policy:
         return False
     if policy == "trailing_tp":
         return params.get("trailing") == TRAIL.params
-    return policy != "day" or params.get("day") == DAY.params
+    # A day strategy replays its quiet hours and slippage under a fixed rule too.
+    if policy == "day" or strategy_id in DAY_STRATEGIES:
+        return params.get("day") == DAY.params
+    return True
 
 __all__ = [
     "DAY_STRATEGIES",

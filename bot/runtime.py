@@ -64,6 +64,7 @@ from bot.reports import append_ledger
 from bot.risk import LOSS_GUARD_WINDOW, RiskManager, allocate, breakeven_win_rate, open_risk, protect, utc_day
 from bot.store import Store
 from bot.strategies import (
+    DAY_STRATEGIES,
     STRATEGIES,
     FundingCarry,
     IntradayMomentum,
@@ -75,6 +76,7 @@ from bot.strategies import (
     validated_for,
 )
 from bot.strategies.day import DAY_WIN_RATE_MARGIN, in_quiet_hours
+from bot.strategies.fixed import FIXED_WIN_RATE_MARGIN, is_fixed, parse_fixed
 from bot.strategies.trailing import TRAILING_POLICIES
 from bot.strategies.base import Setup
 
@@ -879,14 +881,21 @@ class Runtime:
         Swing rows need ``min_win_rate``. Day rows need the break-even of their
         first target plus ``DAY_WIN_RATE_MARGIN``: a day trade wins less often by
         design (half at 1.5R, the rest at break-even), so the swing floor would
-        never let one in.
+        never let one in. Rows under the operator's fixed take-profit and stop-loss
+        need the break-even of that payoff plus ``FIXED_WIN_RATE_MARGIN``: a 3%
+        target over a 1.5% stop pays at a hit rate well under the swing floor.
         """
         if item.test_only or item.win_rate is None:
             return False
-        if exit_policy_for(item.strategy, self.config.exit_policy) != "day":
+        policy = exit_policy_for(item.strategy, self.config.exit_policy)
+        if policy == "day":
+            margin = DAY_WIN_RATE_MARGIN
+        elif is_fixed(policy):
+            margin = FIXED_WIN_RATE_MARGIN
+        else:
             return item.win_rate >= self.config.min_win_rate
         breakeven = breakeven_win_rate(item)
-        return breakeven is not None and item.win_rate >= breakeven + DAY_WIN_RATE_MARGIN
+        return breakeven is not None and item.win_rate >= breakeven + margin
 
     def _choose_pairs(self, moment: datetime) -> list[str] | None:
         """Rank the most promising pairs, at most once an hour. Network only: runs outside the lock.
@@ -1047,6 +1056,13 @@ class Runtime:
             if self._policy(position) == "day":
                 self._day_exit(position, snapshot, moment, reserve)
                 continue
+            if is_fixed(self._policy(position)):
+                # The operator's rule: only the target recorded at the fill, or the broker stop.
+                reason = _target_reason(position, snapshot)
+                if reason is not None:
+                    result = self.executor.exit_position(position["id"], reason)
+                    self._ledger("exit", {"symbol": position["symbol"], "reason": reason, "status": result.get("status")})
+                continue
             reason = _exit_reason(position, snapshot, moment, use_target=self._policy(position) == "target")
             if reason is None:
                 continue
@@ -1130,6 +1146,9 @@ class Runtime:
                     continue
                 stats = self.store.strategy(strategy_id)
                 policy = exit_policy_for(strategy_id, self.config.exit_policy)
+                fixed = parse_fixed(policy)
+                if fixed is not None:
+                    setup = fixed.apply(setup)
                 # A validation run under other exit rules does not validate these.
                 matches = stats is not None and validated_for(stats["params"], strategy_id, self.config.exit_policy)
                 signal_only = stats is None or bool(stats["signal_only"]) or not matches
@@ -1140,7 +1159,8 @@ class Runtime:
                     min_sample=self.config.min_win_rate_sample,
                 )
                 stale = snapshot.stale(symbol, _price_interval(setup.timeframe), now=moment)
-                quiet = policy == "day" and in_quiet_hours(moment)
+                # Day signals skip the thin hours whatever rule they exit by.
+                quiet = strategy_id in DAY_STRATEGIES and in_quiet_hours(moment)
                 draft = classify(
                     setup,
                     slippage=snapshot.slippage(symbol, 1000),
@@ -1149,7 +1169,8 @@ class Runtime:
                     in_position=(symbol, strategy_id) in live,
                     score_threshold=self.config.score_threshold,
                     cost_multiple=self.config.cost_multiple,
-                    min_reward_risk=self.config.min_reward_risk,
+                    # The operator chose the payoff of a fixed rule; the hit-rate floor judges it.
+                    min_reward_risk=0.0 if fixed is not None else self.config.min_reward_risk,
                 )
                 draft.data_age_seconds = _age(snapshot, symbol, setup.timeframe, moment)
                 draft.win_rate = win_rate
@@ -1243,15 +1264,22 @@ def _inflight(position: dict[str, Any]) -> str | None:
     return str(leg.get("kind")) if isinstance(leg, dict) else None
 
 
+def _target_reason(position: dict[str, Any], snapshot: MarketSnapshot) -> str | None:
+    """"alvo atingido" when the last 15m price reached the position's recorded target."""
+    price = _last_price(snapshot, position["symbol"], "15m")
+    target = position.get("target_price")
+    if price is not None and target and price >= float(target):
+        return "alvo atingido"
+    return None
+
+
 def _exit_reason(
     position: dict[str, Any], snapshot: MarketSnapshot, moment: datetime, *, use_target: bool = True
 ) -> str | None:
     """Target (unless the stop trails instead) and the strategy's own exit."""
     symbol = position["symbol"]
-    price = _last_price(snapshot, symbol, "15m")
-    target = position.get("target_price")
-    if use_target and price is not None and target and price >= float(target):
-        return "alvo atingido"
+    if use_target and (reached := _target_reason(position, snapshot)):
+        return reached
     strategy = position["strategy"]
     hourly = _closed(snapshot, symbol, "1h", moment)
     if strategy == "trend" and hourly is not None:

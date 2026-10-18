@@ -31,6 +31,10 @@ TESTNET_MIN_TRADES = 15_000
 #: Liquid pairs ranked by momentum, and the days of the momentum return.
 RANK_POOL = 40
 MOMENTUM_DAYS = 28
+#: A pair listed less than ``MOMENTUM_DAYS`` ago is ranked on its day instead: the
+#: last ``YOUNG_HOURS`` closed 1h candles, and it needs at least ``YOUNG_MIN_HOURS``.
+YOUNG_HOURS = 24
+YOUNG_MIN_HOURS = 12
 
 
 def parse_exchange_info(payload: dict[str, Any]) -> list[dict[str, str]]:
@@ -186,7 +190,8 @@ def rank_promising(
     """The ``count`` liquid USDT pairs with the best risk-adjusted momentum.
 
     The score is the 28-day return over the standard deviation of the daily
-    returns, from closed daily candles of the ``pool`` most liquid pairs. Only
+    returns, from closed daily candles of the ``pool`` most liquid pairs. A pair
+    too young for 28 days is scored the same way on its day (``_day_score``). Only
     pairs with a positive score are returned, best first. ``listed`` limits the
     pool to the pairs the order venue lists. Momentum here only
     picks which pairs the strategies look at; it never buys by itself.
@@ -215,9 +220,30 @@ def _momentum_score(collector: Collector, pair: str) -> float | None:
     except Exception as exc:  # noqa: BLE001 - one unreadable pair leaves the ranking, not the cycle
         logger.warning("daily candles of %s failed: %s", pair, type(exc).__name__)
         return None
-    if len(closes) < MOMENTUM_DAYS + 1 or min(closes) <= 0:
+    if len(closes) < MOMENTUM_DAYS + 1:
+        # Listed less than a month ago: its day is the history there is.
+        return _day_score(collector, pair)
+    return _risk_adjusted(closes[-(MOMENTUM_DAYS + 1) :])
+
+
+def _day_score(collector: Collector, pair: str) -> float | None:
+    """The young pair's last 24h: return over the deviation of its closed 1h returns."""
+    query = urllib.parse.urlencode({"symbol": pair.replace("/", ""), "interval": "1h", "limit": YOUNG_HOURS + 1})
+    try:
+        payload = _read(collector, f"{SPOT}/api/v3/klines?{query}")
+        closes = [float(row[4]) for row in payload[:-1]]
+    except Exception as exc:  # noqa: BLE001 - one unreadable pair leaves the ranking, not the cycle
+        logger.warning("hourly candles of %s failed: %s", pair, type(exc).__name__)
         return None
-    window = closes[-(MOMENTUM_DAYS + 1) :]
+    if len(closes) < YOUNG_MIN_HOURS:
+        return None
+    return _risk_adjusted(closes[-YOUNG_HOURS:])
+
+
+def _risk_adjusted(window: list[float]) -> float | None:
+    """The window's return over the population deviation of its bar returns."""
+    if len(window) < 2 or min(window) <= 0:
+        return None
     returns = [later / earlier - 1 for earlier, later in zip(window, window[1:])]
     deviation = statistics.pstdev(returns)
     if deviation <= 0:

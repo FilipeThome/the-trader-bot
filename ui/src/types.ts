@@ -185,6 +185,9 @@ export type Status = {
   trailing_stop: boolean;
   trailing_activation: boolean;
   trailing_rules?: { activation_r: number; callback_share: number };
+  take_profit_pct?: number | null;
+  stop_loss_pct?: number | null;
+  exit_policy?: string;
   testnet_test_mode: boolean;
   auto_select: boolean;
   auto_select_count: number;

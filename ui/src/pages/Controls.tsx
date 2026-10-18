@@ -27,6 +27,8 @@ export function Controls() {
   const [openRisk, setOpenRisk] = useState("");
   const [pickCount, setPickCount] = useState("");
   const [minProfit, setMinProfit] = useState("");
+  const [takeProfit, setTakeProfit] = useState("");
+  const [stopLoss, setStopLoss] = useState("");
   // The result of a pair preset, shown next to its buttons: the top notice is out of sight there.
   const [symbolsNote, setSymbolsNote] = useState("");
 
@@ -46,6 +48,11 @@ export function Controls() {
   const pickCountValid = pickCountValue != null && pickCountValue >= 5 && pickCountValue <= 20;
   const minProfitValue = parseDecimal(minProfit);
   const minProfitValid = minProfitValue != null && minProfitValue <= 1000;
+  const fixedOn = status.take_profit_pct != null && status.stop_loss_pct != null;
+  const takeProfitPct = parseDecimal(takeProfit) ?? (takeProfit.trim() === "" && fixedOn ? (status.take_profit_pct ?? 0) * 100 : null);
+  const stopLossPct = parseDecimal(stopLoss) ?? (stopLoss.trim() === "" && fixedOn ? (status.stop_loss_pct ?? 0) * 100 : null);
+  // Same bounds as bot.strategies.fixed: a target under 1% never clears the cost filter.
+  const fixedValid = takeProfitPct != null && takeProfitPct >= 1 && takeProfitPct <= 100 && stopLossPct != null && stopLossPct >= 0.5 && stopLossPct <= 50;
   const riskPayload: Record<string, number> = {};
   if (tradeRisk.trim() !== "") riskPayload.risk_per_trade_pct = tradeRiskValue;
   if (openRisk.trim() !== "") riskPayload.max_open_risk_pct = openRiskValue;
@@ -373,10 +380,64 @@ export function Controls() {
           <Help text={`Entre 50% e 95%, para as estratégias swing. A taxa só existe com pelo menos ${status.min_win_rate_sample} trades da estratégia, no teste histórico e nas posições reais, com a mesma regra de saída. Quem não tem amostra nunca entra sozinho. Day trade ignora este mínimo: ganha menos vezes por desenho (metade no TP1, o resto no equilíbrio), então entra sozinho quando a taxa passa do ponto de equilíbrio do TP1 mais ${Math.round((status.day_win_rate_margin ?? 0.03) * 100)} pontos. Esse ponto depende do stop e do custo de cada oportunidade: com stop de 1%, fica perto de 47%.`} />
         </p>
       </div>
-      <p className="flex items-center">
+      <div className="rounded border border-neutral-300 p-3 dark:border-neutral-700">
+        <p className="mb-2 flex items-center font-medium">
+          Alvo e stop fixos
+          <Help text="Você define o ganho e a perda, em porcentagem do preço de entrada. O robô compra, põe o stop na Binance a essa distância abaixo do preço médio executado e vende quando o preço chega ao alvo. Vale para todas as estratégias e substitui o stop, o alvo e as saídas de cada uma, o stop móvel e as saídas do day trade. É outra regra de saída: as estratégias ligadas são validadas de novo sozinhas no histórico, e só operam se passarem. No automático, a taxa de acerto precisa passar do ponto de equilíbrio dessa regra (perda ÷ (perda + ganho líquido)) mais 3 pontos. O alvo mínimo é 1%, para cobrir o custo de ida e volta. Posições já abertas seguem a regra com que abriram." />
+        </p>
+        <p className="mb-2 text-neutral-500">
+          {fixedOn
+            ? `Ligado: vende com +${((status.take_profit_pct ?? 0) * 100).toFixed(2)}% e corta com −${((status.stop_loss_pct ?? 0) * 100).toFixed(2)}%.`
+            : "Desligado: cada estratégia usa o próprio stop e alvo (ou o stop móvel)."}
+        </p>
+        <p className="flex flex-wrap items-center gap-2">
+          ganho
+          <input
+            className="w-16 border bg-transparent px-2 py-1"
+            placeholder={fixedOn ? String(((status.take_profit_pct ?? 0) * 100).toFixed(2)) : "3"}
+            value={takeProfit}
+            onChange={(event) => setTakeProfit(event.target.value)}
+            aria-label="Ganho do alvo em porcentagem"
+          />
+          % · perda
+          <input
+            className="w-16 border bg-transparent px-2 py-1"
+            placeholder={fixedOn ? String(((status.stop_loss_pct ?? 0) * 100).toFixed(2)) : "1,5"}
+            value={stopLoss}
+            onChange={(event) => setStopLoss(event.target.value)}
+            aria-label="Perda do stop em porcentagem"
+          />
+          %
+          <button
+            className="underline disabled:opacity-50"
+            type="button"
+            disabled={!fixedValid}
+            onClick={() =>
+              void run(
+                "Salvar alvo e stop fixos",
+                () => api.updateConfig({ take_profit_pct: (takeProfitPct ?? 0) / 100, stop_loss_pct: (stopLossPct ?? 0) / 100 }),
+                () => `Alvo +${takeProfitPct}% e stop −${stopLossPct}%; as estratégias ligadas estão sendo validadas`,
+              )
+            }
+          >
+            {fixedOn ? "salvar" : "ligar"}
+          </button>
+          {fixedOn && (
+            <button
+              className="underline"
+              type="button"
+              onClick={() => void run("Desligar alvo e stop fixos", () => api.updateConfig({ take_profit_pct: null, stop_loss_pct: null }))}
+            >
+              desligar
+            </button>
+          )}
+        </p>
+      </div>
+      <p className={`flex items-center ${fixedOn ? "opacity-50" : ""}`}>
         <label>
           <input
             type="checkbox"
+            disabled={fixedOn}
             checked={status.trailing_stop}
             onChange={(event) => { const on = event.target.checked; void run(on ? "Ligar o stop móvel" : "Desligar o stop móvel", () => api.updateConfig({ trailing_stop: on })); }}
           />{" "}
@@ -441,7 +502,8 @@ export function Controls() {
 
 function ValidationControl({ job, validated, onStart }: { job?: ValidationJob; validated: boolean; onStart: () => void }) {
   if (job?.status === "running") {
-    const progress = job.stage === "calculando" ? "calculando" : `baixando ${job.done}/${job.total} pares`;
+    const progress =
+      job.stage === "calculando" ? "calculando" : job.stage === "na fila" ? "na fila" : `baixando ${job.done}/${job.total} pares`;
     return <span className="ml-1 text-neutral-500">validando… {progress}</span>;
   }
   const verdict =

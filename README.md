@@ -19,6 +19,27 @@ Isto não é recomendação de investimento. Nenhuma estratégia garante lucro. 
 
 A origem de cada módulo portado está em [ORIGIN.md](ORIGIN.md).
 
+## Alvo e stop fixos
+
+Em Controles, **Alvo e stop fixos** recebe o ganho e a perda em porcentagem do preço de entrada (por exemplo, +3% e −1,5%). Ligado, vale para todas as estratégias, day trade incluído, e substitui o stop, o alvo e as saídas de cada uma, o stop móvel e o TP1/equilíbrio/limite de 6 h do day trade.
+
+- **Entrada:** como antes, uma oportunidade Pronta de uma estratégia validada. No automático, a taxa de acerto estimada precisa passar do ponto de equilíbrio da regra, `perda / (perda + ganho líquido)`, mais 3 pontos. Com +3% e −1,5%, isso fica perto de 38%, não nos 60% do swing. O filtro de ganho/risco não vale aqui, porque você escolheu o ganho e a perda; o filtro de custo continua.
+- **Stop:** um STOP_LOSS_LIMIT na Binance à perda escolhida abaixo do **preço médio executado**, não do preço da análise.
+- **Alvo:** o ciclo vende com LIMIT IOC quando o último preço de 15 min chega ao alvo, também calculado sobre o preço médio executado. Não há saída por sinal da estratégia nem limite de tempo.
+- **Score:** o retorno esperado da linha nunca passa do que a própria estratégia estima, então um alvo largo não faz um sinal fraco parecer forte.
+- **Limites:** alvo de 1% a 100% (abaixo de 1% o custo de ida e volta comeria o ganho e nenhuma linha ficaria Pronta), perda de 0,5% a 50%.
+- **Validação:** os valores fazem parte da regra (`fixed:<alvo em pontos-base>:<perda em pontos-base>`). Mudar qualquer um exige validar de novo, e a taxa de acerto só mistura trades da mesma regra. No histórico, o stop dispara pela mínima da vela e vence quando a mesma vela toca os dois; o alvo dispara no **fechamento** da vela, como o ciclo, que vende pelo último preço e não deixa ordem no livro. Estratégias day continuam sem entrar entre 03:00 e 07:00 UTC, pagam o slippage do day trade e são julgadas pelo gate day.
+- **Automático de ponta a ponta:** ao mudar o alvo e o stop, ou ao ligar uma estratégia, o robô valida sozinho no histórico, uma estratégia por vez, cada estratégia ligada que ainda não tem resultado para a regra atual. Com o modo de entrada **Automático** e Iniciar, o robô escolhe, compra, protege e vende sem clique, e só opera o que passou no teste.
+- Posições abertas seguem a regra com que abriram.
+
+## Moedas novas
+
+Um par listado há pouco tempo não tem o histórico que as análises longas pedem, então o robô olha o dia dele:
+
+- **Seleção automática:** um par com menos de 29 velas diárias fechadas (listado há menos de um mês) é ranqueado pelas últimas 24 velas de 1 h, com o mesmo cálculo: retorno dividido pelo desvio dos retornos. Ele precisa de pelo menos 12 h de negociação. Antes, esses pares nunca entravam.
+- **Day trade:** com menos de 60 velas de 1 h (listado há menos de 2,5 dias), o filtro de tendência do 1 h lê o próprio dia no 15 min: EMA 20 acima da EMA 50 e fechamento acima da VWAP do dia. Pares com histórico continuam usando o 1 h; os setups deles são idênticos bit a bit aos de antes.
+- A reversão à média no 15 min já operava com 10 h de velas. Tendência (1 h, 60 velas) e Momentum (4 h, semanas de histórico) continuam exigindo o histórico longo, por desenho.
+
 ## Trade ao vivo
 
 Ao executar uma oportunidade, o painel mostra o botão **Ver o trade ao vivo no gráfico**; em Posições, cada linha tem o link **ao vivo**. A página `/trade/<id>` mostra as velas do mercado onde a ordem foi executada (no testnet, o livro do Spot Testnet), desde 30 minutos antes da entrada, com as linhas de entrada, stop atual, alvo ou maior preço do stop móvel, e marcadores de entrada e saída. Atualiza a cada 5 segundos enquanto a posição está viva; o servidor guarda as velas por 5 segundos e recua quando o peso da API está alto, para não tirar requisições de stops e saídas.

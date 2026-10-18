@@ -44,6 +44,15 @@ def api_client(tmp_path, monkeypatch) -> Iterator[TestClient]:
     ctx.config = None
     ctx.collector = None
     ctx.balance_cache = None
+    with ctx.validation_lock:
+        ctx.validations.clear()
+
+    class _NoHistory:
+        def fetch(self, *_args, **_kwargs):
+            raise RuntimeError("no Binance history in tests")
+
+    # A config change starts validations by itself; tests that want one stub the loader.
+    monkeypatch.setattr("bot.backtest.loaders.registry.resolve_loader", lambda _market: _NoHistory())
     token = load_or_create_token()
     headers = {"X-Bot-Token": token, "X-Bot-Client": "panel"}
     with TestClient(app, base_url="http://127.0.0.1:8000", headers=headers) as client:

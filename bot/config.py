@@ -16,6 +16,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from bot.paths import base_runtime_root
+from bot.strategies.fixed import MAX_STOP_LOSS, MAX_TAKE_PROFIT, MIN_STOP_LOSS, MIN_TAKE_PROFIT, FixedExit
 
 Mode = Literal["testnet", "production"]
 #: ``manual``: the cycle only manages exits of positions opened from the panel.
@@ -111,6 +112,11 @@ class BotConfig(BaseModel):
     #: With ``trailing_stop``: the entry stop stays until the gain reaches the activation
     #: (``bot.strategies.trailing.TRAIL``); then the stop follows the highest price closer.
     trailing_activation: bool = False
+    #: Operator take-profit and stop-loss as a share of the entry (``bot.strategies.fixed``).
+    #: Both set or both None; when set they replace every strategy's stop, target and exit
+    #: rule, and take precedence over the trailing options.
+    take_profit_pct: float | None = Field(default=None, ge=MIN_TAKE_PROFIT, le=MAX_TAKE_PROFIT)
+    stop_loss_pct: float | None = Field(default=None, ge=MIN_STOP_LOSS, le=MAX_STOP_LOSS)
     #: Spot Testnet only: buy setups that miss a quality filter or validation can be
     #: executed by hand, for testing the order flow. Production ignores it.
     testnet_test_mode: bool = False
@@ -145,6 +151,18 @@ class BotConfig(BaseModel):
         if bad:
             raise ValueError(f"symbols must be BASE/USDT spot pairs: {bad}")
         return list(dict.fromkeys(clean))
+
+    @field_validator("take_profit_pct", "stop_loss_pct")
+    @classmethod
+    def _basis_points(cls, value: float | None) -> float | None:
+        """Whole basis points: the policy string records them exactly."""
+        return None if value is None else round(value, 4)
+
+    @model_validator(mode="after")
+    def _fixed_pair(self) -> "BotConfig":
+        if (self.take_profit_pct is None) != (self.stop_loss_pct is None):
+            raise ValueError("take_profit_pct and stop_loss_pct are set together")
+        return self
 
     @field_validator("strategies")
     @classmethod
@@ -184,9 +202,18 @@ class BotConfig(BaseModel):
     @property
     def exit_policy(self) -> str:
         """The exit rule live trading and the backtest gate both follow."""
+        fixed = self.fixed_exit
+        if fixed is not None:
+            return fixed.policy
         if not self.trailing_stop:
             return "target"
         return "trailing_tp" if self.trailing_activation else "trailing"
+
+    @property
+    def fixed_exit(self) -> FixedExit | None:
+        if self.take_profit_pct is None or self.stop_loss_pct is None:
+            return None
+        return FixedExit(self.take_profit_pct, self.stop_loss_pct)
 
     def production_capital(self) -> float:
         """The capital production trades with: ``production_capital_fraction`` of the allocated capital."""

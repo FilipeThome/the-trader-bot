@@ -41,6 +41,7 @@ from bot.exchange.weight import weight_pressure
 from bot.store import Store
 from bot.strategies import exit_policy_for
 from bot.strategies.day import DAY
+from bot.strategies.fixed import parse_fixed
 from bot.strategies.trailing import trailing_level
 
 logger = logging.getLogger(__name__)
@@ -261,6 +262,11 @@ class Executor:
         avg = (fill.cost + fill.fee_quote) / net if net > 0 else fill.average
         stop = _dec(position.get("stop_price")) or avg * (1 - DEFAULT_STOP_PCT)
         target = _dec(position.get("target_price"))
+        fixed = parse_fixed(position.get("exit_policy"))
+        if fixed is not None and avg > 0:
+            # The operator's percentages count from the real average fill, not the scoring price.
+            stop = avg * (1 - Decimal(str(fixed.stop_loss_pct)))
+            target = avg * (1 + Decimal(str(fixed.take_profit_pct)))
         entry_fee = fill.fee_quote + fill.fee_base * fill.average
         trail_pct = (avg - stop) / avg if avg > 0 and stop < avg else DEFAULT_STOP_PCT
         self.store.update_position(
