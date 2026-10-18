@@ -111,3 +111,21 @@ def test_the_loss_guard_pauses_every_entry_and_zero_turns_it_off() -> None:
     aged = _opportunity()
     protect([aged], losses, RiskLimits(loss_guard_trades=3, pair_cooldown_minutes=0), now + timedelta(hours=1, minutes=1))
     assert aged.status == "pronta"
+
+
+def test_the_breakeven_hit_rate_is_where_kelly_turns_positive() -> None:
+    from bot.evaluator import Opportunity
+    from bot.risk import RiskManager, breakeven_win_rate
+
+    def row(win_rate: float | None, net: float = 0.0125) -> Opportunity:
+        return Opportunity(
+            symbol="BTC/USDT", strategy="intraday_momentum", action="Comprar", score=1.0, net_return=net,
+            risk_pct=0.01, status="pronta", reason="r", timeframe="15m", direction=1, cost=0.0025,
+            gross_return=0.015, win_rate=win_rate,
+        )
+
+    assert breakeven_win_rate(row(None)) == pytest.approx(1 / 2.25)
+    assert breakeven_win_rate(row(None, net=0.0)) is None
+    manager = RiskManager(RiskLimits(), 1000.0)
+    below, above = 1 / 2.25 - 0.001, 1 / 2.25 + 0.001
+    assert manager.kelly_risk(row(below)) < 0 < manager.kelly_risk(row(above))  # type: ignore[operator]

@@ -65,3 +65,7 @@ def test_a_day_validation_reads_90_days_of_15m_and_the_1h_bars(api_client, monke
     assert fetched[1][0] == "1h" and fetched[1][1] >= 90
     job = api_client.get("/bot/status").json()["validations"]["intraday_momentum"]
     assert job["status"] == "done" and job["result"]["exit_policy"] == "day"
+
+
+def test_status_reports_the_day_margin(api_client) -> None:
+    assert api_client.get("/bot/status").json()["day_win_rate_margin"] == 0.03

@@ -5,7 +5,9 @@ parameters; nothing is fitted, so the whole history is out of sample. Like the
 live spot bot, the replay only buys: a sell setup is not a short. A position
 leaves by the configured exit policy: ``target`` (stop or target) or
 ``trailing`` (a stop that follows the highest close at the entry's stop
-distance, no target), and always at the strategy's own exit. Stops and
+distance, no target), ``trailing_tp`` (the entry stop until the activation
+gain, then a closer stop under the highest close; ``bot.strategies.trailing``),
+and always at the strategy's own exit. Stops and
 targets are checked against each bar's low and high, as broker orders fill
 on wicks; the stop wins when one bar touches both. Each round trip
 pays the spot taker fee twice. A pass also needs half-split stability: the
@@ -36,6 +38,7 @@ from bot.strategies.day import DAY, ENTRY_BAR, DayRules, in_quiet_hours
 from bot.strategies.intraday import IntradayMomentum, VwapPullback
 from bot.strategies.mean_reversion import MeanReversion
 from bot.strategies.momentum import Momentum
+from bot.strategies.trailing import TRAIL, TRAILING_POLICIES, trailing_level
 from bot.strategies.trend import TrendBreakout
 
 #: Gate thresholds (README: Sharpe above 1 and drawdown below 20%).
@@ -138,11 +141,14 @@ def simulate(
         opened = float(window["open"].iloc[-1])
         low = float(window["low"].iloc[-1])
         high = float(window["high"].iloc[-1])
-        stop = (peak if exit_policy == "trailing" else entry) * (1 - position.stop_pct)
+        stop = entry * (1 - position.stop_pct)
+        trailed = trailing_level(exit_policy, entry, peak, position.stop_pct)
+        if trailed is not None:
+            stop = max(stop, trailed)
         target = entry * (1 + position.target_pct)
         if low <= stop:
             fill = min(opened, stop)
-        elif exit_policy != "trailing" and high >= target:
+        elif exit_policy not in TRAILING_POLICIES and high >= target:
             fill = max(opened, target)
         elif _strategy_exit(strategy, window):
             fill = price
@@ -406,5 +412,6 @@ def promotion_record(result: BacktestResult, params: dict[str, Any] | None = Non
             "window": LIVE_WINDOW,
             # A day validation holds only for the day rules it replayed.
             **({"day": DAY.params} if result.exit_policy == "day" else {}),
+            **({"trailing": TRAIL.params} if result.exit_policy == "trailing_tp" else {}),
         },
     }

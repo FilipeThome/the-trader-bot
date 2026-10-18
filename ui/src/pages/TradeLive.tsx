@@ -57,6 +57,7 @@ export function TradeLive() {
 
   const position = trade?.position;
   const running = position?.status === "open" || position?.status === "pending";
+  const trailing = position?.exit_policy === "trailing" || position?.exit_policy === "trailing_tp";
   return (
     <section className="space-y-4 text-sm">
       <p>
@@ -89,7 +90,7 @@ export function TradeLive() {
             <Item label="Entrada" value={position.avg_price || null} />
             <Item label="Preço atual" value={position.status === "closed" ? position.exit_price : trade.last_price} />
             <Item label="Stop" value={position.stop_price} />
-            <Item label={position.exit_policy === "trailing" ? "Maior preço (stop móvel)" : "Alvo"} value={position.exit_policy === "trailing" ? position.peak_price : position.target_price} />
+            <Item label={trailing ? "Maior preço (stop móvel)" : "Alvo"} value={trailing ? position.peak_price : position.target_price} />
             <Item label="Aberta em" value={position.opened_at ? new Date(position.opened_at).toLocaleString("pt-BR") : null} />
             <Item label="Fechada em" value={position.closed_at ? new Date(position.closed_at).toLocaleString("pt-BR") : null} />
             <Item label="Motivo" value={position.reason} />

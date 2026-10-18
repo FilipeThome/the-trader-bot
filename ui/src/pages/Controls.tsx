@@ -27,6 +27,8 @@ export function Controls() {
   const [openRisk, setOpenRisk] = useState("");
   const [pickCount, setPickCount] = useState("");
   const [minProfit, setMinProfit] = useState("");
+  // The result of a pair preset, shown next to its buttons: the top notice is out of sight there.
+  const [symbolsNote, setSymbolsNote] = useState("");
 
   if (!status) return <p>Carregando controles…</p>;
   const autoTrading = status.entry_mode === "auto" && status.running;
@@ -55,11 +57,17 @@ export function Controls() {
   function run<T>(label: string, action: () => Promise<T>, describe?: (result: T) => string) {
     return perform(label, action, describe);
   }
-  const symbolsResult = (body: { symbols: string[]; left_out: string[] }) =>
-    `Pares analisados: ${body.symbols.join(", ")}` +
-    (body.left_out.length
-      ? `\nFora, por pouca negociação no Spot Testnet (o stop ficaria sem cotação recente): ${body.left_out.join(", ")}`
-      : "");
+  const symbolsResult = (body: { symbols: string[]; left_out: string[] }) => {
+    const unchanged = body.symbols.join(",") === status.symbols.join(",");
+    const text =
+      (unchanged ? "Nada mudou: a lista já era esta. " : "") +
+      `Pares analisados: ${body.symbols.join(", ")}` +
+      (body.left_out.length
+        ? `\nFora, por pouca negociação no Spot Testnet (o stop ficaria sem cotação recente): ${body.left_out.join(", ")}`
+        : "");
+    setSymbolsNote(text);
+    return text;
+  };
 
   return (
     <section className="max-w-xl text-sm">
@@ -73,6 +81,9 @@ export function Controls() {
         <span>
           Ambiente atual: <strong>{status.mode === "production" ? "Produção" : "Spot Testnet"}</strong>. Capital em uso{" "}
           {status.capital_usd} de {status.allocated_capital_usd} USD.
+          {status.pilot_cap_usd != null && (
+            <strong className="ml-1 text-amber-600"> Produção piloto: capital limitado a US$ {status.pilot_cap_usd}, sem os 30 dias de testnet.</strong>
+          )}
         </span>
         <Help text="Spot Testnet é o ensaio, sem a conta real. Produção usa dinheiro de verdade e, nessa hora, o robô arrisca só 10% do capital que você alocou. Capital em uso é o que entra na conta do tamanho de cada ordem." />
       </p>
@@ -96,7 +107,7 @@ export function Controls() {
         </button>
         <Help text={status.mode === "testnet" && status.testnet_test_mode
           ? "Ligado, o robô compra sozinho as melhores oportunidades Prontas, da maior nota para a menor, dentro do saldo e dos limites de risco, e cuida do stop e da saída. No Spot Testnet com o modo teste, ele também opera as linhas de teste para você ver o fluxo inteiro. Desligar volta ao manual: as posições abertas continuam com stop e saídas."
-          : "Ligado, o robô compra sozinho as melhores oportunidades Prontas, da maior nota para a menor, dentro do saldo e dos limites de risco, e cuida do stop e da saída. Só entram estratégias validadas no histórico com taxa de acerto acima do mínimo. Desligar volta ao manual: as posições abertas continuam com stop e saídas."} />
+          : "Ligado, o robô compra sozinho as melhores oportunidades Prontas, da maior nota para a menor, dentro do saldo e dos limites de risco, e cuida do stop e da saída. Só entram estratégias validadas no histórico com taxa de acerto acima do mínimo (no day trade, acima do ponto de equilíbrio do TP1 mais uma margem). Desligar volta ao manual: as posições abertas continuam com stop e saídas."} />
       </p>
       <div className="flex flex-wrap gap-2">
         <span className="inline-flex items-center">
@@ -244,6 +255,12 @@ export function Controls() {
             </button>
           </p>
         )}
+        {!status.auto_select && status.mode !== "production" && (
+          <p className="mt-2 text-neutral-500">
+            No Spot Testnet só entram os pares com negociação ativa lá (pelo menos 15 mil trades por dia), então as duas listas podem dar os mesmos pares.
+          </p>
+        )}
+        {symbolsNote && <p className="mt-2 whitespace-pre-line">{symbolsNote}</p>}
       </div>
       <div className="rounded border border-neutral-300 p-3 dark:border-neutral-700">
         <p className="mb-2 flex items-center font-medium">
@@ -316,7 +333,7 @@ export function Controls() {
       <div className="rounded border border-neutral-300 p-3 dark:border-neutral-700">
         <p className="mb-2 flex items-center font-medium">
           Entradas
-          <Help text="Manual: o robô nunca compra sozinho. Você clica em executar numa oportunidade Pronta e ele cuida do stop e das saídas; o ciclo liga sozinho nessa hora. Automático: além disso, o ciclo compra sozinho as oportunidades Prontas cuja taxa de acerto estimada passa do mínimo. Ao trocar para automático o ciclo para, e é preciso clicar em Iniciar." />
+          <Help text="Manual: o robô nunca compra sozinho. Você clica em executar numa oportunidade Pronta e ele cuida do stop e das saídas; o ciclo liga sozinho nessa hora. Automático: além disso, o ciclo compra sozinho as oportunidades Prontas cuja taxa de acerto estimada passa do mínimo (no day trade, do ponto de equilíbrio do TP1 mais uma margem). Ao trocar para automático o ciclo para, e é preciso clicar em Iniciar." />
         </p>
         <label className="mr-4">
           <input
@@ -334,7 +351,7 @@ export function Controls() {
             checked={status.entry_mode === "auto"}
             onChange={() => void run("Entradas automáticas", () => api.updateConfig({ entry_mode: "auto" }), () => "Entradas automáticas: o ciclo foi pausado; clique em Iniciar")}
           />{" "}
-          Automático a partir de {Math.round(status.min_win_rate * 100)}% de acerto
+          Automático a partir de {Math.round(status.min_win_rate * 100)}% de acerto (swing)
         </label>
         <p className="mt-2 flex flex-wrap items-center gap-2">
           <input
@@ -353,7 +370,7 @@ export function Controls() {
           >
             salvar mínimo{winRateValid ? ` de ${winRatePct}%` : ""}
           </button>
-          <Help text={`Entre 50% e 95%. A taxa só existe com pelo menos ${status.min_win_rate_sample} trades da estratégia, no teste histórico e nas posições reais, com a mesma regra de saída. Quem não tem amostra nunca entra sozinho.`} />
+          <Help text={`Entre 50% e 95%, para as estratégias swing. A taxa só existe com pelo menos ${status.min_win_rate_sample} trades da estratégia, no teste histórico e nas posições reais, com a mesma regra de saída. Quem não tem amostra nunca entra sozinho. Day trade ignora este mínimo: ganha menos vezes por desenho (metade no TP1, o resto no equilíbrio), então entra sozinho quando a taxa passa do ponto de equilíbrio do TP1 mais ${Math.round((status.day_win_rate_margin ?? 0.03) * 100)} pontos. Esse ponto depende do stop e do custo de cada oportunidade: com stop de 1%, fica perto de 47%.`} />
         </p>
       </div>
       <p className="flex items-center">
@@ -366,6 +383,18 @@ export function Controls() {
           Stop móvel
         </label>
         <Help text="O stop na Binance sobe junto com o maior preço, mantendo a distância da entrada, e nunca desce. Assim a posição segue enquanto o preço sobe e sai quando ele volta. Com o stop móvel ligado, o alvo fixo não fecha a posição. Trocar esta opção exige validar a estratégia de novo, porque a taxa de acerto depende da regra de saída. Posições já abertas seguem a regra com que abriram." />
+      </p>
+      <p className="flex items-center">
+        <label className={status.trailing_stop ? "" : "opacity-50"}>
+          <input
+            type="checkbox"
+            disabled={!status.trailing_stop}
+            checked={status.trailing_activation}
+            onChange={(event) => { const on = event.target.checked; void run(on ? "Ligar a ativação do stop móvel" : "Desligar a ativação do stop móvel", () => api.updateConfig({ trailing_activation: on })); }}
+          />{" "}
+          Stop móvel com ativação (trailing take-profit)
+        </label>
+        <Help text={`Como o trailing take-profit da Binance. O stop de entrada fica parado até o lucro chegar a ${status.trailing_rules?.activation_r ?? 1}× a distância do stop. Daí em diante ele segue o maior preço a ${Math.round((status.trailing_rules?.callback_share ?? 0.5) * 100)}% dessa distância, o que já trava lucro na ativação. É outra regra de saída: as estratégias precisam ser validadas de novo com ela.`} />
       </p>
       <p className="flex items-center">
         <label>

@@ -8,6 +8,7 @@ from bot.strategies.funding import FundingCarry
 from bot.strategies.intraday import IntradayMomentum, VwapPullback
 from bot.strategies.mean_reversion import MeanReversion
 from bot.strategies.momentum import Momentum
+from bot.strategies.trailing import TRAIL
 from bot.strategies.trend import TrendBreakout
 
 Strategy = TrendBreakout | MeanReversion | Momentum | FundingCarry | IntradayMomentum | VwapPullback
@@ -36,6 +37,8 @@ def validated_for(params: dict[str, Any] | None, strategy_id: str, swing_policy:
     policy = exit_policy_for(strategy_id, swing_policy)
     if params.get("exit_policy") != policy:
         return False
+    if policy == "trailing_tp":
+        return params.get("trailing") == TRAIL.params
     return policy != "day" or params.get("day") == DAY.params
 
 __all__ = [

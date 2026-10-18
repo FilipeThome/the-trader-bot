@@ -3,6 +3,7 @@ import { NavLink, Route, Routes } from "react-router";
 
 import { Help } from "./Help";
 import { Balance } from "./pages/Balance";
+import { Bots } from "./pages/Bots";
 import { Controls } from "./pages/Controls";
 import { History } from "./pages/History";
 import { Opportunities } from "./pages/Opportunities";
@@ -15,6 +16,7 @@ const links: [string, string, string][] = [
   ["/", "Oportunidades", "Lista o que o robô está vendo agora, da melhor nota para a pior. Nada aqui vira ordem sozinho se o status não for Pronta."],
   ["/positions", "Posições", "Mostra o que está aberto neste ambiente: quanto entrou, onde corta a perda e onde realiza o ganho."],
   ["/balance", "Saldo", "Mostra o saldo desta conta Binance (testnet ou produção), moeda por moeda, com o valor estimado em USDT."],
+  ["/robos", "Robôs", "DCA e Grid, como os robôs da Binance: você configura, simula no histórico e o robô opera sozinho, sempre com stop na corretora."],
   ["/performance", "Desempenho", "Mostra se o dinheiro cresceu ou encolheu ao longo dos dias, já descontando custos."],
   ["/controls", "Controles", "Liga, pausa e configura o robô. Também é aqui que se troca o ensaio (testnet) pela conta real."],
   ["/history", "Histórico", "Registro do que o robô decidiu, inclusive quando escolheu não operar."],
@@ -112,6 +114,7 @@ export function App() {
           <Route path="/" element={<Opportunities />} />
           <Route path="/positions" element={<Positions />} />
           <Route path="/balance" element={<Balance />} />
+          <Route path="/robos" element={<Bots />} />
           <Route path="/performance" element={<Performance />} />
           <Route path="/controls" element={<Controls />} />
           <Route path="/history" element={<History />} />
