@@ -70,7 +70,7 @@ export function Controls() {
       (unchanged ? "Nada mudou: a lista já era esta. " : "") +
       `Pares analisados: ${body.symbols.join(", ")}` +
       (body.left_out.length
-        ? `\nFora, por pouca negociação no Spot Testnet (o stop ficaria sem cotação recente): ${body.left_out.join(", ")}`
+        ? `\nFora, por não serem negociados no Spot Testnet:${body.left_out.join(", ")}`
         : "");
     setSymbolsNote(text);
     return text;
@@ -264,7 +264,7 @@ export function Controls() {
         )}
         {!status.auto_select && status.mode !== "production" && (
           <p className="mt-2 text-neutral-500">
-            No Spot Testnet só entram os pares com negociação ativa lá (pelo menos 15 mil trades por dia), então as duas listas podem dar os mesmos pares.
+            No Spot Testnet só entram os pares que ele lista, porque as ordens vão para lá.
           </p>
         )}
         {symbolsNote && <p className="mt-2 whitespace-pre-line">{symbolsNote}</p>}

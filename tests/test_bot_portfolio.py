@@ -218,27 +218,25 @@ def test_merge_keeps_live_pairs_first_and_the_symbol_cap() -> None:
 
 def test_testnet_picks_only_pairs_the_spot_testnet_lists() -> None:
     steady = [100 * 1.01**i * (1 + 0.002 * math.sin(i)) for i in range(31)]
-    series = {"SOL/USDT": steady, "DOGE/USDT": steady}
-    inner = _ranking_fetch(series, {"SOL/USDT": 2e9, "DOGE/USDT": 1e9})
+    series = {"SOL/USDT": steady, "DOGE/USDT": steady, "ADA/USDT": steady}
+    inner = _ranking_fetch(series, {"SOL/USDT": 2e9, "DOGE/USDT": 1e9, "ADA/USDT": 5e8})
     testnet_reads: list[str] = []
 
     def fetch(url: str):
         if url.startswith(TESTNET_SPOT):
             testnet_reads.append(url)
-            if url.endswith("/ticker/24hr"):
-                return [{"symbol": "DOGEUSDT", "count": 25000}, {"symbol": "SOLUSDT", "count": 900}], {}
             listed = [{"status": "TRADING", "baseAsset": base, "quoteAsset": "USDT"} for base in ("DOGE", "SOL")]
             return {"symbols": listed}, {}
         return inner(url)
 
     collector = Collector(fetch)
     assert venue_symbols(collector, "production") is None and testnet_reads == []
-    # SOL is listed on the testnet but trades too rarely there for fresh quotes.
+    # Every listed pair counts, however thin its testnet book; ADA is not listed there.
     listed = venue_symbols(collector, "testnet")
-    assert listed == frozenset({"DOGE/USDT"})
-    assert venue_symbols(collector, "testnet") == listed and len(testnet_reads) == 2
-    assert rank_promising(collector, 5, listed=listed) == ["DOGE/USDT"]
-    assert rank_promising(collector, 5) == ["SOL/USDT", "DOGE/USDT"]
+    assert listed == frozenset({"DOGE/USDT", "SOL/USDT"})
+    assert venue_symbols(collector, "testnet") == listed and len(testnet_reads) == 1
+    assert rank_promising(collector, 5, listed=listed) == ["SOL/USDT", "DOGE/USDT"]
+    assert set(rank_promising(collector, 5)) == {"SOL/USDT", "DOGE/USDT", "ADA/USDT"}
 
 
 

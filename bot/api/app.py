@@ -981,7 +981,7 @@ def _require_listed(collector: Collector, symbols: list[str], mode: str) -> None
         raise HTTPException(status_code=422, detail=f"pares fora da Binance spot: {missing}")
     absent = [symbol for symbol in symbols if venue is not None and symbol not in venue]
     if absent:
-        raise HTTPException(status_code=422, detail=f"pares fora do Spot Testnet ou sem negociação ativa lá: {absent}")
+        raise HTTPException(status_code=422, detail=f"pares fora do Spot Testnet:{absent}")
 
 
 @app.get("/bot/events")

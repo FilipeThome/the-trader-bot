@@ -23,11 +23,6 @@ _LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR")
 _MAX_AGE_SECONDS = 3600
 #: The Spot Testnet lists its own subset of pairs; testnet orders only reach those.
 TESTNET_SPOT = "https://testnet.binance.vision"
-#: Trades a testnet pair needs in 24h, about one every 6 seconds. The order gate
-#: refuses a ticker older than 15 seconds, and the ticker time is the last trade,
-#: so a thinner testnet book leaves stops and exits refused as ``quote_stale``.
-#: Measured 2026-10-16: BTC 73k, ETH 29k, SOL 18k; the next pair (DOGE) had 8.5k.
-TESTNET_MIN_TRADES = 15_000
 #: Liquid pairs ranked by momentum, and the days of the momentum return.
 RANK_POOL = 40
 MOMENTUM_DAYS = 28
@@ -68,10 +63,11 @@ def venue_symbols(collector: Collector, mode: str) -> frozenset[str] | None:
     """Pairs the order venue of ``mode`` can trade, or ``None`` when it is the live catalog.
 
     Analysis reads the live market, but Spot Testnet orders only reach the pairs
-    the testnet lists, and only an active testnet book (``TESTNET_MIN_TRADES``)
-    keeps quotes fresh enough for the stop and the exit. In testnet every chosen
-    pair must be one of those. The testnet has its own weight limit, so these
-    reads do not count against the live budget.
+    the testnet lists, so in testnet every chosen pair must be one of those. Any
+    listed pair counts, however thin its testnet book: there the order gate prices
+    stops and exits on the live book (``sdk.get_quote``), not on the ticker a thin
+    pair refreshes slowly. The testnet has its own weight limit, so this read does
+    not count against the live budget.
     """
     if mode != "testnet":
         return None
@@ -80,20 +76,9 @@ def venue_symbols(collector: Collector, mode: str) -> frozenset[str] | None:
     if cached is not None and (now - cached[0]).total_seconds() < _MAX_AGE_SECONDS:
         return cached[1]
     payload, _headers = collector._fetch(f"{TESTNET_SPOT}/api/v3/exchangeInfo")
-    pairs = {row["base"] + row["quote"]: row["symbol"] for row in parse_exchange_info(payload)}
-    tickers, _headers = collector._fetch(f"{TESTNET_SPOT}/api/v3/ticker/24hr")
-    active: set[str] = set()
-    for item in tickers if isinstance(tickers, list) else []:
-        pair = pairs.get(str(item.get("symbol") or ""))
-        try:
-            busy = int(item.get("count") or 0) >= TESTNET_MIN_TRADES
-        except (TypeError, ValueError):
-            busy = False
-        if pair is not None and busy:
-            active.add(pair)
-    if not active:
-        raise ValueError("the Spot Testnet has no active pair")
-    listed = frozenset(active)
+    listed = frozenset(row["symbol"] for row in parse_exchange_info(payload))
+    if not listed:
+        raise ValueError("the Spot Testnet lists no pair")
     collector.testnet_cache = (now, listed)
     return listed
 

@@ -712,24 +712,41 @@ def get_open_orders(
 
 
 def get_quote(symbol: str, *, config: BinanceConfig | None = None, **_: Any) -> dict[str, Any]:
-    """Fetch a latest ticker snapshot for ``symbol`` (ccxt unified format)."""
+    """Fetch a latest ticker snapshot for ``symbol`` (ccxt unified format).
+
+    The quote time is the exchange's ticker timestamp, and the order gate refuses
+    a quote older than ``QUOTE_MAX_AGE``. The Spot Testnet serves its 24h ticker
+    from a cache that a thin pair refreshes only every 30 s to minutes, so there
+    the bid and ask come from the live book (``fetch_order_book``) and the time is
+    when that book was received: the book carries no time of its own. Production
+    keeps the exchange timestamp.
+    """
     cfg = config or load_config()
     _reject_unsupported_usdm_surface(cfg)
     _assert_host(cfg)
     ex = _public_exchange(cfg)
     clean = normalize_symbol(symbol)
     ticker = ex.fetch_ticker(clean)
+    bid, ask, time = _obj_get(ticker, "bid"), _obj_get(ticker, "ask"), str(_obj_get(ticker, "timestamp", ""))
+    if cfg.is_testnet:
+        book = ex.fetch_order_book(clean, limit=5)
+        received = int(datetime.now(timezone.utc).timestamp() * 1000)
+        bids, asks = book.get("bids") or [], book.get("asks") or []
+        # An empty side has no price: the gate then refuses the quote as unavailable.
+        bid = bids[0][0] if bids else None
+        ask = asks[0][0] if asks else None
+        time = str(received)
     return {
         "status": "ok",
         "symbol": clean,
         "quote": {
-            "bid": _obj_get(ticker, "bid"),
-            "ask": _obj_get(ticker, "ask"),
+            "bid": bid,
+            "ask": ask,
             "last": _obj_get(ticker, "last"),
             "high": _obj_get(ticker, "high"),
             "low": _obj_get(ticker, "low"),
             "volume": _obj_get(ticker, "baseVolume"),
-            "time": str(_obj_get(ticker, "timestamp", "")),
+            "time": time,
         },
     }
 
