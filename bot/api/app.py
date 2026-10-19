@@ -287,11 +287,12 @@ def positions() -> dict[str, Any]:
 
 @app.get("/bot/performance")
 def performance() -> dict[str, Any]:
-    store = _runtime().store
+    runtime = _runtime()
+    store = runtime.store
     return {
         "days": store.pnl_days(),
         "strategies": store.strategies(),
-        "equity_peak": store.peak_equity(),
+        "equity_peak": runtime.config.capital_for_sizing() + store.peak_pnl(),
         "calibration": store.calibration(),
     }
 

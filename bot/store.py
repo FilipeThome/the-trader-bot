@@ -403,10 +403,9 @@ class Store:
     def prune(self, before: str) -> dict[str, int]:
         """Delete decisions, signals and equity points older than ``before`` (ISO time).
 
-        The equity peak lives in ``bot_state``, so old equity points are not needed to
+        The PnL peak lives in ``bot_state``, so old equity points are not needed to
         measure the drawdown. Positions and daily PnL are kept.
         """
-        self._peak_from_table()
         with self._conn:
             decisions = self._conn.execute("DELETE FROM decisions WHERE ts < ?", (before,)).rowcount
             signals = self._conn.execute("DELETE FROM signals WHERE ts < ?", (before,)).rowcount
@@ -634,35 +633,44 @@ class Store:
         return [dict(row) for row in rows]
 
     @_locked
-    def record_equity(self, equity: float, ts: str | None = None) -> None:
-        peak = self._peak_from_table()
+    def record_equity(self, equity: float, ts: str | None = None, *, pnl: float | None = None) -> None:
+        """Record an equity point for the chart and, with ``pnl``, raise the PnL peak.
+
+        The drawdown is measured on the cumulative PnL (closed days plus open
+        positions), not on the equity: the equity includes the configured capital,
+        so lowering the capital would read as a loss and raising it would hide one.
+        """
+        peak = self._pnl_peak()
         with self._conn:
             self._conn.execute(
                 "INSERT INTO equity(ts, equity) VALUES(?, ?) ON CONFLICT(ts) DO UPDATE SET equity=excluded.equity",
                 (ts or _now(), equity),
             )
-            if equity > peak:
+            if pnl is not None and pnl > peak:
                 self._conn.execute(
-                    "INSERT INTO bot_state(key, value) VALUES('equity_peak', ?) "
+                    "INSERT INTO bot_state(key, value) VALUES('pnl_peak', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (json.dumps(equity),),
+                    (json.dumps(pnl),),
                 )
 
     @_locked
-    def peak_equity(self) -> float:
-        """The highest equity ever recorded: kept in ``bot_state``, so pruning old points keeps it."""
-        return self._peak_from_table()
+    def peak_pnl(self) -> float:
+        """The highest cumulative PnL ever recorded, at least 0: kept in ``bot_state``, so pruning keeps it."""
+        return self._pnl_peak()
 
-    def _peak_from_table(self) -> float:
-        """The stored peak; the first call after an upgrade seeds it from ``MAX(equity)``. Caller holds the lock."""
-        row = self._conn.execute("SELECT value FROM bot_state WHERE key='equity_peak'").fetchone()
+    def _pnl_peak(self) -> float:
+        """The stored PnL peak. The first call seeds it from the running sum of the daily PnL,
+        because the absolute equity peak of older versions mixed in the capital. Caller holds the lock."""
+        row = self._conn.execute("SELECT value FROM bot_state WHERE key='pnl_peak'").fetchone()
         if row is not None:
             return float(json.loads(row["value"]))
-        found = self._conn.execute("SELECT MAX(equity) AS peak FROM equity").fetchone()
-        peak = float(found["peak"]) if found is not None and found["peak"] is not None else 0.0
+        peak = running = 0.0
+        for day in self._conn.execute("SELECT net_pnl FROM pnl_daily ORDER BY day").fetchall():
+            running += float(day["net_pnl"] or 0)
+            peak = max(peak, running)
         with self._conn:
             self._conn.execute(
-                "INSERT INTO bot_state(key, value) VALUES('equity_peak', ?) ON CONFLICT(key) DO NOTHING",
+                "INSERT INTO bot_state(key, value) VALUES('pnl_peak', ?) ON CONFLICT(key) DO NOTHING",
                 (json.dumps(peak),),
             )
         return peak

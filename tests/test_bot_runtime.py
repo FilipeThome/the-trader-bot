@@ -133,13 +133,26 @@ def test_a_drawdown_halts_once_per_cycle(tmp_path, monkeypatch) -> None:
     runtime, _collector, _executor = _runtime(tmp_path, monkeypatch, ["BTC/USDT", "ETH/USDT", "SOL/USDT"])
     monkeypatch.setattr("bot.runtime._setup", _setup)
     runtime.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": {"exit_policy": "trailing"}})
-    runtime.store.record_equity(1000.0, "2026-01-01T00:00:00+00:00")
     runtime.store.record_day("2026-01-01", net_pnl=-200.0)
     halts: list[str] = []
     monkeypatch.setattr(runtime, "halt", lambda reason, **_kwargs: halts.append(reason))
     runtime.store.set_state("running", True)
     runtime.tick()
     assert len(halts) == 1 and "drawdown" in halts[0]
+
+
+def test_a_lower_capital_is_not_a_drawdown(tmp_path, monkeypatch) -> None:
+    runtime, _executor = _ready_cycle(tmp_path, monkeypatch)
+    runtime.tick()
+    runtime.config = runtime.config.model_copy(update={"allocated_capital_usd": 150.0})
+    runtime.tick()
+    assert runtime.halted is False
+    # A real loss still counts against the lower capital: 20 of 150 is above 10%.
+    runtime.store.record_day("2026-01-01", net_pnl=-20.0)
+    halts: list[str] = []
+    monkeypatch.setattr(runtime, "halt", lambda reason, **_kwargs: halts.append(reason))
+    runtime.tick()
+    assert halts and "drawdown" in halts[0]
 
 
 def test_a_real_daily_loss_pauses_until_the_next_utc_day(tmp_path, monkeypatch) -> None:
@@ -383,7 +396,7 @@ def test_a_smaller_balance_shrinks_orders_without_a_drawdown_halt(tmp_path, monk
     monkeypatch.setattr(service, "free_balance", lambda asset, profile_id: Decimal("100"))
     for _ in range(3):
         runtime.tick()
-    assert runtime.halted is False and runtime.store.peak_equity() == pytest.approx(1000.0)
+    assert runtime.halted is False and runtime.store.peak_pnl() == pytest.approx(0.0)
     assert runtime.store.opportunities()[0]["size_usd"] == pytest.approx(1.8)
 
 

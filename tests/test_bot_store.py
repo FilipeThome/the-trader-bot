@@ -176,25 +176,27 @@ def test_calibration_compares_the_estimate_at_entry_with_the_outcome(tmp_path) -
 _ROW = {"strategy": "trend", "decision": "pronta"}
 
 
-def test_prune_drops_old_history_but_keeps_the_equity_peak(tmp_path) -> None:
+def test_prune_drops_old_history_but_keeps_the_pnl_peak(tmp_path) -> None:
     store = Store(tmp_path / "bot.sqlite")
-    store.record_equity(1500.0, "2026-08-01T00:00:00+00:00")
-    store.record_equity(1000.0, "2026-10-15T00:00:00+00:00")
+    store.record_equity(1500.0, "2026-08-01T00:00:00+00:00", pnl=500.0)
+    store.record_equity(1000.0, "2026-10-15T00:00:00+00:00", pnl=0.0)
     store.add_decision({"ts": "2026-08-01T00:00:00+00:00", "symbol": "BTC/USDT", **_ROW, "reason": "old"})
     store.add_decision({"ts": "2026-10-15T00:00:00+00:00", "symbol": "BTC/USDT", **_ROW, "reason": "new"})
     assert store.prune("2026-09-15T00:00:00+00:00") == {"decisions": 1, "signals": 0, "equity": 1}
     assert [row["reason"] for row in store.decisions()] == ["new"]
     # The drawdown still measures from the old peak.
-    assert store.peak_equity() == 1500.0
+    assert store.peak_pnl() == 500.0
 
 
-def test_the_peak_of_an_upgraded_store_is_seeded_from_its_equity_table(tmp_path) -> None:
+def test_the_pnl_peak_of_an_upgraded_store_is_seeded_from_the_daily_pnl(tmp_path) -> None:
     path = tmp_path / "bot.sqlite"
     store = Store(path)
-    store._conn.execute("INSERT INTO equity(ts, equity) VALUES('2026-10-01T00:00:00+00:00', 1234.0)")
-    store._conn.commit()
+    # The absolute equity peak of older versions includes a capital that may have changed since.
+    store.set_state("equity_peak", 1000.0)
+    for day, pnl in (("2026-10-01", 30.0), ("2026-10-02", 20.0), ("2026-10-03", -40.0)):
+        store.record_day(day, net_pnl=pnl)
     store.close()
-    assert Store(path).peak_equity() == 1234.0
+    assert Store(path).peak_pnl() == 50.0
 
 
 def test_a_day_report_reads_every_decision_of_that_day(tmp_path) -> None:

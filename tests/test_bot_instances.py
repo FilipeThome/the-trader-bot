@@ -426,7 +426,7 @@ def test_a_drawdown_halts_and_stops_every_robot(tmp_path, monkeypatch, venue) ->
     runtime = _live_runtime(tmp_path, monkeypatch)
     _price(runtime, venue, 100.0)
     runtime.create_instance("grid", "BTC/USDT", GRID)
-    runtime.store.record_equity(2000.0, "2026-01-01T00:00:00+00:00")
+    runtime.store.record_equity(2000.0, "2026-01-01T00:00:00+00:00", pnl=1000.0)
     _step(runtime)
     assert runtime.halted and runtime.store.instances()[0]["status"] == "stopped"
 

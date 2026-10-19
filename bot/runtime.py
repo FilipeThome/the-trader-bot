@@ -1128,7 +1128,7 @@ class Runtime:
         exposure += sum(float(row.get("reserved_usd") or 0) for row in self._book() if row["status"] == "reserved")
         day = utc_day(moment)
         day_pnl, equity, peak = self._equity(snapshot, moment)
-        self.store.record_equity(equity, moment.isoformat())
+        self.store.record_equity(equity, moment.isoformat(), pnl=equity - capital)
         returns = _returns(snapshot)
         trades_today = self.store.trades_today(day)
         ranked: list[Opportunity] = []
@@ -1230,14 +1230,16 @@ class Runtime:
 
     def _equity(self, snapshot: MarketSnapshot, moment: datetime) -> tuple[float, float, float]:
         """Today's net PnL, the equity (configured capital, every closed day, the open positions
-        at the last price) and the peak equity."""
+        at the last price) and the peak equity: the configured capital plus the PnL peak, so a
+        change of capital never reads as a drawdown."""
         days = self.store.pnl_days()
         day = utc_day(moment)
         day_row = next((row for row in days if row["day"] == day), None)
         day_pnl = float(day_row["net_pnl"]) if day_row else 0.0
         positions = self.store.open_positions()
-        equity = self.config.capital_for_sizing() + sum(float(row["net_pnl"]) for row in days) + _unrealized(positions, snapshot)
-        return day_pnl, equity, max(self.store.peak_equity(), equity)
+        capital = self.config.capital_for_sizing()
+        pnl = sum(float(row["net_pnl"]) for row in days) + _unrealized(positions, snapshot)
+        return day_pnl, capital + pnl, capital + max(self.store.peak_pnl(), pnl)
 
     def _pause_day(self, moment: datetime) -> None:
         """Stop the cycle until the next UTC day: the daily-loss limit."""
