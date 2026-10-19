@@ -215,7 +215,7 @@ def test_switching_to_auto_entries_stops_the_cycle(api_client) -> None:
 
 
 def _catalog() -> list[dict[str, str]]:
-    return [{"symbol": f"{base}/USDT", "base": base, "quote": "USDT"} for base in ("BTC", "ETH", "SOL", "USDC", "BTCUP", "JUP")]
+    return [{"symbol": f"{base}/USDT", "base": base, "quote": "USDT"} for base in ("BTC", "ETH", "SOL", "USDC", "RLUSD", "BTCUP", "JUP")]
 
 
 def test_top_pairs_skip_stablecoins_and_leveraged_tokens_and_keep_live_positions(api_client) -> None:
@@ -227,6 +227,7 @@ def test_top_pairs_skip_stablecoins_and_leveraged_tokens_and_keep_live_positions
     collector.testnet_cache = (pd.Timestamp.now(tz="UTC").to_pydatetime(), listed)
     tickers = [
         {"symbol": "USDCUSDT", "quoteVolume": "9e9"},
+        {"symbol": "RLUSDUSDT", "quoteVolume": "8.5e9"},
         {"symbol": "BTCUPUSDT", "quoteVolume": "8e9"},
         {"symbol": "ETHUSDT", "quoteVolume": "5e9"},
         {"symbol": "JUPUSDT", "quoteVolume": "4e9"},

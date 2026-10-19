@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 _QUOTE_RANK = {"USDT": 0, "USDC": 1, "FDUSD": 2, "BTC": 3, "ETH": 4, "BNB": 5}
 #: Dollar-pegged or fiat bases: a USDT pair of these is not a trade.
-_DOLLAR_BASES = frozenset({"USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "PYUSD", "USDE", "USD1", "EUR", "EURI", "AEUR", "XUSD"})
+_DOLLAR_BASES = frozenset({"USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "PYUSD", "USDE", "USD1", "RLUSD", "EUR", "EURI", "AEUR", "XUSD"})
 _LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR")
 _MAX_AGE_SECONDS = 3600
 #: The Spot Testnet lists its own subset of pairs; testnet orders only reach those.
