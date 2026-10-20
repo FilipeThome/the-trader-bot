@@ -256,8 +256,11 @@ def test_status_reports_validation_detail_with_raw_and_deflated_sharpe(api_clien
     assert detail["momentum"]["4h"]["sharpe"] == 1.6 and detail["momentum"]["4h"]["dsr"] == 0.97
     assert detail["momentum"]["4h"]["trials"] == 3 and detail["momentum"]["4h"]["mc_ok"] is True
     assert detail["trend"]["1h"]["mc_ok"] is False
-    assert body["validated"] == {"momentum": True, "trend": True, "mean_reversion": False}
+    # As the cycle reads it: trend's only passed timeframe fails the Monte Carlo rule, so it may only signal.
+    assert body["validated"] == {"momentum": True, "trend": False, "mean_reversion": False}
     assert body["trials"]["momentum"] == 1 and body["trials"]["trend"] == 0
+    # N: momentum's trial on another pair set plus its 4h; trend's 1h and 4h with nothing logged.
+    assert body["trials_n"]["momentum"] == 2 and body["trials_n"]["trend"] == 2
     # The key follows the config: another market filter leaves every result unvalidated.
     _use({"market_filter": "btc_ema40d"})
     assert not any(api_client.get("/bot/status").json()["validated"].values())
@@ -299,3 +302,36 @@ def test_positions_include_r_mae_mfe(api_client) -> None:
     rows = {row["id"]: row for row in api_client.get("/bot/positions").json()["rows"]}
     assert (rows[planned]["r_now"], rows[planned]["mae_r"], rows[planned]["mfe_r"]) == (1.0, -0.6, 2.0)
     assert (rows[legacy]["r_now"], rows[legacy]["mae_r"], rows[legacy]["mfe_r"]) == (None, None, None)
+
+
+def test_status_trials_n_is_the_n_the_next_validation_reaches(api_client, loader, monkeypatch) -> None:
+    seen_n: list[int] = []
+    real = module.validate_strategy
+
+    def spy(strategy_id: str, frames: Any, timeframe: str, **kwargs: Any) -> Any:
+        seen_n.append(kwargs["trials"])
+        return real(strategy_id, frames, timeframe, **kwargs)
+
+    monkeypatch.setattr(module, "validate_strategy", spy)
+
+    def status() -> dict[str, Any]:
+        return api_client.get("/bot/status").json()
+
+    def validate() -> None:
+        assert api_client.post("/bot/strategies/trend/validate").status_code == 202
+        _join()
+
+    # Nothing logged: trend's 1h and 4h under this config.
+    assert status()["trials_n"]["trend"] == 2
+    validate()
+    assert seen_n[-1] == 2 and status()["trials_n"]["trend"] == 2
+    assert status()["trials"]["trend"] == 2
+    # Another exit rule adds its two combinations before the run, and the run reaches that N.
+    _use({"take_profit_pct": 0.03, "stop_loss_pct": 0.015})
+    assert status()["trials_n"]["trend"] == 4
+    validate()
+    assert seen_n[-1] == 4 and status()["trials_n"]["trend"] == 4
+    # The rows keep counting every run; N counts combinations.
+    assert status()["trials"]["trend"] == 4
+    validate()
+    assert status()["trials"]["trend"] == 6 and status()["trials_n"]["trend"] == 4

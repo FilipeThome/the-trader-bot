@@ -382,10 +382,13 @@ def test_replay_with_resting_buys_fills_at_the_level_on_the_low() -> None:
     on = replay_grid(RESTING_GRID, grid_bars, taker=0.001)
     assert off["grid_trades"] == 0 and on["grid_trades"] == 1
     assert on["realized_usd"] == pytest.approx(10 / 95 * 100.5 * 0.999 - 10 * 1.001, rel=1e-9)
-    # The stop is checked first: a bar that reaches it buys nothing on the way.
+    # The levels rest above the stop: a bar that falls to it fills 95 and 90 on the way, then sells them at 85 too.
     gap = _bars([(100, 100, 100), (100, 84, 86)])
     stopped = replay_grid(RESTING_GRID, gap, taker=0.001)
-    assert stopped["ended"] == "stop" and stopped["pnl_usd"] == pytest.approx(replay_grid(GRID, gap, taker=0.001)["pnl_usd"])
+    held = 10 / 90 + 10 / 95 + 10 / 100 + 10 / 105
+    paid = (10 / 100 * 100 + 10 / 105 * 100) * 1.001 + 2 * 10 * 1.001
+    assert stopped["ended"] == "stop" and stopped["pnl_usd"] == pytest.approx(held * 85 * 0.999 - paid, rel=1e-9)
+    assert stopped["pnl_usd"] < replay_grid(GRID, gap, taker=0.001)["pnl_usd"]
     # DCA: the safety order fills at 98 on the wick, so the take-profit comes sooner.
     dca_bars = _bars([(100, 100, 100), (100, 97.9, 99.5), (99.5, 99.5, 102.5)])
     assert replay_dca(DCA, dca_bars, taker=0.001)["wins"] == 0

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
 from typing import Any
 
 import pytest
@@ -355,7 +354,7 @@ def test_closed_trades_filter_and_leave_out_test_and_instance_rows(tmp_path) -> 
     assert len(store.closed_trades(since="2000-01-01T00:00:00+00:00")) == 4
 
 
-def test_calendar_daily_returns_are_zero_filled_utc_days_ending_today(tmp_path) -> None:
+def test_daily_returns_are_one_value_per_utc_close_day(tmp_path) -> None:
     store = Store(tmp_path / "bot.sqlite")
     closes = (
         (50.0, "2026-10-10T12:00:00+00:00"),
@@ -368,13 +367,6 @@ def test_calendar_daily_returns_are_zero_filled_utc_days_ending_today(tmp_path) 
         position_id = _closed(store, "BTC/USDT", pnl)
         store._conn.execute("UPDATE positions SET closed_at=? WHERE id=?", (closed_at, position_id))
     store._conn.commit()
-    now = datetime(2026, 10, 20, 15, 0, tzinfo=timezone.utc)
-    assert store.strategy_daily_returns("trend", 1000.0, calendar_days=4, now=now) == pytest.approx(
-        [0.0, 0.01, 0.0, 0.002]
-    )
-    assert len(store.strategy_daily_returns("trend", 1000.0, calendar_days=30, now=now)) == 30
-    assert store.strategy_daily_returns("momentum", 1000.0, calendar_days=3, now=now) == [0.0, 0.0, 0.0]
-    # Without calendar days: only the days that closed a trade, as before.
+    # Only the days that closed a trade, summed per UTC day, oldest first.
     assert store.strategy_daily_returns("trend", 1000.0) == pytest.approx([0.05, 0.01, 0.002, 0.07])
-    with pytest.raises(ValueError):
-        store.strategy_daily_returns("trend", 1000.0, calendar_days=0)
+    assert store.strategy_daily_returns("momentum", 1000.0) == []

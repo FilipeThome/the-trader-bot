@@ -125,6 +125,13 @@ def test_macro_events_are_parsed_to_utc() -> None:
         BotConfig(macro_events_utc=hourly[: MAX_MACRO_EVENTS + 1])
 
 
+@pytest.mark.parametrize("item", ["0001-01-01T00:00:00+05:00", "9999-12-31T23:00:00-05:00"])
+def test_a_macro_event_outside_the_utc_range_is_a_validation_error(item: str) -> None:
+    # Valid ISO, but its UTC time falls outside the datetime range: a 422, not an OverflowError.
+    with pytest.raises(ValidationError, match="macro_events_utc must be ISO times"):
+        BotConfig(macro_events_utc=[item])
+
+
 @pytest.mark.parametrize(("drawdown", "halt"), [(0.4, 0.5), (0.5, 0.75), (0.6, 0.9), (0.7, 1.0), (1.0, 1.0)])
 def test_a_legacy_bot_json_with_a_wide_drawdown_limit_still_loads(tmp_path, drawdown, halt) -> None:
     config = _load(tmp_path, {"limits": {"max_drawdown_pct": drawdown}})

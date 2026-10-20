@@ -201,18 +201,6 @@ class RiskManager:
         p = opportunity.win_rate
         return p - (1 - p) / payoff
 
-    def portfolio_verdict(self, *, day_pnl: float, peak_equity: float, equity: float) -> RiskVerdict | None:
-        """The account-wide limits: the daily loss pauses the day, the drawdown halts. None within both.
-
-        Strategy entries (``assess``) and DCA or grid buys (``Runtime._robot_buy_block``) obey the same
-        verdict. ``portfolio_state`` is the stepped replacement; this keeps the single step for its callers.
-        """
-        if day_pnl <= -self.capital * self.limits.max_daily_loss_pct:
-            return RiskVerdict(False, _daily_loss_reason(self.limits), pause_day=True)
-        if peak_equity > 0 and equity <= peak_equity * (1 - self.limits.max_drawdown_pct):
-            return RiskVerdict(False, f"drawdown de {self.limits.max_drawdown_pct:.0%} desde o pico", halt=True)
-        return None
-
     def portfolio_state(
         self,
         *,
@@ -275,14 +263,11 @@ class RiskManager:
         *,
         open_positions: list[dict[str, Any]],
         exposure_usd: float,
-        day_pnl: float,
-        peak_equity: float,
-        equity: float,
         trades_today: int,
         returns_by_symbol: dict[str, list[float]],
         stale: bool,
         signal_only: bool,
-        state: RiskState | None = None,
+        state: RiskState,
         venue_cap_usd: Any = None,
         atr_daily_pct: float | None = None,
         throttle: float = 1.0,
@@ -290,9 +275,9 @@ class RiskManager:
     ) -> RiskVerdict:
         """Whether a row may trade, and its size (``sizing`` within the exposure room).
 
-        Without ``state`` the account limits are ``portfolio_verdict``'s. With it, a halt
-        or reducing level refuses, the daily loss pauses, and the state's ``risk_scale``
-        lowers the risk share. The exposure room is ``min(C·max_exposure_pct,
+        The account limits come from ``state`` alone (``portfolio_state``, read once per
+        cycle): a halt or reducing level refuses, the daily loss pauses, and the state's
+        ``risk_scale`` lowers the risk share. The exposure room is ``min(C·max_exposure_pct,
         vol_target_cap_usd) − exposure_usd``: an order larger than the room shrinks to it
         (``exposure`` or ``vol_target`` binds), and no room refuses.
         """
@@ -300,16 +285,10 @@ class RiskManager:
             return RiskVerdict(False, "OHLCV com mais de 2 intervalos de atraso")
         if signal_only:
             return RiskVerdict(False, "estratégia em somente sinal: sem validação no histórico ou rebaixada")
-        scale = self.risk_scale
-        if state is None:
-            breached = self.portfolio_verdict(day_pnl=day_pnl, peak_equity=peak_equity, equity=equity)
-            if breached is not None:
-                return breached
-        else:
-            blocked = self._state_verdict(state)
-            if blocked is not None:
-                return blocked
-            scale = min(scale, max(0.0, state.risk_scale))
+        blocked = self._state_verdict(state)
+        if blocked is not None:
+            return blocked
+        scale = min(self.risk_scale, max(0.0, state.risk_scale))
         if trades_today >= self.limits.max_trades_per_day:
             return RiskVerdict(False, "limite de trades por dia")
         if len(open_positions) >= self.limits.max_positions and opportunity.status != "em_posicao":
@@ -436,6 +415,26 @@ class RiskManager:
         return correlated >= self.limits.max_correlated
 
 
+def mc_drawdown(p95_r: object, limits: RiskLimits) -> float | None:
+    """The validation's Monte Carlo p95 drawdown at today's risk per trade, or None when unreadable.
+
+    ``p95_r`` is ``mc_p95_dd_r`` from a timeframe result, in R. A missing, boolean or
+    non-finite value proves nothing about the drawdown limit, so it reads as None.
+    """
+    if isinstance(p95_r, bool) or not isinstance(p95_r, (int, float)) or not math.isfinite(float(p95_r)):
+        return None
+    return float(p95_r) * limits.risk_per_trade_pct
+
+
+def mc_drawdown_ok(p95_r: object, limits: RiskLimits) -> bool:
+    """True only when the Monte Carlo p95 drawdown is readable and stays under ``max_drawdown_pct``.
+
+    The one rule the cycle (signal-only rows) and the panel (``mc_ok``) both use.
+    """
+    drawdown = mc_drawdown(p95_r, limits)
+    return drawdown is not None and drawdown < limits.max_drawdown_pct
+
+
 def planned_notional(limits: RiskLimits, sizing_capital: float, risk_pct: float) -> float:
     """The order a row with this stop distance plans before its per-row caps: the stop-risk
     size under the order ceiling. Without a usable stop distance, the ceiling itself."""
@@ -503,10 +502,15 @@ def vol_target_cap(
     annualised volatility (``portfolio_vol``) to ``target_vol_annual`` of the sizing capital.
 
     It is the held exposure plus the largest order ``x ≥ 0`` with ``σ(held + x) ≤
-    target·C``, solved exactly on the covariance. It only limits new entries: a book
-    already above the target gets no room, and nothing held is sold. None when it does
-    not bind: the target is off, the history is short (``portfolio_vol``), the pair
-    carries no volatility, or the planned ``size_usd`` keeps the book within the target.
+    target·C``, solved exactly on the covariance: ``σ²(x)`` is a parabola, and the room
+    is its larger root. It only limits new entries; nothing held is sold. A book already
+    above the target gets room only from a hedge, a pair whose covariance with the book
+    is negative: such an order lowers ``σ`` first, and the room runs up to the size at
+    which ``σ`` climbs back to the target, so any order within it leaves the book below
+    its current ``σ``. Without a hedge, or when no size brings ``σ`` down to the target,
+    a book above the target gets no room. None when it does not bind: the target is off,
+    the history is short (``portfolio_vol``), the pair carries no volatility, or the
+    planned ``size_usd`` keeps the book within the target.
     """
     if not _positive(limits.target_vol_annual) or not _positive(sizing_capital):
         return None

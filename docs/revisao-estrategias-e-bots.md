@@ -466,7 +466,7 @@ O que mudou em relação à proposta, item a item:
 ### Desvios combinados na integração
 
 - **`bot.json` antigo com drawdown de 50% ou mais.** A derivação do desenho (`halt = min(50%, max(15%, 1,5 × limite))`) poria o halt abaixo do limite, e o arquivo deixaria de carregar. Nesse caso o halt fica em 1,5 vez o limite, no máximo 100%; o degrau de cautela continua na metade do limite.
-- **Mudar só `max_drawdown_pct` pela API recalcula os degraus.** `PUT /bot/config` mescla os limites gravados com os enviados. Mantidos, os degraus antigos podiam ficar fora de ordem e recusar a mudança (422). Quando o limite muda sem os degraus no corpo, os gravados saem e são derivados de novo; um degrau de cautela em 0 continua desligado.
+- **Mudar só `max_drawdown_pct` pela API recalcula os degraus.** `PUT /bot/config` mescla os limites gravados com os enviados. Mantidos, os degraus antigos podiam ficar fora de ordem e recusar a mudança (422). Quando o limite muda sem os degraus no corpo, um degrau gravado que continua em ordem fica; só o que o novo limite deixa fora de ordem sai e é derivado de novo. Um degrau de cautela em 0 continua desligado.
 - **Um halt retomado fica em só reduzir.** O degrau de halt é gravado em `bot_state.risk_state` como `reducing`. Depois de `POST /bot/resume`, nenhuma compra sai até o drawdown cair abaixo de `dd_reduce_pct` (ou de `max_drawdown_pct`, com a cautela desligada). Stops e saídas continuam.
 - **O filtro de mercado falha fechado sem dado do BTC.** Ligado, um ciclo em que o BTC/USDT não foi lido bloqueia toda entrada ("BTC sem leitura neste ciclo"). Com menos de 240 velas de 4 h fechadas, ele deixa passar, como no desenho.
 - **O nível de risco é calculado antes dos robôs.** O desenho punha o cálculo depois das saídas e dos robôs. Na integração ele foi para depois das saídas e antes dos robôs, uma vez por ciclo: robôs e estratégias obedecem ao mesmo nível no mesmo ciclo. Só reduzir, halt e pausa diária bloqueiam as compras dos robôs; a cautela não as reduz.
@@ -482,3 +482,15 @@ O reviewer aceitou as ondas 1 a 3 com cinco correções, todas aplicadas na onda
 - **Leitura da taxa da conta (baixa).** A leitura roda numa thread própria e o ciclo espera no máximo 2 s, usando o que já estiver em cache.
 
 Uma segunda revisão, sobre a onda 4, aceitou com quatro correções, também aplicadas com testes: Pausar o ciclo é recusado enquanto uma compra parada não se confirma cancelada ou a parte comprada não tem stop; só um bloqueio de escrita deixa de contar para o halt do stop atravessado; uma compra parada já confirmada pela Binance não é esquecida numa única leitura "não encontrada"; e uma recolocação de stop pendente não esconde mais a checagem do stop atravessado.
+
+### Revisão rigorosa da branch
+
+Uma revisão rigorosa da branch inteira, em seis fatias, reprovou o código com 12 blockers e 14 majors; todos foram corrigidos com testes, e uma verificação independente confirmou cada item. Os mais importantes:
+
+- **Sharpe com ruído de ponto flutuante.** 30 stops idênticos davam Sharpe por trade de −2×10¹⁵, que envenenava a variância do Sharpe deflacionado e travava a estratégia para sempre. A dispersão agora usa tolerância relativa, e tentativas com Sharpe não finito ou acima de 5 em valor absoluto ficam fora da variância.
+- **Decaimento depois da revalidação.** O Sharpe ao vivo usa só os dias desde a validação.
+- **Estado de risco fora do ciclo.** Criar um robô lê o nível gravado e não grava nada; só o ciclo, com preços, mede o dia.
+- **Pausar, retomar e iniciar.** Pausar nunca liga um ciclo parado; retomar e iniciar resolvem antes as compras paradas que o halt deixou.
+- **Stop atravessado.** Exige também que o último negócio tenha chegado ao stop, que é o que dispara um STOP_LOSS_LIMIT.
+- **Exposição do mandato.** As compras paradas dos robôs contam na exposição das compras, mas não na das vendas: um stop de outro par nunca é recusado por causa delas.
+- **Uma regra para o Monte Carlo** (`risk.mc_drawdown_ok`) e **uma derivação dos tetos do mandato** (`mandate_caps_for`), usadas pelo ciclo, pela API e pelo painel.

@@ -5,7 +5,7 @@ import { Help } from "../Help";
 import { riskLevels, strategyName } from "../labels";
 import { parseDecimal, parseWhole } from "../numbers";
 import { useBot } from "../store";
-import type { Status, ValidationJob } from "../types";
+import type { MandateSummary, Status, ValidationJob } from "../types";
 
 const strategyHelp: Record<string, string> = {
   trend: "Trend segue o movimento quando o preço rompe a máxima ou a mínima recente. A ideia é acompanhar a tendência, não adivinhar a virada. Só opera no tempo gráfico (1h ou 4h) que passar no teste histórico.",
@@ -128,7 +128,7 @@ export function Controls() {
           <button className="rounded border px-3 py-2" type="button" onClick={() => void run("Pausar o ciclo", api.stop)}>
             Pausar
           </button>
-          <Help text="Desliga o ciclo. Não cancela ordens que já foram à corretora e não fecha posições." />
+          <Help text="Desliga o ciclo. Não fecha posições e deixa os stops na corretora. Cancela antes as compras limitadas paradas dos robôs; se um cancelamento não se confirma, a pausa é recusada e o ciclo fica como estava; se uma posição ficar sem stop, o robô entra em halt." />
         </span>
         <span className="inline-flex items-center">
           <button className="rounded bg-red-600 px-3 py-2 text-white" type="button" onClick={() => void run("Parar tudo", api.halt)}>
@@ -418,13 +418,14 @@ export function Controls() {
             className="underline disabled:opacity-50"
             type="button"
             disabled={!fixedValid}
-            onClick={() =>
+            onClick={() => {
+              if (!window.confirm(`${fixedOn ? "Trocar para" : "Ligar"} alvo +${takeProfitPct}% e stop −${stopLossPct}%?\n\n${revalidationWarning}`)) return;
               void run(
                 "Salvar alvo e stop fixos",
                 () => api.updateConfig({ take_profit_pct: (takeProfitPct ?? 0) / 100, stop_loss_pct: (stopLossPct ?? 0) / 100 }),
                 () => `Alvo +${takeProfitPct}% e stop −${stopLossPct}%; as estratégias ligadas estão sendo validadas`,
-              )
-            }
+              );
+            }}
           >
             {fixedOn ? "salvar" : "ligar"}
           </button>
@@ -432,7 +433,10 @@ export function Controls() {
             <button
               className="underline"
               type="button"
-              onClick={() => void run("Desligar alvo e stop fixos", () => api.updateConfig({ take_profit_pct: null, stop_loss_pct: null }))}
+              onClick={() => {
+                if (!window.confirm(`Desligar o alvo e o stop fixos? Cada estratégia volta ao próprio stop e alvo.\n\n${revalidationWarning}`)) return;
+                void run("Desligar alvo e stop fixos", () => api.updateConfig({ take_profit_pct: null, stop_loss_pct: null }));
+              }}
             >
               desligar
             </button>
@@ -445,7 +449,11 @@ export function Controls() {
             type="checkbox"
             disabled={fixedOn}
             checked={status.trailing_stop}
-            onChange={(event) => { const on = event.target.checked; void run(on ? "Ligar o stop móvel" : "Desligar o stop móvel", () => api.updateConfig({ trailing_stop: on })); }}
+            onChange={(event) => {
+              const on = event.target.checked;
+              if (!window.confirm(`${on ? "Ligar" : "Desligar"} o stop móvel?\n\n${revalidationWarning}`)) return;
+              void run(on ? "Ligar o stop móvel" : "Desligar o stop móvel", () => api.updateConfig({ trailing_stop: on }));
+            }}
           />{" "}
           Stop móvel
         </label>
@@ -457,7 +465,11 @@ export function Controls() {
             type="checkbox"
             disabled={!status.trailing_stop}
             checked={status.trailing_activation}
-            onChange={(event) => { const on = event.target.checked; void run(on ? "Ligar a ativação do stop móvel" : "Desligar a ativação do stop móvel", () => api.updateConfig({ trailing_activation: on })); }}
+            onChange={(event) => {
+              const on = event.target.checked;
+              if (!window.confirm(`${on ? "Ligar" : "Desligar"} a ativação do stop móvel?\n\n${revalidationWarning}`)) return;
+              void run(on ? "Ligar a ativação do stop móvel" : "Desligar a ativação do stop móvel", () => api.updateConfig({ trailing_activation: on }));
+            }}
           />{" "}
           Stop móvel com ativação (trailing take-profit)
         </label>
@@ -471,11 +483,16 @@ export function Controls() {
             onChange={(event) => {
               const on = event.target.checked;
               void run(on ? "Zerar no halt ligado" : "Zerar no halt desligado", async () => {
-                const changes = mandateChanges({ ...status, flatten_on_halt: on });
+                const target = status.mandate_target;
+                const changes = target ? mandateChanges(status.mandate, { ...target, flatten_on_halt: on }) : [];
                 const text =
                   `${on ? "Ligar" : "Desligar"} zerar posições no halt?\n\n` +
                   "Esta opção faz parte do mandato da corretora, e a parada de emergência segue o mandato. Para mudar, o mandato é reconfirmado com os limites atuais do bot.json." +
-                  (changes.length ? `\n\nO mandato passa a ter:\n${changes.join("\n")}` : "");
+                  (!target
+                    ? "\n\nNão foi possível calcular o mandato novo: confira os limites no cartão do mandato depois de confirmar."
+                    : changes.length
+                      ? `\n\nO mandato passa a ter:\n${changes.join("\n")}`
+                      : "");
                 if (!window.confirm(text)) throw new Error("cancelado");
                 return api.updateConfig({ flatten_on_halt: on, reconfirm_mandate: true });
               }, () => `Zerar no halt ${on ? "ligado" : "desligado"} e mandato reconfirmado`);
@@ -529,20 +546,26 @@ function usd(value: number): string {
   return `US$ ${value.toFixed(2)}`;
 }
 
-/** Where the committed mandate differs from what bot.json would write now, one line per cap. */
-function mandateChanges(status: Status): string[] {
-  const mandate = status.mandate;
+/** The confirm text of every change to a validation key (exit rule: fixed TP/SL and trailing; market filter; hysteresis). */
+const revalidationWarning =
+  "As estratégias ligadas passam a só sinal até validar de novo, e cada nova validação conta como tentativa no Sharpe deflacionado.";
+
+function yesNo(value: boolean): string {
+  return value ? "sim" : "não";
+}
+
+/** Each mandate field, compared the way the gate reads it: dollars to the cent, the rest exactly. */
+const mandateFields: [string, (mandate: MandateSummary) => string, (a: MandateSummary, b: MandateSummary) => boolean][] = [
+  ["Teto por ordem", (m) => usd(m.max_order_notional_usd), (a, b) => Math.abs(a.max_order_notional_usd - b.max_order_notional_usd) > 0.005],
+  ["Exposição total", (m) => usd(m.max_total_exposure_usd), (a, b) => Math.abs(a.max_total_exposure_usd - b.max_total_exposure_usd) > 0.005],
+  ["Ordens por dia", (m) => String(m.max_trades_per_day), (a, b) => a.max_trades_per_day !== b.max_trades_per_day],
+  ["Zerar no halt", (m) => yesNo(m.flatten_on_halt), (a, b) => a.flatten_on_halt !== b.flatten_on_halt],
+];
+
+/** Where the committed mandate differs from the target a reconfirmation would write, one line per field. */
+function mandateChanges(mandate: MandateSummary | null | undefined, target: MandateSummary): string[] {
   if (!mandate) return [];
-  const orderCap = status.capital_usd * (status.limits.max_order_notional_pct ?? 0);
-  const exposureCap = status.capital_usd * (status.limits.max_exposure_pct ?? 0);
-  const lines: string[] = [];
-  if (Math.abs(orderCap - mandate.max_order_notional_usd) > 0.005)
-    lines.push(`teto por ordem: ${usd(mandate.max_order_notional_usd)} → ${usd(orderCap)}`);
-  if (Math.abs(exposureCap - mandate.max_total_exposure_usd) > 0.005)
-    lines.push(`exposição total: ${usd(mandate.max_total_exposure_usd)} → ${usd(exposureCap)}`);
-  if (mandate.flatten_on_halt !== status.flatten_on_halt)
-    lines.push(`zerar no halt: ${mandate.flatten_on_halt ? "sim" : "não"} → ${status.flatten_on_halt ? "sim" : "não"}`);
-  return lines;
+  return mandateFields.filter(([, , differs]) => differs(mandate, target)).map(([label, shown]) => `${label}: ${shown(mandate)} → ${shown(target)}`);
 }
 
 /** The drawdown level the runtime keeps: cautious and reducing change what the bot may buy. */
@@ -552,12 +575,15 @@ function RiskBanner({ status }: { status: Status }) {
   const since = state.since ? ` desde ${new Date(state.since).toLocaleString("pt-BR")}` : "";
   const drawdown = pctText(state.drawdown, 1);
   const reduce = pctText(status.limits.dd_reduce_pct, 1);
+  // Where the runtime leaves reducing: the cautious step, or the reducing limit itself when that step is off (0).
+  const ddReduce = status.limits.dd_reduce_pct ?? 0;
+  const release = pctText(ddReduce > 0 ? ddReduce : status.limits.max_drawdown_pct, 1);
   const halt = pctText(status.limits.halt_drawdown_pct, 1);
   if (state.level === "cautious") {
     return (
       <p role="status" className="rounded border border-amber-400 bg-amber-50 p-3 text-amber-900 dark:bg-amber-950 dark:text-amber-200">
         <strong>Modo {riskLevels.cautious}{since}.</strong> O patrimônio está {drawdown} abaixo do pico (a partir de {reduce}). Cada trade arrisca a metade e
-        entra no máximo uma posição por ciclo. Volta ao normal sozinho quando a queda ficar abaixo de {reduce}.
+        entra no máximo uma posição por ciclo. Volta ao normal sozinho quando a queda ficar abaixo de {release}.
         {state.reason ? ` Motivo: ${state.reason}.` : ""}
       </p>
     );
@@ -566,7 +592,7 @@ function RiskBanner({ status }: { status: Status }) {
     <p role="alert" className="rounded border border-red-500 bg-red-50 p-3 text-red-900 dark:bg-red-950 dark:text-red-200">
       <strong>Modo {riskLevels.reducing}{since}.</strong> O patrimônio está {drawdown} abaixo do pico (limite {pctText(status.limits.max_drawdown_pct, 1)}). Nenhuma
       compra nova: estratégias, entradas armadas, execução manual e robôs ficam bloqueados. Stops, saídas, stop móvel e TP1 continuam. Sai sozinho quando a
-      queda ficar abaixo de {reduce}; em {halt} o robô para (halt).
+      queda ficar abaixo de {release}; em {halt} o robô para (halt).
       {state.reason ? ` Motivo: ${state.reason}.` : ""}
     </p>
   );
@@ -576,9 +602,13 @@ function RiskBanner({ status }: { status: Status }) {
 function MandateCard({ status }: { status: Status }) {
   const perform = useBot((state) => state.perform);
   const mandate = status.mandate;
-  const orderCap = status.capital_usd * (status.limits.max_order_notional_pct ?? 0);
-  const exposureCap = status.capital_usd * (status.limits.max_exposure_pct ?? 0);
-  const changes = mandateChanges(status);
+  const target = status.mandate_target ?? null;
+  const changes = target ? mandateChanges(mandate, target) : [];
+  // The bot.json percentage behind each dollar cap, so a difference can be traced to its limit.
+  const fieldNotes: Record<string, string> = {
+    "Teto por ordem": ` (${pctText(status.limits.max_order_notional_pct)})`,
+    "Exposição total": ` (${pctText(status.limits.max_exposure_pct)})`,
+  };
   return (
     <div className="rounded border border-neutral-300 p-3 dark:border-neutral-700">
       <p className="mb-2 flex items-center font-medium">
@@ -598,35 +628,27 @@ function MandateCard({ status }: { status: Status }) {
               </tr>
             </thead>
             <tbody>
-              <tr className="border-t border-neutral-200 dark:border-neutral-800">
-                <td className="pr-4">Teto por ordem</td>
-                <td className="pr-4">{usd(mandate.max_order_notional_usd)}</td>
-                <td className={Math.abs(orderCap - mandate.max_order_notional_usd) > 0.005 ? "text-amber-600" : ""}>
-                  {usd(orderCap)} ({pctText(status.limits.max_order_notional_pct)})
-                </td>
-              </tr>
-              <tr className="border-t border-neutral-200 dark:border-neutral-800">
-                <td className="pr-4">Exposição total</td>
-                <td className="pr-4">{usd(mandate.max_total_exposure_usd)}</td>
-                <td className={Math.abs(exposureCap - mandate.max_total_exposure_usd) > 0.005 ? "text-amber-600" : ""}>
-                  {usd(exposureCap)} ({pctText(status.limits.max_exposure_pct)})
-                </td>
-              </tr>
-              <tr className="border-t border-neutral-200 dark:border-neutral-800">
-                <td className="pr-4">Ordens por dia</td>
-                <td className="pr-4">{mandate.max_trades_per_day}</td>
-                <td>—</td>
-              </tr>
-              <tr className="border-t border-neutral-200 dark:border-neutral-800">
-                <td className="pr-4">Zerar no halt</td>
-                <td className="pr-4">{mandate.flatten_on_halt ? "sim" : "não"}</td>
-                <td className={mandate.flatten_on_halt !== status.flatten_on_halt ? "text-amber-600" : ""}>{status.flatten_on_halt ? "sim" : "não"}</td>
-              </tr>
+              {mandateFields.map(([label, shown, differs]) => (
+                <tr key={label} className="border-t border-neutral-200 dark:border-neutral-800">
+                  <td className="pr-4">{label}</td>
+                  <td className="pr-4">{shown(mandate)}</td>
+                  {target ? (
+                    <td className={differs(mandate, target) ? "text-amber-600" : ""}>
+                      {shown(target)}
+                      {fieldNotes[label] ?? ""}
+                    </td>
+                  ) : (
+                    <td className="text-neutral-500">—</td>
+                  )}
+                </tr>
+              ))}
             </tbody>
           </table>
-          {changes.length > 0 ? (
+          {!target ? (
+            <p className="mt-2 text-amber-600">Não foi possível calcular o mandato que o bot.json gravaria agora; a comparação fica indisponível.</p>
+          ) : changes.length > 0 ? (
             <p className="mt-2 flex flex-wrap items-center gap-2">
-              <span className="text-amber-600">O mandato difere do bot.json; até reconfirmar, vale o menor teto e o zerar no halt do mandato.</span>
+              <span className="text-amber-600">O mandato difere do bot.json; até reconfirmar, valem o menor teto, as ordens por dia e o zerar no halt do mandato.</span>
               <button
                 className="underline"
                 type="button"
@@ -664,10 +686,10 @@ type LimitField = {
 const limitGroups: [string, string, LimitField[]][] = [
   [
     "Drawdown em degraus",
-    "Queda do patrimônio a partir do pico. Cada degrau precisa ficar abaixo do seguinte. Mudar só o só reduzir recalcula os outros dois (metade dele, e 1,5 vez dele entre 15% e 50%).",
+    "Queda do patrimônio a partir do pico. Cada degrau precisa ficar abaixo do seguinte. Mudar só o só reduzir mantém os degraus gravados que continuam em ordem e recalcula os que saem dela (cautela na metade dele, halt em 1,5 vez dele entre 15% e 50%). A cautela em 0 continua desligada.",
     [
       { key: "dd_reduce_pct", label: "Cautela a partir de (%)", unit: "pct", min: 0, max: 50, help: "Risco por trade pela metade e no máximo uma entrada por ciclo. 0 desliga este degrau." },
-      { key: "max_drawdown_pct", label: "Só reduzir a partir de (%)", unit: "pct", min: 0, max: 50, above: true, help: "Nenhuma compra nova; stops, saídas, stop móvel e TP1 continuam. Sai sozinho quando a queda volta abaixo da cautela." },
+      { key: "max_drawdown_pct", label: "Só reduzir a partir de (%)", unit: "pct", min: 0, max: 50, above: true, help: "Nenhuma compra nova; stops, saídas, stop móvel e TP1 continuam. Sai sozinho quando a queda volta abaixo da cautela; com a cautela em 0, quando volta abaixo deste nível." },
       { key: "halt_drawdown_pct", label: "Halt a partir de (%)", unit: "pct", min: 0, max: 100, above: true, help: "Parada de emergência: o robô para e não volta sozinho." },
     ],
   ],
@@ -763,7 +785,9 @@ function LimitsCard({ status }: { status: Status }) {
         type="button"
         disabled={!valid}
         onClick={() =>
-          void perform("Salvar limites de risco", () => api.updateConfig({ limits: payload }), () => "Limites de risco salvos").then(() => setDrafts({}))
+          void perform("Salvar limites de risco", () => api.updateConfig({ limits: payload }), () => "Limites de risco salvos").then((outcome) => {
+            if (outcome.ok) setDrafts({});
+          })
         }
       >
         salvar limites
@@ -781,7 +805,7 @@ function RulesCard({ status }: { status: Status }) {
     <div className="space-y-2 rounded border border-neutral-300 p-3 dark:border-neutral-700">
       <p className="flex items-center font-medium">
         Regras de mercado e saída
-        <Help text="O filtro de mercado e a histerese mudam as regras que o teste histórico replica: ao mudar, as estratégias ligadas são validadas de novo sozinhas, e cada teste conta como uma tentativa no Sharpe deflacionado." />
+        <Help text="O filtro de mercado e a histerese mudam as regras que o teste histórico replica: ao mudar, as estratégias ligadas são validadas de novo sozinhas. No Sharpe deflacionado, cada combinação nova (timeframe, regra, pares, filtro, histerese) conta como uma tentativa." />
       </p>
       <p className="flex items-center">
         <label>
@@ -790,6 +814,7 @@ function RulesCard({ status }: { status: Status }) {
             checked={filterOn}
             onChange={(event) => {
               const on = event.target.checked;
+              if (!window.confirm(`${on ? "Ligar" : "Desligar"} o filtro de mercado?\n\n${revalidationWarning}`)) return;
               void perform(on ? "Ligar o filtro de mercado" : "Desligar o filtro de mercado", () => api.updateConfig({ market_filter: on ? "btc_ema40d" : "off" }), () =>
                 `Filtro de mercado ${on ? "ligado" : "desligado"}; as estratégias ligadas estão sendo validadas`);
             }}
@@ -805,6 +830,7 @@ function RulesCard({ status }: { status: Status }) {
             checked={hysteresis}
             onChange={(event) => {
               const on = event.target.checked;
+              if (!window.confirm(`${on ? "Ligar" : "Desligar"} a histerese de saída?\n\n${revalidationWarning}`)) return;
               void perform(on ? "Ligar a histerese de saída" : "Desligar a histerese de saída", () => api.updateConfig({ exit_hysteresis: on }), () =>
                 `Histerese ${on ? "ligada" : "desligada"}; as estratégias ligadas estão sendo validadas`);
             }}
@@ -880,7 +906,9 @@ function MacroCard({ status }: { status: Status }) {
           onClick={() =>
             void perform("Salvar calendário macro", () => api.updateConfig(payload), () =>
               lines.length ? `${lines.length} evento(s) macro salvos` : "Pausa dos eventos macro salva",
-            ).then(() => {
+            ).then((outcome) => {
+              // A refused list (422) stays in the box, so the operator can fix it instead of retyping it.
+              if (!outcome.ok) return;
               setEvents("");
               setMinutes("");
             })
@@ -889,7 +917,14 @@ function MacroCard({ status }: { status: Status }) {
           {lines.length ? "substituir a lista" : "salvar pausa"}
         </button>
         {current.length > 0 && (
-          <button className="underline" type="button" onClick={() => void perform("Limpar o calendário macro", () => api.updateConfig({ macro_events_utc: [] }))}>
+          <button
+            className="underline"
+            type="button"
+            onClick={() => {
+              if (!window.confirm(`Limpar a lista?\n\nRemove ${current.length === 1 ? "o evento" : `os ${current.length} eventos`} do calendário macro.`)) return;
+              void perform("Limpar o calendário macro", () => api.updateConfig({ macro_events_utc: [] }));
+            }}
+          >
             limpar a lista
           </button>
         )}

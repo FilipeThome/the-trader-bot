@@ -98,7 +98,7 @@ export type StopWindowStats = {
   by_kind: Record<string, { count: number; mean_ms: number; max_ms: number }>;
 };
 
-/** The committed mandate's caps; null without a mandate. */
+/** A mandate's caps: the committed one (null without a mandate) or the one bot.json would write now. */
 export type MandateSummary = {
   max_order_notional_usd: number;
   max_total_exposure_usd: number;
@@ -111,7 +111,8 @@ export type PairSlippage = {
   trades: number;
   /** Mean round-trip slippage of the last trades that recorded it; null without any. */
   slippage_rt: number | null;
-  blocked: boolean;
+  /** null when the slippage check itself failed: the state is unknown, with the cause in ``blocked_reason``. */
+  blocked: boolean | null;
   blocked_reason?: string | null;
 };
 
@@ -278,12 +279,19 @@ export type Status = {
   validated: Record<string, boolean>;
   /** Per strategy and timeframe: the last validation's result, with ``mc_ok`` at today's limits. */
   validation_detail?: Record<string, Record<string, TimeframeResult>>;
-  /** Validation runs since the strategy's last pass (the N of the deflated Sharpe). */
+  /** Recorded validation runs since the strategy's last pass; a rerun of the same combination counts again. */
   trials?: Record<string, number>;
+  /**
+   * The N of the deflated Sharpe: distinct (timeframe, exit rule, pair set, market filter, hysteresis)
+   * combinations since the last pass, plus the current one. Absent on an API without it.
+   */
+  trials_n?: Record<string, number>;
   risk_state?: RiskState | null;
   /** Unprotected windows of the last 30 days, when a stop is swapped. */
   stop_windows?: StopWindowStats | null;
   mandate?: MandateSummary | null;
+  /** What a reconfirmation would write now from bot.json; null when it cannot be computed, absent on an older API. */
+  mandate_target?: MandateSummary | null;
   market_filter?: "off" | "btc_ema40d";
   exit_hysteresis?: boolean;
   flatten_day_on_daily_loss?: boolean;

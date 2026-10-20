@@ -243,16 +243,20 @@ class BotConfig(BaseModel):
     @field_validator("macro_events_utc")
     @classmethod
     def _utc_events(cls, value: list[str]) -> list[str]:
-        """Parse each event, read a time without offset as UTC, then deduplicate and sort."""
+        """Parse each event, read a time without offset as UTC, then deduplicate and sort.
+
+        A time whose UTC conversion leaves the datetime range (year 1 or 9999 with an
+        offset) is refused like any unreadable one.
+        """
         moments: set[datetime] = set()
         for item in value:
             try:
                 moment = datetime.fromisoformat(item.strip())
-            except ValueError:
+                if moment.tzinfo is None:
+                    moment = moment.replace(tzinfo=timezone.utc)
+                moments.add(moment.astimezone(timezone.utc))
+            except (ValueError, OverflowError):
                 raise ValueError(f"macro_events_utc must be ISO times: {item!r}") from None
-            if moment.tzinfo is None:
-                moment = moment.replace(tzinfo=timezone.utc)
-            moments.add(moment.astimezone(timezone.utc))
         return [moment.isoformat() for moment in sorted(moments)]
 
     @model_validator(mode="after")

@@ -148,21 +148,26 @@ def test_status_reports_the_risk_state_the_mandate_and_the_new_settings(api_clie
     assert api_client.put("/bot/config", json={"macro_events_utc": ["amanhã"]}).status_code == 422
 
 
-def test_changing_only_the_drawdown_limit_derives_its_steps_again(api_client) -> None:
+def test_a_new_drawdown_limit_rederives_only_the_steps_it_puts_out_of_order(api_client) -> None:
     def limits(body: dict) -> dict:
         response = api_client.put("/bot/config", json={"limits": body})
         assert response.status_code == 200, response.text
         return response.json()["config"]["limits"]
 
+    # From (5%, 10%, 15%): the halt at or below 20% is derived again, the reduce step still fits.
     raised = limits({"max_drawdown_pct": 0.2})
-    assert (raised["dd_reduce_pct"], raised["halt_drawdown_pct"]) == (0.1, 0.3)
+    assert (raised["dd_reduce_pct"], raised["halt_drawdown_pct"]) == (0.05, 0.3)
+    # The reduce step at or above 4% is derived again, the halt still fits.
     lowered = limits({"max_drawdown_pct": 0.04})
-    assert (lowered["dd_reduce_pct"], lowered["halt_drawdown_pct"]) == (0.02, 0.15)
+    assert (lowered["dd_reduce_pct"], lowered["halt_drawdown_pct"]) == (0.02, 0.3)
     # Steps sent with the limit are kept as sent.
     sent = limits({"max_drawdown_pct": 0.12, "dd_reduce_pct": 0.03, "halt_drawdown_pct": 0.2})
     assert (sent["dd_reduce_pct"], sent["halt_drawdown_pct"]) == (0.03, 0.2)
     # Another limit leaves the steps alone.
     assert limits({"max_exposure_pct": 0.4})["halt_drawdown_pct"] == 0.2
+    # Custom steps that still fit a new limit survive it.
+    moved = limits({"max_drawdown_pct": 0.15})
+    assert (moved["dd_reduce_pct"], moved["halt_drawdown_pct"]) == (0.03, 0.2)
     # A reduce step of 0 is "off" and stays off.
     limits({"dd_reduce_pct": 0})
     off = limits({"max_drawdown_pct": 0.3})
@@ -181,7 +186,7 @@ def test_performance_reports_slippage_per_pair(api_client, monkeypatch) -> None:
         store.update_position(position, status="open", qty=1.0, avg_price=100.0, entry_slippage=entry, exit_slippage=exit_)
         store.close_position(position, exit_price=101.0, realized_pnl=1.0, fees=0.0)
     blocked = {"SOL/USDT": "slippage realizado acima do orçamento"}
-    monkeypatch.setattr(decay, "pair_slippage_blocked", lambda _store, symbol, _budget, *, now: blocked.get(symbol), raising=False)
+    monkeypatch.setattr(decay, "pair_slippage_blocked", lambda _store, symbol, _budget, *, now: blocked.get(symbol))
     pairs = {row["symbol"]: row for row in api_client.get("/bot/performance").json()["pairs"]}
     assert set(ctx.runtime.config.symbols) <= set(pairs)
     sol = pairs["SOL/USDT"]

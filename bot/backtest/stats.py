@@ -29,17 +29,32 @@ import numpy as np
 EULER_GAMMA = 0.5772156649015329
 #: Profit factor and Sortino of a sample without losses.
 RATIO_CAP = 99.0
+#: Returns whose range is at most this share of max(1, |mean|) have no dispersion: what
+#: is left is float rounding (30 equal stop-outs computed from different entry prices
+#: differ in the last digits), and dividing by it gives a Sharpe of order 1e15.
+DISPERSION_TOL = 1e-12
+#: Largest |per-trade Sharpe| a trial may have to enter the deflated Sharpe's variance.
+#: Under the unskilled-trials model a trial's Sharpe is about N(0, 1/n), and with at least
+#: 30 trades (the gate's minimum) 1/√n is under 0.19: a Sharpe of 5 is over 25 standard
+#: errors away. Beyond it the sample is degenerate (nearly every trade the same return,
+#: such as all stop-outs) or a numeric artefact, and one such value would inflate the
+#: variance, and SR0 with it, so that no later strategy could pass.
+MAX_TRIAL_SHARPE = 5.0
 
 _NORMAL = NormalDist()
+
+
+def _no_dispersion(values: np.ndarray) -> bool:
+    """True when the returns differ by no more than float rounding (``DISPERSION_TOL``)."""
+    return float(np.ptp(values)) <= DISPERSION_TOL * max(1.0, abs(float(values.mean())))
 
 
 def per_trade_sharpe(returns: Sequence[float] | np.ndarray) -> float:
     """Mean over sample standard deviation, not annualised. 0.0 below two returns or without dispersion."""
     values = np.asarray(returns, dtype=float)
-    if len(values) < 2:
+    if len(values) < 2 or _no_dispersion(values):
         return 0.0
-    sigma = float(values.std(ddof=1))
-    return 0.0 if sigma == 0 else float(values.mean()) / sigma
+    return float(values.mean()) / float(values.std(ddof=1))
 
 
 def probabilistic_sharpe(returns: Sequence[float] | np.ndarray, sr0: float = 0.0) -> float:
@@ -47,15 +62,16 @@ def probabilistic_sharpe(returns: Sequence[float] | np.ndarray, sr0: float = 0.0
 
     SR is the per-trade Sharpe (sample standard deviation); γ3 and γ4 are the
     sample skewness and (non-excess) kurtosis. Fewer than two returns, or a
-    non-positive denominator, give 0.0. Returns without dispersion give the
-    limit: 1.0 when their mean is above zero and ``sr0`` is finite, else 0.0.
+    non-positive denominator, give 0.0. Returns without dispersion (equal up to
+    ``DISPERSION_TOL``) give the limit: 1.0 when their mean is above zero (an
+    unbounded Sharpe beats any finite ``sr0``), else 0.0.
     """
     values = np.asarray(returns, dtype=float)
     count = len(values)
     if count < 2:
         return 0.0
     mean = float(values.mean())
-    if float(values.std(ddof=1)) == 0:
+    if _no_dispersion(values):
         return 1.0 if mean > 0 else 0.0
     sharpe = per_trade_sharpe(values)
     centred = values - mean
@@ -85,9 +101,15 @@ def deflated_sharpe(returns: Sequence[float] | np.ndarray, trials: int, trial_sh
 
     The variance of the trials' per-trade Sharpe is taken over ``trial_sharpes``
     (the earlier trials) plus this sample's own Sharpe, with the sample variance;
-    with one value it is 0, and so is SR0.
+    with one value it is 0, and so is SR0. Values that are not finite or whose
+    magnitude is above ``MAX_TRIAL_SHARPE`` are left out of the variance (they
+    still count in ``trials``), so one degenerate run cannot lock out every later one.
     """
-    sharpes = [float(value) for value in trial_sharpes] + [per_trade_sharpe(returns)]
+    sharpes = [
+        value
+        for value in (*(float(sharpe) for sharpe in trial_sharpes), per_trade_sharpe(returns))
+        if math.isfinite(value) and abs(value) <= MAX_TRIAL_SHARPE
+    ]
     var = float(np.var(sharpes, ddof=1)) if len(sharpes) > 1 else 0.0
     return probabilistic_sharpe(returns, expected_max_sharpe(int(trials), var))
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import math
 from decimal import Decimal
 from typing import Any
@@ -13,6 +14,8 @@ from bot.risk import (
     RiskManager,
     RiskState,
     allocate,
+    mc_drawdown,
+    mc_drawdown_ok,
     planned_notional,
     portfolio_vol,
     protect,
@@ -42,19 +45,31 @@ def _manager() -> RiskManager:
     return RiskManager(RiskLimits(), capital_usd=10_000)
 
 
+ACCOUNT_FIGURES = ("day_pnl", "peak_equity", "equity")
+
+
+def _state_of(manager: RiskManager, overrides: dict[str, Any], capital: float) -> RiskState:
+    """The risk state the cycle reads from the account figures, taken out of ``overrides``
+    (``assess`` reads only the state, never the figures)."""
+    figures: dict[str, float] = {"day_pnl": 0.0, "peak_equity": capital, "equity": capital}
+    figures.update({key: overrides.pop(key) for key in ACCOUNT_FIGURES if key in overrides})
+    return manager.portfolio_state(
+        day_change=figures["day_pnl"], peak_equity=figures["peak_equity"], equity=figures["equity"]
+    )
+
+
 def _assess(manager: RiskManager, **overrides):
+    state = _state_of(manager, overrides, 10_000)
     payload = dict(
         open_positions=[],
         exposure_usd=0,
-        day_pnl=0,
-        peak_equity=10_000,
-        equity=10_000,
         trades_today=0,
         returns_by_symbol={},
         stale=False,
         signal_only=False,
     )
     payload.update(overrides)
+    payload.setdefault("state", state)
     return manager.assess(_opportunity(), **payload)
 
 
@@ -65,7 +80,9 @@ def test_each_risk_limit_blocks_its_case() -> None:
     assert "somente sinal" in _assess(manager, signal_only=True).reason
     paused = _assess(manager, day_pnl=-400)
     assert paused.pause_day and not paused.allowed
-    halted = _assess(manager, peak_equity=10_000, equity=8_900)
+    reducing = _assess(manager, peak_equity=10_000, equity=8_900)
+    assert reducing.reducing and not reducing.halt and not reducing.allowed
+    halted = _assess(manager, peak_equity=10_000, equity=8_500)
     assert halted.halt and not halted.allowed
     assert "trades" in _assess(manager, trades_today=20).reason
     positions = [{"symbol": f"S{i}/USDT"} for i in range(5)]
@@ -88,10 +105,20 @@ def test_order_is_capped_at_two_percent() -> None:
     assert size > 0
 
 
-@pytest.mark.parametrize("equity", [10_000, 9_500])
-def test_drawdown_halt_is_only_past_ten_percent(equity: float) -> None:
+@pytest.mark.parametrize("equity", [10_000, 9_500, 9_000, 8_500])
+def test_drawdown_halt_is_only_at_the_halt_step(equity: float) -> None:
     verdict = _assess(_manager(), peak_equity=10_000, equity=equity)
-    assert verdict.halt is (equity <= 9_000)
+    assert verdict.halt is (equity <= 8_500)
+    assert verdict.allowed is (equity > 9_000)
+
+
+def test_assess_requires_the_risk_state() -> None:
+    # No call may skip the stepped account limits: there is no stateless fallback.
+    payload: dict[str, Any] = dict(
+        open_positions=[], exposure_usd=0.0, trades_today=0, returns_by_symbol={}, stale=False, signal_only=False,
+    )
+    with pytest.raises(TypeError, match="state"):
+        _manager().assess(_opportunity(), **payload)
 
 
 def test_a_pair_waits_out_its_cooldown_after_a_loss() -> None:
@@ -171,11 +198,12 @@ def _defaults(**overrides: Any) -> RiskLimits:
 
 
 def _verdict(manager: RiskManager, row: Opportunity, **overrides: Any):
+    state = _state_of(manager, overrides, CAPITAL)
     payload: dict[str, Any] = dict(
-        open_positions=[], exposure_usd=0.0, day_pnl=0.0, peak_equity=CAPITAL, equity=CAPITAL,
-        trades_today=0, returns_by_symbol={}, stale=False, signal_only=False,
+        open_positions=[], exposure_usd=0.0, trades_today=0, returns_by_symbol={}, stale=False, signal_only=False,
     )
     payload.update(overrides)
+    payload.setdefault("state", state)
     return manager.assess(row, **payload)
 
 
@@ -299,6 +327,44 @@ def test_vol_target_caps_new_exposure_when_portfolio_vol_is_high() -> None:
     assert vol_target_cap(limits, CAPITAL, {"ETH/USDT": 3_000.0}, "SOL/USDT", 2_250.0, hedge) is None
 
 
+def test_a_hedge_gets_room_on_a_book_above_the_target_only_until_vol_returns_to_it() -> None:
+    limits = _defaults()  # 6,000 USD of annual σ.
+    hedge = {"ETH/USDT": _alternating(1.5), "SOL/USDT": _alternating(1.5, sign=-1.0)}
+    held = {"ETH/USDT": 5_000.0}
+    assert portfolio_vol(held, hedge) == pytest.approx(7_500.0)  # above the target
+    # SOL moves against ETH: σ = 1.5·|5000 − x| ≤ 6000 for x in [1000, 9000]; the room is 9,000.
+    cap = vol_target_cap(limits, CAPITAL, held, "SOL/USDT", 500.0, hedge)
+    assert cap == pytest.approx(14_000.0)
+    room = cap - 5_000.0
+    assert portfolio_vol({**held, "SOL/USDT": room}, hedge) == pytest.approx(6_000.0)
+    assert portfolio_vol({**held, "SOL/USDT": room + 100.0}, hedge) > 6_000.0
+    # Every order within the room leaves the book below its current σ.
+    for size in (100.0, 1_000.0, 5_000.0, room):
+        assert portfolio_vol({**held, "SOL/USDT": size}, hedge) < 7_500.0
+    # A planned order past the room is cut to it.
+    assert vol_target_cap(limits, CAPITAL, held, "SOL/USDT", 10_000.0, hedge) == pytest.approx(14_000.0)
+
+
+def test_mc_drawdown_reads_p95_in_r_at_the_risk_per_trade() -> None:
+    limits = RiskLimits(risk_per_trade_pct=0.01, max_drawdown_pct=0.10)
+    assert mc_drawdown(5.0, limits) == pytest.approx(0.05)
+    assert mc_drawdown(7, limits) == pytest.approx(0.07)
+    for unreadable in (None, True, False, "5", math.nan, math.inf, -math.inf):
+        assert mc_drawdown(unreadable, limits) is None
+
+
+def test_mc_drawdown_ok_needs_a_readable_p95_strictly_under_the_limit() -> None:
+    limits = RiskLimits(risk_per_trade_pct=0.01, max_drawdown_pct=0.10)
+    assert mc_drawdown_ok(5.0, limits) and mc_drawdown_ok(9.99, limits) and mc_drawdown_ok(0, limits)
+    assert not mc_drawdown_ok(10.0, limits)  # at the limit
+    assert not mc_drawdown_ok(12.0, limits)
+    # A missing p95 proves nothing: never ok (it used to read as 0 in the panel).
+    for unreadable in (None, True, "5", math.nan, math.inf):
+        assert not mc_drawdown_ok(unreadable, limits)
+    # The same p95 fails once the risk per trade grows.
+    assert not mc_drawdown_ok(5.0, RiskLimits(risk_per_trade_pct=0.02, max_drawdown_pct=0.10))
+
+
 def test_vol_target_off_or_short_history_never_binds() -> None:
     returns = {"ETH/USDT": _alternating(1.5), "SOL/USDT": _alternating(1.5)}
     held = {"ETH/USDT": 3_000.0}
@@ -420,21 +486,19 @@ def test_reducing_is_kept_until_drawdown_recovers_below_the_first_step() -> None
     assert state.level == "normal"
 
 
-def test_portfolio_verdict_is_unchanged_for_old_callers() -> None:
+def test_assess_obeys_the_state_not_the_account_figures() -> None:
     manager = _manager()
-    halted = manager.portfolio_verdict(day_pnl=0.0, peak_equity=10_000, equity=9_000)
-    assert halted is not None and halted.halt and halted.reason == "drawdown de 10% desde o pico"
-    assert manager.portfolio_verdict(day_pnl=0.0, peak_equity=10_000, equity=9_500) is None
-    paused = manager.portfolio_verdict(day_pnl=-300.0, peak_equity=10_000, equity=10_000)
-    assert paused is not None and paused.pause_day and not paused.halt
-    # Without a state, assess keeps the single step: 10% halts.
-    assert _assess(manager, equity=9_000).halt
-    # With the state, 10% reduces instead, and 15% halts.
+    # The account figures are not an input: the state is the only account limit.
+    assert not set(ACCOUNT_FIGURES) & set(inspect.signature(RiskManager.assess).parameters)
+    # A normal state lets a row through.
+    normal = RiskState("normal", 0.0, 1.0, None, "")
+    assert _assess(manager, state=normal).allowed
+    # 10% reduces, and 15% halts.
     reducing = manager.portfolio_state(day_change=0.0, peak_equity=10_000, equity=9_000)
-    verdict = _assess(manager, equity=9_000, state=reducing)
+    verdict = _assess(manager, state=reducing)
     assert not verdict.allowed and verdict.reducing and not verdict.halt and "só reduzir" in verdict.reason
     halt = manager.portfolio_state(day_change=0.0, peak_equity=10_000, equity=8_500)
-    assert _assess(manager, equity=8_500, state=halt).halt
+    assert _assess(manager, state=halt).halt
     paused_state = manager.portfolio_state(day_change=-300.0, peak_equity=10_000, equity=10_000)
     pause = _assess(manager, state=paused_state)
     assert pause.pause_day and not pause.allowed and not pause.halt
@@ -445,7 +509,7 @@ def test_the_cautious_state_halves_the_risk_size() -> None:
     cautious = manager.portfolio_state(day_change=0.0, peak_equity=CAPITAL, equity=9_400)
     assert cautious.level == "cautious"
     assert _verdict(manager, _row(stop=0.02)).size_usd == pytest.approx(5_000.0)
-    halved = _verdict(manager, _row(stop=0.02), equity=9_400, state=cautious)
+    halved = _verdict(manager, _row(stop=0.02), state=cautious)
     assert halved.allowed and halved.size_usd == pytest.approx(2_500.0) and halved.size_limit == "risk"
     assert RiskState("normal", 0.0, 1.0, None, "").max_entries is None
 

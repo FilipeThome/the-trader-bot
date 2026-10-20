@@ -72,6 +72,13 @@ def _stuck(venue, *, filled: str = "0", cost: str = "0", state: str = "open") ->
     venue.on_cancel = cancel
 
 
+def _gap(venue, bid: str = "95", last: str = "96") -> None:
+    """The price gapped through the stop: the last trade reached its trigger (a STOP_LOSS_LIMIT
+    triggers on it) and the bid sits below its limit."""
+    venue.bid = Decimal(bid)
+    venue.last = Decimal(last)
+
+
 def _sells(venue) -> list[dict[str, Any]]:
     return [call for call in venue.calls if call["order_type"] == "limit" and call["side"] == "sell"]
 
@@ -85,7 +92,7 @@ def test_a_triggered_stop_left_below_its_limit_is_cancelled_and_sold_next_sync(t
     executor = _executor(tmp_path, events)
     position = _entered(executor, venue)
     _stuck(venue)
-    venue.bid = Decimal("95")
+    _gap(venue)
     executor.sync_positions()
     assert venue.cancelled == [STOP_ORDER_ID]
     (sell,) = _sells(venue)
@@ -117,7 +124,7 @@ def test_a_partially_filled_stuck_stop_books_the_part_and_sells_the_rest(tmp_pat
     executor = _executor(tmp_path, events)
     position = _entered(executor, venue)
     _stuck(venue, filled="0.4", cost="39.004")
-    venue.bid = Decimal("95")
+    _gap(venue)
     executor.sync_positions()
     (sell,) = _sells(venue)
     # The 0.4 the stop sold is booked on the cancel; only what is still held is offered.
@@ -144,7 +151,7 @@ def test_an_open_stop_with_the_bid_above_its_limit_is_left_alone(tmp_path, venue
     _stuck(venue)
     sent = len(venue.calls)
     # Below the trigger, but not below the limit: the stop-limit can still fill.
-    venue.bid = Decimal(bid)
+    _gap(venue, bid, last=bid)
     executor.sync_positions()
     assert venue.cancelled == [] and len(venue.calls) == sent
     assert events == []
@@ -152,12 +159,46 @@ def test_an_open_stop_with_the_bid_above_its_limit_is_left_alone(tmp_path, venue
     assert still is not None and still["status"] == "open" and still["stop_order_id"] == STOP_ORDER_ID
 
 
+def test_a_stop_whose_trigger_the_last_trade_never_reached_is_left_alone(tmp_path, venue) -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+    executor = _executor(tmp_path, events)
+    position = _entered(executor, venue)
+    _stuck(venue)
+    executor.store.set_state("stop_gapped_retries", {str(position["id"]): 2})
+    sent = len(venue.calls)
+    # A thin bid below the limit, but the last trade is above the stop: the stop never triggered.
+    _gap(venue, "95", last="98.5")
+    executor.sync_positions()
+    assert venue.cancelled == [] and len(venue.calls) == sent and _sells(venue) == []
+    assert events == []
+    still = executor.store.position(position["id"])
+    assert still is not None and still["status"] == "open" and still["stop_order_id"] == STOP_ORDER_ID
+    # Not stuck: a later stuck stop counts its failed cancels from zero.
+    assert executor.store.get_state("stop_gapped_retries") == {}
+
+
+def test_an_unreadable_last_trade_neither_sells_nor_resets_the_stuck_count(tmp_path, venue, monkeypatch) -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+    executor = _executor(tmp_path, events)
+    position = _entered(executor, venue)
+    _stuck(venue)
+    executor.store.set_state("stop_gapped_retries", {str(position["id"]): 2})
+    sent = len(venue.calls)
+    monkeypatch.setattr(
+        "bot.exchange.service.get_quote", lambda *_a: {"status": "ok", "quote": {"bid": "95", "ask": "95", "last": None}}
+    )
+    executor.sync_positions()
+    assert venue.cancelled == [] and len(venue.calls) == sent and events == []
+    assert executor.store.position(position["id"])["stop_order_id"] == STOP_ORDER_ID
+    assert executor.store.get_state("stop_gapped_retries") == {str(position["id"]): 2}
+
+
 def test_a_failed_first_ioc_retries_2pct_below_then_halts_when_still_open(tmp_path, venue) -> None:
     events: list[tuple[str, dict[str, Any]]] = []
     executor = _executor(tmp_path, events)
     position = _entered(executor, venue)
     _stuck(venue)
-    venue.bid = Decimal("95")
+    _gap(venue)
     venue.responses["sell:limit"] = [dict(NO_FILL), dict(NO_FILL)]
     with pytest.raises(UnprotectedPosition, match="gap"):
         executor.sync_positions()
@@ -177,7 +218,7 @@ def test_a_partial_first_ioc_sells_the_rest_2pct_below_the_bid(tmp_path, venue) 
     executor = _executor(tmp_path, events)
     position = _entered(executor, venue)
     _stuck(venue)
-    venue.bid = Decimal("95")
+    _gap(venue)
     venue.responses["sell:limit"] = [{"status": "ok", "filled": "0.5", "cost": "47.26", "fees": []}]
     executor.sync_positions()
     first, second = _sells(venue)
@@ -197,7 +238,7 @@ def test_a_write_blocker_leaves_the_stuck_stop_on_the_book(tmp_path, venue) -> N
     position = _entered(executor, venue)
     _stuck(venue)
     sent = len(venue.calls)
-    venue.bid = Decimal("95")
+    _gap(venue)
     venue.blocker = "halt ativo"
     executor.sync_positions()
     assert venue.cancelled == [] and len(venue.calls) == sent
@@ -222,7 +263,7 @@ def test_an_instance_position_with_a_stuck_stop_is_closed_the_same_way(tmp_path,
     venue.on_cancel = lambda _id: venue.orders.update(
         {STOP_CLIENT_ID: {"status": "ok", "order": {"status": "canceled", "filled": "0", "order_id": STOP_ORDER_ID}}}
     )
-    venue.bid = Decimal("85")
+    _gap(venue, "85", last="89")
     executor.sync_positions()
     (sell,) = _sells(venue)
     assert sell["quantity"] == "0.1996" and sell["limit_price"] == "84.57"
@@ -237,7 +278,7 @@ def test_a_stop_that_fills_before_the_cancel_closes_the_row_from_its_own_fill(tm
     executor = _executor(tmp_path, events)
     position = _entered(executor, venue)
     _stuck(venue)
-    venue.bid = Decimal("95")
+    _gap(venue)
 
     def filled_first(_order_id: str) -> dict[str, Any]:
         # Read as resting, filled while the cancel was on its way: Binance refuses the cancel.
@@ -262,7 +303,7 @@ def test_a_stuck_stop_that_cannot_be_cancelled_halts_without_selling(tmp_path, v
     executor = _executor(tmp_path, events)
     position = _entered(executor, venue)
     _stuck(venue)
-    venue.bid = Decimal("95")
+    _gap(venue)
     venue.on_cancel = lambda _id: {"status": "unknown", "error": "cancel outcome is unknown"}
     # The stop still rests after a failed cancel: no 2% IOC follows, the next sync retries (review F3)...
     for _ in range(2):
@@ -284,7 +325,7 @@ def test_an_ioc_of_unknown_outcome_halts_without_a_second_sale(tmp_path, venue) 
     executor = _executor(tmp_path, events)
     position = _entered(executor, venue)
     _stuck(venue)
-    venue.bid = Decimal("95")
+    _gap(venue)
     venue.responses["sell:limit"] = [{"status": "unknown", "error": "timeout"}]
     with pytest.raises(UnprotectedPosition, match="timeout"):
         executor.sync_positions()
@@ -306,7 +347,7 @@ def test_a_failing_default_ledger_never_stops_the_exit(tmp_path, venue, monkeypa
     executor = Executor(Store(tmp_path / "bot.sqlite"), PROFILE)
     position = _entered(executor, venue)
     _stuck(venue)
-    venue.bid = Decimal("95")
+    _gap(venue)
     executor.sync_positions()
     closed = executor.store.position(position["id"])
     assert closed is not None and closed["status"] == "closed"

@@ -16,7 +16,16 @@ from bot.backtest.instances import (
     replay_grid,
     replay_windows,
 )
-from bot.instances import DcaParams, GridParams, cooldown_ends, creation_problems, dca_plan, grid_plan
+from bot.instances import (
+    DcaParams,
+    GridParams,
+    cooldown_ends,
+    creation_problems,
+    dca_ladder,
+    dca_plan,
+    dca_stop,
+    grid_plan,
+)
 
 DCA = DcaParams(base_usd=10, so_count=2, step_pct=0.02, take_profit_pct=0.03, stop_pct=0.05)
 GRID = GridParams(lower=90, upper=110, grids=4, invest_usd=40, stop_price=85)
@@ -140,6 +149,69 @@ def test_a_young_pair_replays_its_whole_history_in_the_longer_windows() -> None:
     assert [row["bars"] for row in rows] == [30 * 24, 40 * 24, 40 * 24]
     empty = replay_windows("grid", GRID, frame.iloc[:0], taker=0.001, spread=0.0)
     assert [row["bars"] for row in empty] == [0, 0, 0]
+
+
+def _ohlc(rows: list[tuple[float, float, float]]) -> pd.DataFrame:
+    """(open, low, close) per 1h bar."""
+    index = pd.date_range("2026-01-01", periods=len(rows), freq="1h", tz="UTC")
+    opens, lows, closes = zip(*rows)
+    highs = [max(o, c) for o, c in zip(opens, closes)]
+    return pd.DataFrame({"open": opens, "high": highs, "low": lows, "close": closes, "volume": 1.0}, index=index)
+
+
+def test_a_dca_stop_bar_fills_the_resting_safety_orders_above_the_stop_first() -> None:
+    resting = DCA.model_copy(update={"resting_buys": True})
+    ladder = dca_ladder(DCA, 100.0)
+    stop = dca_stop(DCA, 100.0)
+    assert [row["price"] for row in ladder] == pytest.approx([100.0, 98.0, 96.0]) and stop == pytest.approx(91.2)
+    held = sum(row["usd"] * 0.999 / row["price"] for row in ladder)
+    # The bar opens at 99 and falls through both safety orders to the stop: the stop sells all three buys.
+    falls = _ohlc([(100, 100, 100), (99, 80, 81)])
+    stopped = replay_dca(resting, falls, taker=0.001)
+    assert stopped["ended"] == "stop"
+    assert stopped["pnl_usd"] == pytest.approx(held * stop * 0.999 - 30, rel=1e-9)
+    assert stopped["pnl_usd"] < replay_dca(DCA, falls, taker=0.001)["pnl_usd"]
+    # A gap through the stop: the levels crossed in the gap fill, and the stop sells at the open.
+    gapped = replay_dca(resting, _ohlc([(100, 100, 100), (90, 80, 81)]), taker=0.001)
+    assert gapped["ended"] == "stop" and gapped["pnl_usd"] == pytest.approx(held * 90 * 0.999 - 30, rel=1e-9)
+
+
+def test_a_grid_stop_bar_fills_the_resting_levels_above_the_stop_first() -> None:
+    resting = GRID.model_copy(update={"resting_buys": True})
+    # Started at 100: levels 100 and 105 held, 95 then 90 rest under them, the stop at 85.
+    held = 10 / 90 + 10 / 95 + 10 / 100 + 10 / 105
+    paid = (10 / 100 + 10 / 105) * 100 * 1.001 + 2 * 10 * 1.001
+    opens_between = replay_grid(resting, _ohlc([(100, 100, 100), (96, 84, 86)]), taker=0.001)
+    assert opens_between["ended"] == "stop"
+    assert opens_between["pnl_usd"] == pytest.approx(held * 85 * 0.999 - paid, rel=1e-9)
+    gapped = replay_grid(resting, _ohlc([(100, 100, 100), (84, 80, 82)]), taker=0.001)
+    assert gapped["ended"] == "stop" and gapped["pnl_usd"] == pytest.approx(held * 84 * 0.999 - paid, rel=1e-9)
+
+
+def test_a_grid_take_profit_bar_sells_the_level_its_wick_filled() -> None:
+    resting = GRID.model_copy(update={"resting_buys": True, "take_profit_price": 112})
+    # Started at 100 (levels 100 and 105 held); the next bar wicks to 94, filling 95, and closes at 113.
+    bars = _ohlc([(100, 100, 100), (100, 94, 113)])
+    result = replay_grid(resting, bars, taker=0.001)
+    held = 10 / 95 + 10 / 100 + 10 / 105
+    paid = 10 * 1.001 + (10 / 100 + 10 / 105) * 100 * 1.001
+    assert result["ended"] == "take_profit"
+    assert result["realized_usd"] == pytest.approx(held * 113 * 0.999 - paid, rel=1e-9)
+    assert result["pnl_usd"] == pytest.approx(held * 113 * 0.999 - paid, rel=1e-9)
+    # Without resting buys the take-profit sells only the two levels bought at the start.
+    market = replay_grid(GRID.model_copy(update={"take_profit_price": 112}), bars, taker=0.001)
+    two = 10 / 100 + 10 / 105
+    assert market["pnl_usd"] == pytest.approx(two * 113 * 0.999 - two * 100 * 1.001, rel=1e-9)
+
+
+def test_a_dca_take_profit_bar_sells_the_safety_order_its_wick_filled() -> None:
+    resting = DCA.model_copy(update={"resting_buys": True})
+    # The wick to 97.9 fills the safety order at 98, which lowers the take-profit under the 102.5 close.
+    held = 10 * 0.999 / 100 + 10 * 0.999 / 98
+    assert 20 / held * (1 + DCA.take_profit_pct) <= 102.5 < 100 / 0.999 * (1 + DCA.take_profit_pct)
+    result = replay_dca(resting, _ohlc([(100, 100, 100), (100, 97.9, 102.5)]), taker=0.001)
+    assert result["wins"] == 1 and result["ended"] is None
+    assert result["pnl_usd"] == pytest.approx(held * 102.5 * 0.999 - 20, rel=1e-9)
 
 
 def test_replay_windows_rejects_a_mismatched_kind_or_frame() -> None:

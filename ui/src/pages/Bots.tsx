@@ -94,20 +94,21 @@ export function Bots() {
   }, []);
 
   async function simulate() {
-    const result = await perform(`Simular ${kind.toUpperCase()} em ${pair}`, () => api.previewInstance(kind, pair, params), (body) =>
+    const outcome = await perform(`Simular ${kind.toUpperCase()} em ${pair}`, () => api.previewInstance(kind, pair, params), (body) =>
       body.problems.length ? `Simulação pronta: ${body.problems.length} problema(s) a resolver` : "Simulação pronta: o plano pode rodar",
     );
-    if (result) {
-      setPreview(result);
+    if (outcome.ok) {
+      setPreview(outcome.result);
       setPreviewKey(key);
     }
   }
 
   async function create() {
-    await perform(`Criar ${kind.toUpperCase()} em ${pair}`, () => api.createInstance(kind, pair, params), (body) =>
+    const outcome = await perform(`Criar ${kind.toUpperCase()} em ${pair}`, () => api.createInstance(kind, pair, params), (body) =>
       [`Robô ${kind.toUpperCase()} criado em ${pair}`, body.step, body.cycle_started ? "ciclo iniciado" : ""].filter(Boolean).join(" · "),
     );
-    setPreview(null);
+    // A refused robot keeps its simulation, so the operator can fix the cause and try again.
+    if (outcome.ok) setPreview(null);
     void refresh();
   }
 

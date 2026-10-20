@@ -73,7 +73,7 @@ from bot.instances import (
     instance_budget,
     worst_case_loss,
 )
-from bot.live.halt import halt_flag_set, trip_halt
+from bot.live.halt import clear_halt, halt_flag_set, trip_halt
 from bot.live.mandate.store import load_mandate
 from bot.markets import merge_symbols, rank_promising, venue_symbols
 from bot.paths import base_runtime_root
@@ -85,6 +85,8 @@ from bot.risk import (
     RiskState,
     allocate,
     breakeven_win_rate,
+    mc_drawdown,
+    mc_drawdown_ok,
     open_risk,
     planned_notional,
     protect,
@@ -137,6 +139,10 @@ MARKET_SYMBOL = CLUSTER_ANCHOR
 LEGACY_EXIT_TIMEFRAMES = {"trend": "1h", "mean_reversion": "15m", "momentum": "4h"}
 #: ``stop()`` refused: a resting buy is not resolved, so the cycle goes on until it is.
 STOP_REFUSED_RESTING = "compra limitada ainda no livro: o ciclo continua para resolver"
+#: ``start()``, or ``stop()`` of a stopped cycle, refused: a resting buy is not resolved and no cycle watches it.
+RESTING_UNRESOLVED = "compra limitada sem resolução (cancelamento ou novo stop não confirmados); tente de novo"
+#: ``resume()`` refused: the halt is tripped again while a resting buy is not resolved.
+RESUME_REFUSED_RESTING = "compra limitada sem resolução (cancelamento ou novo stop não confirmados); o halt continua"
 #: Most seconds one cycle waits for the account-fee reads; the rest finish in the background.
 FEE_WARMUP_BUDGET_SECONDS = 2.0
 #: Refusal of a strategy with no current validation, or one demoted to signal only.
@@ -221,9 +227,15 @@ class Runtime:
             return True
 
     def start(self) -> dict[str, Any]:
+        """Start the cycle. A stopped cycle reconciles no resting buy, so one still on the book (a halt
+        whose cancel did not land) comes off first, and the start is refused while it is unresolved."""
         with self.lock:
             if self.halted:
                 return {"status": "error", "error": "halt ativo — retomada manual exigida"}
+            if not self.running:
+                refused = self._settle_resting("start", RESTING_UNRESOLVED)
+                if refused is not None:
+                    return refused
             # The daily-loss pause refuses buys only (``paused_until``): the cycle may run under it.
             self.store.set_state("running", True)
             # "Three failed cycles in a row" counts from this start, not from before a halt.
@@ -234,25 +246,55 @@ class Runtime:
     def stop(self) -> dict[str, Any]:
         """Stop the cycle. Nothing reconciles a resting buy while the cycle is stopped, so each comes
         off the book first and what one bought joins its position under a new stop. While one is not
-        resolved (its cancel unconfirmed, or the stop over what it bought not re-placed), the cycle
-        keeps running to resolve it and the stop is refused; a position left without a stop halts."""
+        resolved (its cancel unconfirmed, or the stop over what it bought not re-placed), the stop is
+        refused: a running cycle keeps running to resolve it, a stopped one stays stopped (never
+        started here). A position left without a stop halts."""
         with self.lock:
-            resting = self._cancel_resting_buys("stop")
-            unprotected = [item for item in resting if item.get("unprotected")]
-            if unprotected:
-                self.store.set_state("running", False)
-                self._ledger("stop", {"resting_failed": len(unprotected)})
-                reason = f"posição sem proteção: {unprotected[0].get('error')}"
-                self.halt(reason, flatten=False)
-                return {"status": "error", "error": f"{reason}; halt acionado", "running": False, "resting": resting}
-            unresolved = [item for item in resting if item.get("status") != "ok"]
-            if unresolved:
-                self.store.set_state("running", True)
-                self._ledger("stop_refused", {"cause": "resting_buy", "results": unresolved})
-                return {"status": "error", "error": STOP_REFUSED_RESTING, "running": True, "resting": unresolved}
+            refused = self._settle_resting("stop", STOP_REFUSED_RESTING if self.running else RESTING_UNRESOLVED)
+            if refused is not None:
+                return refused
             self.store.set_state("running", False)
             self._ledger("stop", {})
             return {"status": "ok", "running": False}
+
+    def resume(self) -> dict[str, Any]:
+        """The operator's restart after a halt: the flag clears and the cycle stays stopped.
+
+        A resting buy the halt could not resolve is cancelled now, after the flag: the stop over
+        what it bought needs the gate open. While one stays unresolved the halt is tripped again
+        and the resume refused; a position left without a stop halts too.
+        """
+        with self.lock:
+            clear_halt("binance")
+            clear_halt(None)
+            self.store.set_state("running", False)
+            self.store.set_state("halt_reason", None)
+            self.failures = 0
+            self._ledger("resume", {"by": "operator"})
+            refused = self._settle_resting("resume", RESUME_REFUSED_RESTING)
+            if refused is not None:
+                if not self.halted:
+                    self.halt(RESUME_REFUSED_RESTING, flatten=False)
+                return {**refused, "halted": self.halted}
+            return {"status": "ok", "halted": self.halted}
+
+    def _settle_resting(self, cause: str, refusal: str) -> dict[str, Any] | None:
+        """Cancel every resting buy before ``cause`` goes on (``_cancel_resting_buys``). Returns the
+        refusal of ``cause``, or None when each one is resolved. A position that may be left without
+        a stop halts; any other unresolved buy refuses ``cause`` with ``refusal``. Never changes
+        ``running`` otherwise."""
+        resting = self._cancel_resting_buys(cause)
+        unprotected = [item for item in resting if item.get("unprotected")]
+        if unprotected:
+            self._ledger(f"{cause}_refused", {"cause": "unprotected", "results": unprotected})
+            reason = f"posição sem proteção: {unprotected[0].get('error')}"
+            self.halt(reason, flatten=False)
+            return {"status": "error", "error": f"{reason}; halt acionado", "running": False, "resting": resting}
+        unresolved = [item for item in resting if item.get("status") != "ok"]
+        if unresolved:
+            self._ledger(f"{cause}_refused", {"cause": "resting_buy", "results": unresolved})
+            return {"status": "error", "error": refusal, "running": self.running, "resting": unresolved}
+        return None
 
     def halt(self, reason: str, *, flatten: bool | None = None, by: str = "file") -> dict[str, Any]:
         """Stop the cycle, flatten when asked, then write the sticky HALT flag.
@@ -291,8 +333,9 @@ class Runtime:
                     "resting_failed": sum(1 for item in resting if item.get("status") != "ok"),
                 },
             )
-            self.publish({"type": "halt", "reason": reason})
-            return {"status": "ok", "halted": True, "reason": reason, "flatten": flattened}
+            # A resting buy left unresolved is shown: resume and start cancel it before they go on.
+            self.publish({"type": "halt", "reason": reason, "resting": resting})
+            return {"status": "ok", "halted": True, "reason": reason, "flatten": flattened, "resting": resting}
 
     def _cancel_resting_buys(self, cause: str) -> list[dict[str, Any]]:
         """Cancel every resting buy of the robots (``Executor.cancel_resting_buys``); never raises."""
@@ -454,7 +497,8 @@ class Runtime:
             if self.retired:
                 return {"status": "error", "error": "ambiente trocado; tente de novo"}
             now = datetime.now(timezone.utc)
-            block = self._robot_buy_block(self.collector.view(), now, clock_blocked=self.collector.snapshot.clock_blocked)
+            # Outside the cycle: the level the last cycle stored, never one read on the panel's unpriced view.
+            block = self._robot_buy_block(now, clock_blocked=self.collector.snapshot.clock_blocked, state=None)
             if block is not None:
                 return {"status": "error", "error": block}
             plan = self._instance_plan(kind, symbol, params)
@@ -630,11 +674,11 @@ class Runtime:
         """One step of every live instance. A blocked clock never lets them buy, only sell and stop.
         The daily-loss pause refuses their buys until the next UTC day while their sales and
         stops go on; so does REDUCING; the halt step stops them all. Every buy block also takes
-        a resting buy off the book. ``state`` is the cycle's risk state."""
+        a resting buy off the book. ``state`` is the cycle's risk state (None: the stored level)."""
         instances = self.store.instances(live_only=True)
         if not instances:
             return
-        buy_block = self._robot_buy_block(snapshot, moment, clock_blocked=clock_blocked, state=state)
+        buy_block = self._robot_buy_block(moment, clock_blocked=clock_blocked, state=state)
         if self.halted:
             return
         for instance in instances:
@@ -653,27 +697,27 @@ class Runtime:
     def _instance_position(self, instance_id: int) -> dict[str, Any] | None:
         return next((row for row in self.store.live_positions() if row.get("instance_id") == instance_id), None)
 
-    def _robot_buy_block(
-        self, snapshot: MarketSnapshot, moment: datetime, *, clock_blocked: bool, state: RiskState | None = None
-    ) -> str | None:
+    def _robot_buy_block(self, moment: datetime, *, clock_blocked: bool, state: RiskState | None) -> str | None:
         """Why DCA and grid instances may not buy now, or None.
 
-        The clock rule of entries, the daily pause, the trades-per-day limit for new
-        inventory, and the account's risk level strategy entries obey (``_risk_state``):
-        a daily loss pauses the day, REDUCING allows sales only and the halt step halts
-        here too, so a bot running only robots stays inside them. Without ``state`` the
-        level is read now.
+        The clock rule of entries, the daily pause, and the account's risk level strategy
+        entries obey: a daily loss pauses the day, REDUCING allows sales only and the halt
+        step halts here too, so a bot running only robots stays inside them. ``state`` is
+        the cycle's risk state (``_risk_state``). Outside the cycle (None) the level and the
+        pause the last cycle stored are read and nothing is written: only the cycle, on its
+        priced snapshot, measures and stores the risk level and the day's start.
         """
         if clock_blocked:
             return "relógio fora de 1s — só cancelamentos e saídas"
-        paused = self._paused(moment) is not None
-        if state is None and not paused:
-            state = self._risk_state(snapshot, moment)
-        if state is not None and (state.level in ("halt", "reducing") or state.pause_day):
-            return state.reason
-        if paused:
-            return "pausado até o próximo dia UTC"
-        return None
+        if state is not None:
+            if state.level in ("halt", "reducing") or state.pause_day:
+                return state.reason
+        else:
+            stored = self.store.get_state("risk_state")
+            if isinstance(stored, dict) and stored.get("level") in ("halt", "reducing"):
+                reason = stored.get("reason")
+                return reason if isinstance(reason, str) and reason else "modo só reduzir"
+        return self._paused(moment)
 
     def _trade_limit(self, moment: datetime) -> str | None:
         """New inventory (a DCA round, a grid restart) counts as a trade, like a strategy entry."""
@@ -1479,7 +1523,7 @@ class Runtime:
         exposure = sum(abs(value) for value in held_usd.values())
         exposure += sum(float(row.get("reserved_usd") or 0) for row in self._book() if row["status"] == "reserved")
         day = utc_day(moment)
-        day_pnl, equity, peak = self._equity(snapshot, moment)
+        equity = self._equity(snapshot, moment)[1]
         self.store.record_equity(equity, moment.isoformat(), pnl=equity - capital)
         trades_today = self.store.trades_today(day)
         market_block = self._market_block(snapshot, moment)
@@ -1571,9 +1615,6 @@ class Runtime:
                     draft,
                     open_positions=positions,
                     exposure_usd=exposure,
-                    day_pnl=day_pnl,
-                    peak_equity=peak,
-                    equity=equity,
                     trades_today=trades_today,
                     returns_by_symbol=returns,
                     stale=stale,
@@ -1638,11 +1679,11 @@ class Runtime:
         if symbol not in ((stats.get("params") or {}).get("symbols") or ()):
             return f"somente sinal: {symbol} fora do conjunto de pares validado"
         mc = result.get("mc_p95_dd_r")
-        if isinstance(mc, bool) or not _finite(mc):
+        drawdown = mc_drawdown(mc, limits)
+        if drawdown is None:
             # A record without a readable Monte Carlo drawdown proves nothing about the limit.
             return "somente sinal — Monte Carlo: drawdown p95 ausente ou ilegível na validação; valide de novo"
-        drawdown = float(mc or 0) * limits.risk_per_trade_pct
-        if drawdown >= limits.max_drawdown_pct:
+        if not mc_drawdown_ok(mc, limits):
             return (
                 f"somente sinal — Monte Carlo: drawdown p95 de {_pct(drawdown)} passa do limite "
                 f"de {_pct(limits.max_drawdown_pct)}"

@@ -6,6 +6,9 @@ import type { CalibrationRow, Opportunity, PairSlippage, PnlDay, Position, Statu
 /** What the last panel action did, shown where it is always visible. */
 export type Notice = { kind: "busy" | "ok" | "error"; text: string };
 
+/** How a panel action ended: the reply on success, nothing on an error (already shown as the notice). */
+export type Outcome<T> = { ok: true; result: T } | { ok: false };
+
 type BotState = {
   status: Status | null;
   rows: Opportunity[];
@@ -25,8 +28,9 @@ type BotState = {
   /**
    * Run one panel action: show it as running, then its result or its error, then reload.
    * ``describe`` turns the API reply into the success text; the label is used otherwise.
+   * Callers clear their inputs only when ``ok`` is true, so a refused change keeps what was typed.
    */
-  perform: <T>(label: string, action: () => Promise<T>, describe?: (result: T) => string) => Promise<T | undefined>;
+  perform: <T>(label: string, action: () => Promise<T>, describe?: (result: T) => string) => Promise<Outcome<T>>;
 };
 
 let noticeTimer = 0;
@@ -71,9 +75,10 @@ export const useBot = create<BotState>((set, get) => ({
   perform: async (label, action, describe) => {
     window.clearTimeout(noticeTimer);
     set({ busy: true, notice: { kind: "busy", text: `${label}…` } });
-    let result: Awaited<ReturnType<typeof action>> | undefined;
+    let outcome: Outcome<Awaited<ReturnType<typeof action>>> = { ok: false };
     try {
-      result = await action();
+      const result = await action();
+      outcome = { ok: true, result };
       set({ notice: { kind: "ok", text: describe ? describe(result) : `${label}: feito` } });
       // A success fades; an error stays until the next action or the close button.
       noticeTimer = window.setTimeout(() => {
@@ -85,6 +90,6 @@ export const useBot = create<BotState>((set, get) => ({
       set({ busy: false });
       await get().load();
     }
-    return result;
+    return outcome;
   },
 }));

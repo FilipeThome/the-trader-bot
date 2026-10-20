@@ -45,6 +45,8 @@ class Venue:
     A buy LIMIT GTC (a robot's resting buy) rests: it is kept in ``orders`` under the
     client id its key gives, ``open`` with nothing filled, until ``fill_resting`` fills
     it (in part or in full) or a cancel takes it off (``canceled``, keeping what filled).
+    With ``fill_rest_on_arrival`` it fills in full as it reaches the book (the price moved
+    through the level since the quote), and the send answers with that fill.
     Scripted results for it are queued under ``"buy:gtc"`` only.
     """
 
@@ -76,6 +78,8 @@ class Venue:
         self.on_cancel: Callable[[str], dict[str, Any] | None] | None = None
         #: Resting LIMIT GTC buys: order id -> client order id, in the order they were placed.
         self.resting: dict[str, str] = {}
+        #: A resting LIMIT GTC buy fills in full on arrival.
+        self.fill_rest_on_arrival = False
 
     def submit_order(self, symbol: str, profile_id: str, *, held: Any = None, **kwargs: Any) -> dict[str, Any]:
         buy_limit = kwargs["order_type"] == "limit" and kwargs.get("side") == "buy"
@@ -163,6 +167,9 @@ class Venue:
                 "fees": [],
             },
         }
+        if self.fill_rest_on_arrival:
+            order = self.fill_resting(client_id=client_id)
+            return {**order, "status": "ok", "client_order_id": client_id}
         return {"status": "ok", "order_id": order_id, "client_order_id": client_id, "filled": "0"}
 
     def resting_order(self, client_id: str | None = None) -> dict[str, Any]:

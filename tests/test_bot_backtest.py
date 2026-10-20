@@ -92,6 +92,19 @@ def test_gate_fails_on_low_dsr_after_many_trials() -> None:
     assert tried.passed is False and tried.reason == f"Sharpe deflacionado de {tried.dsr:.2f} em 20 testes, abaixo de 0.95"
 
 
+def test_equal_stop_outs_record_a_zero_sharpe_and_cannot_poison_later_trials() -> None:
+    # Equal 2% stop-outs entered at different prices differ only by float rounding.
+    entries = [101.37, 98.12] * 4
+    stop_outs = [(entry * (1 - 0.02) - entry) / entry - runner.ROUND_TRIP_COST for entry in entries]
+    losing = _judge(_placed([stop_outs] * 4, stop_outs))
+    assert losing.sharpe_trade == 0.0 and losing.sharpe == 0.0 and losing.passed is False
+    window = [0.03, -0.012, 0.025, -0.015, 0.02, -0.01, 0.03, -0.012]
+    trades = _placed([window] * 4, [0.01] * 8)
+    # The Sharpe such a run stored before the dispersion tolerance (about -2e15) is left out of N's variance.
+    poisoned = _judge(trades, trials=2, trial_sharpes=[-2e15])
+    assert poisoned.passed and poisoned.dsr == pytest.approx(_judge(trades, trials=2).dsr)
+
+
 def test_halves_rule_is_replaced_by_walk_forward() -> None:
     # The first half of the trades loses on balance (the old rule refused it); three of
     # four windows make money, the efficiency skips folds anchored on a loss, and it passes.

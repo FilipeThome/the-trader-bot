@@ -46,6 +46,47 @@ def test_psr_edge_cases() -> None:
     assert stats.probabilistic_sharpe([-0.01] * 5) == 0.0
 
 
+def _stop_outs(count: int) -> list[float]:
+    """Equal 2% stop-outs after a 0.2% round trip, entered at alternating prices: equal up to the last digits."""
+    entries = [101.37 if index % 2 == 0 else 98.12 for index in range(count)]
+    return [(entry * (1 - 0.02) - entry) / entry - 0.002 for entry in entries]
+
+
+def test_returns_equal_up_to_rounding_have_no_dispersion() -> None:
+    stop_outs = _stop_outs(30)
+    assert 0 < max(stop_outs) - min(stop_outs) < 1e-15  # the case is float noise, not equal floats
+    assert stats.per_trade_sharpe(stop_outs) == 0.0
+    assert stats.probabilistic_sharpe(stop_outs) == 0.0
+    # A positive mean without dispersion is the limit 1.0 whatever the length (47 used to give 0.0).
+    for count in (30, 47):
+        assert stats.per_trade_sharpe([0.1] * count) == 0.0
+        assert stats.probabilistic_sharpe([0.1] * count) == 1.0
+    noisy = [math.nextafter(0.0213, 1.0) if index % 3 else 0.0213 for index in range(40)]
+    assert stats.per_trade_sharpe(noisy) == 0.0
+    assert stats.probabilistic_sharpe(noisy) == 1.0
+    # Real dispersion, however small next to the mean, is still measured.
+    assert stats.per_trade_sharpe([0.0213, 0.0214, 0.0212]) == pytest.approx(213.0)
+
+
+def test_dsr_leaves_degenerate_trials_out_of_the_variance() -> None:
+    earlier = [0.1, 0.4, -0.2]
+    clean = stats.deflated_sharpe(RETURNS, 6, earlier)
+    poisoned = [*earlier, -2e15, math.inf, math.nan, stats.MAX_TRIAL_SHARPE + 0.01]
+    # Same trial count, same deflated Sharpe: the bad values change only N's variance, and they are left out.
+    assert stats.deflated_sharpe(RETURNS, 6, poisoned) == pytest.approx(clean)
+    # The bound is inclusive: a trial at MAX_TRIAL_SHARPE still counts.
+    assert stats.deflated_sharpe(RETURNS, 6, [*earlier, stats.MAX_TRIAL_SHARPE]) < clean
+
+
+def test_a_poisoned_trial_does_not_lock_out_a_clean_strategy() -> None:
+    strong = RETURNS * 8
+    earlier = [0.05, -0.1, 0.12]
+    passed = stats.deflated_sharpe(strong, 5, earlier)
+    assert passed > 0.95  # the gate's MIN_DSR
+    # The stored Sharpe of 30 equal stop-outs before the tolerance: about -2e15.
+    assert stats.deflated_sharpe(strong, 5, [*earlier, -2e15]) == pytest.approx(passed)
+
+
 def test_dsr_falls_as_trials_grow() -> None:
     earlier = [0.05, 0.3, -0.1, 0.2]
     values = [stats.deflated_sharpe(RETURNS, trials, earlier) for trials in (1, 2, 5, 20, 100)]

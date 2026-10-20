@@ -137,8 +137,10 @@ export function Performance() {
                     <td className={`pr-4 ${budget != null && row.slippage_rt != null && budget > 0 && row.slippage_rt > budget ? "text-red-600" : ""}`}>
                       {pct(row.slippage_rt, 2)}
                     </td>
-                    <td className={row.blocked ? "font-medium text-red-600" : "text-neutral-500"}>
-                      {row.blocked ? `bloqueado${row.blocked_reason ? `: ${row.blocked_reason}` : ""}` : "liberado"}
+                    <td className={row.blocked === false ? "text-neutral-500" : row.blocked ? "font-medium text-red-600" : "font-medium text-amber-600"}>
+                      {row.blocked === false
+                        ? "liberado"
+                        : `${row.blocked ? "bloqueado" : "desconhecido"}${row.blocked_reason ? `: ${row.blocked_reason}` : ""}`}
                     </td>
                   </tr>
                 ))}
@@ -216,6 +218,7 @@ function Validation({ status }: { status: Status | null }) {
           results={detail[id]}
           validated={Boolean(status?.validated?.[id])}
           trials={status?.trials?.[id]}
+          trialsN={status?.trials_n?.[id]}
           riskPerTrade={status?.limits.risk_per_trade_pct}
           maxDrawdown={status?.limits.max_drawdown_pct}
         />
@@ -229,13 +232,16 @@ function StrategyValidation({
   results,
   validated,
   trials,
+  trialsN,
   riskPerTrade,
   maxDrawdown,
 }: {
   id: string;
   results: Record<string, TimeframeResult>;
   validated: boolean;
+  /** Recorded runs since the last pass; ``trialsN`` is the N the deflated Sharpe uses. */
   trials?: number;
+  trialsN?: number;
   riskPerTrade?: number;
   maxDrawdown?: number;
 }) {
@@ -272,9 +278,11 @@ function StrategyValidation({
           {pct(r.holdout.net)} em {r.holdout.trades} trades <span className="text-neutral-500">desde {day(r.holdout.start)}</span>
         </span>
       ) : "—"],
-    ["Monte Carlo", "1000 sorteios da ordem dos trades: a queda p95 em R, vezes o risco por trade de hoje, comparada ao drawdown máximo. Acima do limite, as linhas ficam só como sinal, sem precisar validar de novo.", (r) => {
+    ["Monte Carlo", "1000 sorteios da ordem dos trades: a queda p95 em R, vezes o risco por trade de hoje, comparada ao drawdown máximo. Acima do limite, as linhas ficam só como sinal, sem precisar validar de novo. Sem a queda p95 registrada, também ficam só como sinal até uma nova validação.", (r) => {
       const p95 = r.mc_p95_dd_r;
-      const loss = p95 != null && riskPerTrade != null ? p95 * riskPerTrade : null;
+      // The runtime keeps a row without a readable p95 as signal only (risk.mc_drawdown_ok): never green.
+      if (typeof p95 !== "number" || !Number.isFinite(p95)) return <span className="text-red-600">ilegível — valide de novo</span>;
+      const loss = riskPerTrade != null ? p95 * riskPerTrade : null;
       return (
         <span className={r.mc_ok === false ? "text-red-600" : r.mc_ok ? "text-green-600" : ""}>
           {num(p95, 1)} R × {pct(riskPerTrade)} = {pct(loss)} <span className="text-neutral-500">(limite {pct(maxDrawdown, 0)})</span>
@@ -289,8 +297,14 @@ function StrategyValidation({
     <div className="mb-6 overflow-x-auto rounded border border-neutral-300 p-3 dark:border-neutral-700">
       <p className="mb-2 font-medium">
         {strategyName(id)} · {validated ? <span className="text-green-600">opera</span> : <span className="text-neutral-500">só sinal</span>}
-        <span className="ml-2 font-normal text-neutral-500">
-          {trials != null ? `${trials} tentativa(s) desde a última aprovação` : ""}
+        <span className="ml-2 inline-flex items-center font-normal text-neutral-500">
+          {[
+            trials != null ? `${trials} execuções registradas desde a última aprovação` : "",
+            trialsN != null ? `N do Sharpe deflacionado: ${trialsN}` : "",
+          ].filter(Boolean).join(" · ")}
+          {(trials != null || trialsN != null) && (
+            <Help text="Cada combinação nova (timeframe, regra, pares, filtro, histerese) conta como uma tentativa. Repetir a mesma combinação registra outra execução, mas não aumenta o N." />
+          )}
         </span>
       </p>
       <table className="text-left">

@@ -142,6 +142,41 @@ def test_decay_needs_10_trades_in_the_window_since_the_validation(tmp_path) -> N
     assert review_strategy(store, "trend", capital=1000.0, now=NOW) is not None
 
 
+def test_the_live_sharpe_starts_at_the_revalidation(tmp_path) -> None:
+    store = Store(tmp_path / "bot.sqlite")
+    validated_at = NOW - timedelta(days=10)  # 12:00 UTC, ten days ago
+    # The losses that demoted it, the last one on the morning of the revalidation day.
+    for day in range(10, 26):
+        _trade(store, NOW - timedelta(days=day, hours=6), pnl=-5.0, r=-1.0)
+    # Wins since the revalidation: that afternoon, then one a day.
+    wins = [validated_at + timedelta(hours=6), *(NOW - timedelta(days=day) for day in range(9, -1, -1))]
+    for index, closed_at in enumerate(wins):
+        _trade(store, closed_at, pnl=1.0 + index % 2, r=0.5)
+    _validated(store, "trend", {"4h": {"passed": True, "daily_sharpe": 3.0}}, validated_at=validated_at.isoformat())
+
+    assert review_strategy(store, "trend", capital=1000.0, now=NOW) is None
+    row = store.strategy("trend")
+    # Eleven days, from the revalidation's day to today, with no trace of the losses.
+    expected = live_sharpe([(1.0 + index % 2) / 1000.0 for index in range(len(wins))])
+    assert row["signal_only"] is False and row["live_sharpe"] == pytest.approx(expected)
+
+    # The same losses after the revalidation do count, and the reason names the days measured.
+    for day in range(1, 6):
+        _trade(store, NOW - timedelta(days=day, hours=1), pnl=-20.0, r=-1.0)
+    reason = review_strategy(store, "trend", capital=1000.0, now=NOW)
+    assert reason is not None and reason.startswith("Sharpe diário dos últimos 11 dias")
+
+
+def test_the_live_sharpe_needs_two_days_since_the_revalidation(tmp_path) -> None:
+    store = Store(tmp_path / "bot.sqlite")
+    for minute in range(10):
+        _trade(store, NOW - timedelta(minutes=minute), pnl=-1.0, r=None)
+    # Revalidated this morning: one day of evidence has no daily Sharpe yet.
+    _validated(store, "trend", {"4h": {"passed": True, "daily_sharpe": 1.0}}, validated_at=(NOW - timedelta(hours=2)).isoformat())
+    assert review_strategy(store, "trend", capital=1000.0, now=NOW) is None
+    assert store.strategy("trend")["signal_only"] is False
+
+
 def test_decay_demotes_after_20_trades_with_negative_r(tmp_path) -> None:
     store = Store(tmp_path / "bot.sqlite")
     # Older than the 30-day window, so the Sharpe check has nothing to judge.

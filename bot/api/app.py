@@ -39,9 +39,8 @@ from bot.exchange import service
 from bot.exchange.weight import weight_pressure
 from bot.features import build_features, ensure_chart_data
 from bot.instances import DcaParams, GridParams, Kind
-from bot.live.halt import clear_halt
 from bot.live.mandate.store import load_mandate
-from bot.mandate_io import ORDERS_PER_DAY_ENTRY, commit_mandate_for, mandate_is_restricted
+from bot.mandate_io import commit_mandate_for, mandate_caps_for, mandate_is_restricted
 from bot.strategies.day import DAY, DAY_WIN_RATE_MARGIN
 from bot.strategies.trailing import TRAIL
 from bot.markets import CHART_LEAD, chart_interval, merge_symbols, top_liquid_usdt, tradable_symbols, venue_klines, venue_symbols
@@ -58,7 +57,6 @@ from bot.strategies import (
     STRATEGY_VERSIONS,
     exit_policy_for,
     pairset_hash,
-    timeframe_passed,
     timeframe_result,
     uses_hysteresis,
     validated_for,
@@ -91,6 +89,8 @@ REVALIDATE_RETRY = timedelta(hours=1)
 REPORT_DAYS = 30
 #: A pair's slippage is the mean round trip of its last trades (the decay block's window).
 SLIPPAGE_TRADES = 20
+#: A pair's ``blocked_reason`` when its slippage check failed; its ``blocked`` is then null (unknown).
+SLIPPAGE_CHECK_FAILED = "verificação de slippage falhou"
 #: Stop distance of the day preset's sizing example.
 PRESET_STOP_PCT = 0.01
 _TRADE_FIELDS = (
@@ -285,6 +285,7 @@ def status() -> dict[str, Any]:
     today = days[-1] if days else None
     stored = store.strategies()
     since = (datetime.now(timezone.utc) - timedelta(days=REPORT_DAYS)).isoformat()
+    since_pass = {strategy_id: store.trials_since_pass(strategy_id) for strategy_id in VALIDATABLE}
     return {
         "running": runtime.running,
         "halted": runtime.halted,
@@ -298,11 +299,17 @@ def status() -> dict[str, Any]:
         "strategies": runtime.config.strategies,
         "validated": {row["strategy_id"]: _validated(row, config) for row in stored},
         "validation_detail": {row["strategy_id"]: _validation_detail_of(row["params"], config) for row in stored},
-        "trials": {strategy_id: len(store.trials_since_pass(strategy_id)) for strategy_id in VALIDATABLE},
+        # Trial rows recorded since the last pass, and the deflated Sharpe's N they make with this config.
+        "trials": {strategy_id: len(trials) for strategy_id, trials in since_pass.items()},
+        "trials_n": {
+            strategy_id: _trial_count(trials, _config_combinations(strategy_id, config))
+            for strategy_id, trials in since_pass.items()
+        },
         "validations": _validation_jobs(runtime.config.mode),
         "risk_state": store.get_state("risk_state"),
         "stop_windows": store.stop_window_stats(since),
         "mandate": _mandate_summary(),
+        "mandate_target": _mandate_target(config),
         "testnet_test_mode": runtime.config.testnet_test_mode,
         "limits": runtime.config.limits.model_dump(),
         "flatten_on_halt": runtime.config.flatten_on_halt,
@@ -335,7 +342,9 @@ def status() -> dict[str, Any]:
 
 
 def _validated(row: dict[str, Any], config: BotConfig) -> bool:
-    """Executable: the result replayed today's rules, an operated timeframe passed and it is not signal-only."""
+    """Executable by the cycle's signal-only rule: not signal-only, the result replayed today's
+    rules, and an operated timeframe passed with a readable Monte Carlo p95 drawdown under the
+    drawdown limit at today's risk per trade (``risk.mc_drawdown_ok``)."""
     params = row["params"]
     strategy = STRATEGIES.get(row["strategy_id"])
     timeframes = strategy.timeframes if strategy is not None else ()
@@ -344,20 +353,25 @@ def _validated(row: dict[str, Any], config: BotConfig) -> bool:
         and validated_for(
             params, row["strategy_id"], config.exit_policy, market_filter=config.market_filter, hysteresis=config.exit_hysteresis
         )
-        and any(timeframe_passed(params, timeframe) for timeframe in timeframes)
+        and any(_operable(timeframe_result(params, timeframe), config) for timeframe in timeframes)
     )
 
 
+def _operable(result: dict[str, Any] | None, config: BotConfig) -> bool:
+    """The timeframe passed and its Monte Carlo drawdown holds under today's limits."""
+    return result is not None and bool(result.get("passed")) and risk.mc_drawdown_ok(result.get("mc_p95_dd_r"), config.limits)
+
+
 def _validation_detail_of(params: dict[str, Any] | None, config: BotConfig) -> dict[str, dict[str, Any]]:
-    """Each replayed timeframe's result plus ``mc_ok``: the Monte Carlo p95 drawdown at today's
-    risk per trade stays below the drawdown limit (the live check, D10)."""
+    """Each replayed timeframe's result plus ``mc_ok`` (``risk.mc_drawdown_ok``, the live check, D10):
+    the Monte Carlo p95 drawdown at today's risk per trade is readable and below the drawdown
+    limit. A missing or unreadable p95 is not ok."""
     detail: dict[str, dict[str, Any]] = {}
     for timeframe in (params or {}).get("timeframes") or {}:
         result = timeframe_result(params, timeframe)
         if result is None:
             continue
-        p95 = float(result.get("mc_p95_dd_r") or 0.0)
-        detail[timeframe] = {**result, "mc_ok": p95 * config.limits.risk_per_trade_pct < config.limits.max_drawdown_pct}
+        detail[timeframe] = {**result, "mc_ok": risk.mc_drawdown_ok(result.get("mc_p95_dd_r"), config.limits)}
     return detail
 
 
@@ -377,6 +391,11 @@ def _mandate_summary() -> dict[str, Any] | None:
         "max_trades_per_day": caps.max_trades_per_day,
         "flatten_on_halt": mandate.flatten_on_halt,
     }
+
+
+def _mandate_target(config: BotConfig) -> dict[str, Any]:
+    """The caps ``commit_mandate_for(config)`` would write now, without writing anything."""
+    return dict(mandate_caps_for(config))
 
 
 @app.get("/bot/opportunities")
@@ -427,7 +446,8 @@ def performance() -> dict[str, Any]:
 
 def _pair_slippage(runtime: Runtime) -> list[dict[str, Any]]:
     """Per pair over ``REPORT_DAYS``: closed trades, the mean round-trip slippage of the last
-    ``SLIPPAGE_TRADES`` that recorded it (None without any), and whether the slippage budget blocks it."""
+    ``SLIPPAGE_TRADES`` that recorded it (None without any), and whether the slippage budget blocks it
+    (``blocked`` null with ``SLIPPAGE_CHECK_FAILED`` as the reason when the check failed)."""
     now = datetime.now(timezone.utc)
     trades = runtime.store.closed_trades(since=(now - timedelta(days=REPORT_DAYS)).isoformat())
     by_symbol: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in runtime.config.symbols}
@@ -442,30 +462,30 @@ def _pair_slippage(runtime: Runtime) -> list[dict[str, Any]]:
             for row in closed
             if row.get("entry_slippage") is not None and row.get("exit_slippage") is not None
         ][:SLIPPAGE_TRADES]
-        blocked = _slippage_block(runtime.store, symbol, budget, now)
+        blocked, reason = _slippage_block(runtime.store, symbol, budget, now)
         rows.append(
             {
                 "symbol": symbol,
                 "trades": len(closed),
                 "slippage_rt": sum(measured) / len(measured) if measured else None,
-                "blocked": blocked is not None,
-                "blocked_reason": blocked,
+                "blocked": blocked,
+                "blocked_reason": reason,
             }
         )
     return rows
 
 
-def _slippage_block(store: Store, symbol: str, budget: float, now: datetime) -> str | None:
-    """``decay.pair_slippage_blocked`` (the W2-C contract); None while that module lacks it or the budget is off."""
-    check = getattr(decay, "pair_slippage_blocked", None)
-    if check is None or budget <= 0:
-        return None
+def _slippage_block(store: Store, symbol: str, budget: float, now: datetime) -> tuple[bool | None, str | None]:
+    """``decay.pair_slippage_blocked`` as the row's (blocked, reason).
+
+    A check that raised is unknown, never "not blocked": (None, ``SLIPPAGE_CHECK_FAILED``).
+    """
     try:
-        reason = check(store, symbol, budget, now=now)
+        reason = decay.pair_slippage_blocked(store, symbol, budget, now=now)
     except Exception:  # noqa: BLE001 - one pair's check must not fail the report
         logger.warning("slippage block check for %s failed", symbol, exc_info=True)
-        return None
-    return str(reason) if reason else None
+        return None, SLIPPAGE_CHECK_FAILED
+    return reason is not None, reason
 
 
 _BALANCE_TTL_SECONDS = 20
@@ -551,7 +571,8 @@ def start() -> dict[str, Any]:
 def stop() -> dict[str, Any]:
     result = _runtime().stop()
     if result.get("status") != "ok":
-        # A resting buy not yet resolved keeps the cycle running, or a position without a stop halted.
+        # A robot's resting buy is not resolved yet (the cycle keeps the state it had), or a
+        # position left without a stop halted the bot.
         raise HTTPException(status_code=409, detail=result["error"])
     return result
 
@@ -564,16 +585,13 @@ def halt() -> dict[str, Any]:
 
 @app.post("/bot/resume")
 def resume() -> dict[str, Any]:
-    """Manual restart after a halt. The cycle never calls this."""
+    """Manual restart after a halt (``Runtime.resume``). The cycle never calls this."""
     with ctx.lock:
-        clear_halt("binance")
-        clear_halt(None)
-        runtime = _runtime()
-        runtime.store.set_state("running", False)
-        runtime.store.set_state("halt_reason", None)
-        runtime.failures = 0
-        runtime._ledger("resume", {"by": "operator"})
-        return {"status": "ok", "halted": runtime.halted}
+        result = _runtime().resume()
+    if result.get("status") != "ok":
+        # A resting buy the halt left unresolved keeps the halt, or a position without a stop halted again.
+        raise HTTPException(status_code=409, detail=result["error"])
+    return result
 
 
 @app.post("/bot/opportunities/execute")
@@ -1064,19 +1082,15 @@ def _replay_timeframes(
 ) -> dict[str, BacktestResult]:
     """Run the gate on each timeframe and log each run as a trial.
 
-    The deflated Sharpe's N counts the distinct (timeframe, exit rule, pair set, market
-    filter, hysteresis) combinations tried since the strategy's last pass, the earlier
-    timeframes of this run included, plus the current one; the variance uses those
-    trials' per-trade Sharpe.
+    The deflated Sharpe's N is ``_trial_count`` of the trials since the strategy's last
+    pass, the earlier timeframes of this run included, plus the current combination; the
+    variance uses those trials' per-trade Sharpe.
     """
-    policy = exit_policy_for(strategy_id, config.exit_policy)
-    hysteresis = bool(config.exit_hysteresis) and uses_hysteresis(strategy_id, policy)
-    pairset = pairset_hash(config.symbols)
     seen = store.trials_since_pass(strategy_id)
     results: dict[str, BacktestResult] = {}
     for timeframe, by_symbol in frames.items():
-        combination = (timeframe, policy, pairset, config.market_filter, hysteresis)
-        tried = {_combination(trial) for trial in seen} | {combination}
+        combination = _config_combination(strategy_id, timeframe, config)
+        _timeframe, policy, pairset, _market_filter, hysteresis = combination
         result = validate_strategy(
             strategy_id,
             by_symbol,
@@ -1085,7 +1099,7 @@ def _replay_timeframes(
             hourly_frames=hourly,
             hysteresis=config.exit_hysteresis,
             market_frame=market,
-            trials=len(tried),
+            trials=_trial_count(seen, [combination]),
             trial_sharpes=[float(trial["sharpe_trade"]) for trial in seen],
         )
         sharpe = float(result.sharpe_trade)
@@ -1107,7 +1121,11 @@ def _replay_timeframes(
     return results
 
 
-def _combination(trial: dict[str, Any]) -> tuple[str, str, str, str, bool]:
+_Combination = tuple[str, str, str, str, bool]
+
+
+def _combination(trial: dict[str, Any]) -> _Combination:
+    """A logged trial's (timeframe, exit rule, pair set, market filter, hysteresis)."""
     return (
         str(trial["timeframe"]),
         str(trial["exit_policy"]),
@@ -1115,6 +1133,28 @@ def _combination(trial: dict[str, Any]) -> tuple[str, str, str, str, bool]:
         str(trial["market_filter"]),
         bool(trial["hysteresis"]),
     )
+
+
+def _config_combination(strategy_id: str, timeframe: str, config: BotConfig) -> _Combination:
+    """The combination a validation of ``strategy_id`` on ``timeframe`` under ``config`` logs."""
+    policy = exit_policy_for(strategy_id, config.exit_policy)
+    hysteresis = bool(config.exit_hysteresis) and uses_hysteresis(strategy_id, policy)
+    return (timeframe, policy, pairset_hash(config.symbols), config.market_filter, hysteresis)
+
+
+def _config_combinations(strategy_id: str, config: BotConfig) -> list[_Combination]:
+    """One combination per timeframe the strategy operates, as its next validation runs them."""
+    return [_config_combination(strategy_id, timeframe, config) for timeframe in STRATEGIES[strategy_id].timeframes]
+
+
+def _trial_count(seen: list[dict[str, Any]], current: list[_Combination]) -> int:
+    """The deflated Sharpe's N (D9): the distinct combinations among ``seen`` (the trials since
+    the last pass) and ``current``.
+
+    The validation passes the timeframe it is about to replay; ``/bot/status`` passes every
+    operated timeframe of the config, the N the next validation reaches on its last one.
+    """
+    return len({_combination(trial) for trial in seen} | set(current))
 
 
 def _job_result(record: dict[str, Any], results: dict[str, BacktestResult]) -> dict[str, Any]:
@@ -1238,17 +1278,13 @@ def _preset_preview(current: BotConfig, preset: BotConfig) -> dict[str, Any]:
         "order_cap_usd": round(order_cap, 2),
         "risk_notional_usd": round(wanted, 2),
         "capped_by_order_cap": wanted > order_cap,
-        "mandate_orders_per_day": ORDERS_PER_DAY_ENTRY * preset.limits.max_trades_per_day,
+        "mandate_orders_per_day": mandate_caps_for(preset)["max_trades_per_day"],
         "sizing": _size_example(preset, PRESET_STOP_PCT),
     }
 
 
-#: Labels of the limits the fallback sizing can report, as ``risk.SIZE_LIMITS`` names them.
-_FALLBACK_SIZE_LIMITS = {"risk": "risco por trade", "safety": "teto por ordem"}
-
-
 def _size_example(config: BotConfig, stop_pct: float) -> dict[str, Any]:
-    """The order one entry at a ``stop_pct`` stop would place under ``config``.
+    """The order one entry at a ``stop_pct`` stop would place under ``config`` (``RiskManager.sizing``).
 
     No pair is named, so neither the venue nor the volatility cap applies, and no hit
     rate is known, so Kelly does not cut the share.
@@ -1268,39 +1304,14 @@ def _size_example(config: BotConfig, stop_pct: float) -> dict[str, Any]:
         cost=0.0,
         gross_return=0.0,
     )
-    size, binding, caps = _sizing(manager, opportunity)
-    labels: dict[str, str] = getattr(risk, "SIZE_LIMITS", _FALLBACK_SIZE_LIMITS)
+    decision = manager.sizing(opportunity)
     return {
         "stop_pct": stop_pct,
-        "size_usd": round(size, 2),
-        "binding": binding,
-        "label": labels.get(binding, binding),
-        "caps": {name: round(value, 2) for name, value in caps.items()},
+        "size_usd": round(decision.size_usd, 2),
+        "binding": decision.binding,
+        "label": risk.SIZE_LIMITS[decision.binding],
+        "caps": {name: round(value, 2) for name, value in decision.caps.items()},
     }
-
-
-def _sizing(manager: risk.RiskManager, opportunity: Opportunity) -> tuple[float, str, dict[str, float]]:
-    """``RiskManager.sizing`` (§2.3: ``SizeDecision(size_usd, binding, caps)``) as (size, binding, finite caps).
-
-    Adapter for wave 2: until ``risk.py`` gains ``sizing``, the two caps ``size_for``
-    applies without Kelly (the risk share over the stop, and the order cap less headroom).
-    """
-    sizing = getattr(manager, "sizing", None)
-    if callable(sizing):
-        decision = sizing(opportunity)
-        caps = {
-            str(name): float(value)
-            for name, value in dict(decision.caps or {}).items()
-            if isinstance(value, (int, float)) and math.isfinite(value)
-        }
-        return float(decision.size_usd), str(decision.binding), caps
-    capital = manager.sizing_capital
-    caps = {
-        "risk": capital * manager.limits.risk_per_trade_pct / opportunity.risk_pct,
-        "safety": capital * manager.limits.max_order_notional_pct * risk.ORDER_HEADROOM,
-    }
-    binding = min(caps, key=caps.__getitem__)
-    return caps[binding], binding, caps
 
 
 @app.get("/bot/presets/day")
@@ -1465,17 +1476,22 @@ def update_config(body: ConfigUpdate) -> dict[str, Any]:
 def _merge_limits(saved: dict[str, Any], sent: dict[str, float | int]) -> dict[str, Any]:
     """The saved limits with the sent ones on top.
 
-    The drawdown steps derive from ``max_drawdown_pct`` (``RiskLimits``). A new limit
-    sent without its steps drops the saved ones so they are derived again: kept, they
-    could fall out of order (a reduce step at or above the limit, a halt at or below
-    it) and refuse a change the operator made in one field. A reduce step of 0 is the
-    operator's "off" and stays off.
+    The drawdown steps must stay in order around ``max_drawdown_pct`` (``RiskLimits``). A
+    new limit sent without its steps keeps each saved step that still fits it and drops
+    only one it puts out of order, which ``RiskLimits`` then derives again: a reduce step
+    at or above the limit, or a halt at or below it (a halt and a limit both at 100% fit).
+    Kept, such a step would refuse a change the operator made in one field. A reduce step
+    of 0 is the operator's "off" and stays off.
     """
     merged = {**saved, **sent}
-    if "max_drawdown_pct" in sent and sent["max_drawdown_pct"] != saved.get("max_drawdown_pct"):
-        for name in ("dd_reduce_pct", "halt_drawdown_pct"):
-            if name not in sent and not (name == "dd_reduce_pct" and saved.get(name) == 0):
-                merged.pop(name, None)
+    if "max_drawdown_pct" not in sent:
+        return merged
+    limit = sent["max_drawdown_pct"]
+    reduce_step, halt = saved["dd_reduce_pct"], saved["halt_drawdown_pct"]
+    if "dd_reduce_pct" not in sent and reduce_step != 0 and reduce_step >= limit:
+        merged.pop("dd_reduce_pct")
+    if "halt_drawdown_pct" not in sent and halt <= limit and not halt == limit == 1.0:
+        merged.pop("halt_drawdown_pct")
     return merged
 
 

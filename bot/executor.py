@@ -30,11 +30,16 @@ buy block cancel it first and book what it bought, and after a cancel the order
 is always read again: it may have filled between the read and the cancel. No
 sale and no stop close ever runs over a resting buy whose result is unknown. A
 stop that sold while a resting buy filled leaves the row open with the coins
-the buy added, under a new stop (``_carry_after_stop``).
+the buy added, under a new stop (``_carry_after_stop``). Until it is settled, the
+mandate gate counts a resting buy as held at its full quantity on every buy
+(``_held_for_buy``): it fills later without passing the gate again. Sells (stops
+and exits) are checked against the open positions only (``_held_for_sell``), so
+a resting buy never makes the gate refuse a stop or an exit near the cap.
 
 A stop that triggered but rests unfilled because the price gapped below its
-limit is found by price in the sync: it is cancelled and the position sold with
-an IOC below the bid, then one more 2% below it (``EMERGENCY_LIMIT_GAP``).
+limit is found by price in the sync (last trade at or under the stop, bid under
+its limit): it is cancelled and the position sold with an IOC below the bid,
+then one more 2% below it (``EMERGENCY_LIMIT_GAP``).
 
 When a position cannot be protected or closed, ``UnprotectedPosition`` is
 raised and the runtime halts.
@@ -219,6 +224,16 @@ def _order_not_found(result: dict[str, Any]) -> bool:
     return "ordernotfound" in text or "unknown order" in text
 
 
+def _placed_at(position: dict[str, Any], leg: dict[str, Any]) -> datetime | None:
+    """When the order of ``leg`` was sent (its ``placed_at``), or None when unreadable. A leg written
+    before ``placed_at`` was recorded falls back to the row's ``updated_at``."""
+    try:
+        placed = datetime.fromisoformat(str(leg.get("placed_at") or position["updated_at"]))
+    except ValueError:
+        return None
+    return placed if placed.tzinfo is not None else placed.replace(tzinfo=timezone.utc)
+
+
 def _carried(leg: dict[str, Any] | None) -> bool:
     """A re-stop leg of a resting buy's fill: it records the coins the old stop does not cover."""
     return leg is not None and leg.get("kind") == "restop" and leg.get("added") is not None
@@ -385,7 +400,7 @@ class Executor:
             time_in_force="ioc",
             idempotency_key=key,
             session_id="bot",
-            held=self._held(),
+            held=self._held_for_buy(),
         )
         status = _status(result)
         if status == "ok":
@@ -511,7 +526,7 @@ class Executor:
             order_type="market",
             idempotency_key=key,
             session_id="bot",
-            held=self._held(),
+            held=self._held_for_buy(),
         )
         status = _status(result)
         if status == "ok":
@@ -578,7 +593,15 @@ class Executor:
         client_id = service.client_order_id(self.profile_id, key)
         self.store.update_position(
             position_id,
-            pending_leg=json.dumps({"kind": "buy", "leg": leg, "client_order_id": client_id, "stop": str(next_stop)}),
+            pending_leg=json.dumps(
+                {
+                    "kind": "buy",
+                    "leg": leg,
+                    "client_order_id": client_id,
+                    "stop": str(next_stop),
+                    "placed_at": _now().isoformat(),
+                }
+            ),
         )
         result = service.submit_order(
             symbol,
@@ -588,7 +611,7 @@ class Executor:
             order_type="market",
             idempotency_key=key,
             session_id="bot",
-            held=self._held(),
+            held=self._held_for_buy(),
         )
         status = _status(result)
         if status == "unknown":
@@ -689,8 +712,10 @@ class Executor:
         client_id = str(leg.get("client_order_id") or "")
         lookup = service.order_status(symbol, self.profile_id, client_id)
         if lookup.get("status") == "not_found":
-            updated = datetime.fromisoformat(str(position["updated_at"]))
-            if (_now() - updated).total_seconds() > _ACCEPTANCE_WINDOW_SECONDS:
+            # Timed from the send, not from ``updated_at``: ``mark`` moves that on every new low or
+            # high, so a falling price would keep the leg (and every exit) waiting forever.
+            placed = _placed_at(position, leg)
+            if placed is not None and (_now() - placed).total_seconds() > _ACCEPTANCE_WINDOW_SECONDS:
                 self.store.update_position(position["id"], pending_leg=None)
             return
         order = lookup.get("order") if lookup.get("status") == "ok" else None
@@ -786,6 +811,9 @@ class Executor:
             "level": level,
             "placed_at": _now().isoformat(),
         }
+        # Read before the leg is written: ``_held_for_buy`` counts a recorded resting buy, and the
+        # gate already counts this order itself.
+        held = self._held_for_buy()
         self.store.update_position(position_id, pending_leg=json.dumps(record))
         result = service.submit_order(
             symbol,
@@ -797,7 +825,7 @@ class Executor:
             time_in_force="gtc",
             idempotency_key=key,
             session_id="bot",
-            held=self._held(),
+            held=held,
         )
         status = _status(result)
         if status == "unknown":
@@ -927,13 +955,8 @@ class Executor:
         forgotten only when the cancel answers that Binance knows no such order either; any other
         answer leaves it unknown, which blocks sales and new resting buys until a read settles it.
         """
-        try:
-            placed = datetime.fromisoformat(str(leg.get("placed_at") or position["updated_at"]))
-        except ValueError:
-            return "unknown"
-        if placed.tzinfo is None:
-            placed = placed.replace(tzinfo=timezone.utc)
-        if (_now() - placed).total_seconds() <= _ACCEPTANCE_WINDOW_SECONDS:
+        placed = _placed_at(position, leg)
+        if placed is None or (_now() - placed).total_seconds() <= _ACCEPTANCE_WINDOW_SECONDS:
             return "unknown"
         order_id = str(leg.get("order_id") or "")
         if order_id:
@@ -1042,7 +1065,7 @@ class Executor:
             time_in_force="gtc",
             idempotency_key=self._key(position_id, "stop", attempt),
             session_id="bot",
-            held=self._held(),
+            held=self._held_for_sell(),
         )
         status = _status(result)
         if status == "ok":
@@ -1354,7 +1377,7 @@ class Executor:
                 time_in_force="ioc",
                 idempotency_key=self._key(position_id, leg, attempt),
                 session_id="bot",
-                held=self._held(),
+                held=self._held_for_sell(),
             )
             status = _status(result)
             if status == "unknown":
@@ -1738,10 +1761,17 @@ class Executor:
             if self._position(position["id"])["status"] == "open":
                 self.protect(position["id"])
         else:
-            # Resting (new, open or partly filled): a stop the price gapped through never fills.
+            # Resting (new, open or partly filled): a stop the price gapped through never fills. A
+            # STOP_LOSS_LIMIT triggers on the last trade price, so it is stuck only once the last trade
+            # reached the stop and the bid sits below its limit, both read from one quote.
             stop = _dec(position.get("stop_price"))
-            bid = self._bid(position["symbol"])
-            if stop is not None and bid is not None and 0 < bid < stop * (1 - STOP_LIMIT_GAP):
+            quote = self._quote(position["symbol"]) or {}
+            bid = _dec(quote.get("bid"))
+            last = _dec(quote.get("last"))
+            if stop is None or bid is None or last is None:
+                # Unreadable: not stuck, and the count of failed cancels stays for the next sync.
+                return
+            if 0 < bid < stop * (1 - STOP_LIMIT_GAP) and 0 < last <= stop:
                 self._stop_gapped(self._position(position["id"]), order, bid)
             else:
                 # Not stuck any more: a later stuck stop counts its failed cancels from zero.
@@ -1990,16 +2020,39 @@ class Executor:
         return self._quote_field(symbol, "last")
 
     def _quote_field(self, symbol: str, field: str) -> Decimal | None:
+        quote = self._quote(symbol)
+        return _dec(quote.get(field)) if quote is not None else None
+
+    def _quote(self, symbol: str) -> dict[str, Any] | None:
+        """The current quote of ``symbol`` (``bid``, ``ask``, ``last``), or None when unreadable."""
         try:
             payload = service.get_quote(symbol, self.profile_id)
         except Exception as exc:  # noqa: BLE001 - callers treat a missing price as "cannot price"
             logger.warning("quote for %s failed: %s", symbol, type(exc).__name__)
             return None
         quote = payload.get("quote") if isinstance(payload, dict) else None
-        return _dec(quote.get(field)) if isinstance(quote, dict) else None
+        return quote if isinstance(quote, dict) else None
 
-    def _held(self) -> list[dict[str, Any]]:
+    def _held_for_sell(self) -> list[dict[str, Any]]:
+        """The bot's exposure the mandate gate checks a sell against: the open positions only.
+
+        The gate caps post-trade exposure on a sell too, so a resting buy counted here could refuse
+        a protective stop or an exit on another symbol near the cap, and halt the runtime.
+        """
         return [{"symbol": row["symbol"], "quantity": row["qty"]} for row in self.store.open_positions()]
+
+    def _held_for_buy(self) -> list[dict[str, Any]]:
+        """The bot's exposure the mandate gate checks a buy against: the open positions, and each
+        resting buy not yet settled at its full quantity on its symbol (it fills without passing the
+        gate again)."""
+        held: list[dict[str, Any]] = []
+        for row in self.store.open_positions():
+            held.append({"symbol": row["symbol"], "quantity": row["qty"]})
+            leg = _leg(row)
+            resting = _positive(leg.get("qty")) if leg is not None and leg.get("kind") == "rest_buy" else None
+            if resting is not None:
+                held.append({"symbol": row["symbol"], "quantity": float(resting)})
+        return held
 
     def _position(self, position_id: int) -> dict[str, Any]:
         position = self.store.position(position_id)

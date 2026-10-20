@@ -97,6 +97,9 @@ class FakeExecutor:
         self.events.append(f"exit:{position_id}")
         return {"status": "ok"}
 
+    def cancel_resting_buys(self) -> list[dict[str, Any]]:
+        return []
+
 
 def _runtime(
     tmp_path, monkeypatch, symbols: list[str] | None = None, **overrides: Any

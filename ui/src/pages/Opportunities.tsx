@@ -67,14 +67,14 @@ export function Opportunities() {
   }
 
   async function execute(row: Opportunity) {
-    const body = await perform(`Executar ${row.symbol}`, () => api.execute(row.symbol, row.strategy), (reply) => {
+    const outcome = await perform(`Executar ${row.symbol}`, () => api.execute(row.symbol, row.strategy), (reply) => {
       const results: Decision[] = reply.results ?? [];
       const opened = results.find((item) => item.decision === "operar");
       const notes = results.filter((item) => item.decision !== "operar").map((item) => `${item.decision}: ${item.reason}`);
       if (reply.cycle_started) notes.push("ciclo iniciado para acompanhar o stop e as saídas");
       return [opened ? `Compra de ${row.symbol} executada, com stop na corretora` : `Nenhuma compra de ${row.symbol}`, ...notes].join("\n");
     });
-    const started = (body?.results ?? []).find(
+    const started = (outcome.ok ? outcome.result.results ?? [] : []).find(
       (item) => (item.decision === "operar" || item.decision === "pendente") && item.position_id != null,
     );
     setTradeId(started?.position_id ?? null);

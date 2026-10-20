@@ -74,21 +74,35 @@ ORDERS_PER_ENTRY = 4
 ORDERS_PER_DAY_ENTRY = 6
 
 
-def commit_mandate_for(config: "BotConfig") -> Path:
-    """Write the mandate for the active mode from the operator limits."""
+def mandate_caps_for(config: "BotConfig") -> dict[str, float | int | bool]:
+    """The caps ``commit_mandate_for`` writes for ``config``, without writing.
+
+    The one derivation of the mandate caps: the panel compares the written mandate with it.
+    """
     from bot.strategies import DAY_STRATEGIES
 
     capital = config.capital_for_sizing()
     limits = config.limits
     day = any(config.strategies.get(strategy_id, False) for strategy_id in DAY_STRATEGIES)
     per_entry = ORDERS_PER_DAY_ENTRY if day else ORDERS_PER_ENTRY
+    return {
+        "max_order_notional_usd": capital * limits.max_order_notional_pct,
+        "max_total_exposure_usd": capital * limits.max_exposure_pct,
+        "max_trades_per_day": per_entry * limits.max_trades_per_day + limits.instance_orders_per_day,
+        "flatten_on_halt": config.flatten_on_halt,
+    }
+
+
+def commit_mandate_for(config: "BotConfig") -> Path:
+    """Write the mandate for the active mode from the operator limits."""
+    caps = mandate_caps_for(config)
     return commit_binance_mandate(
-        capital_usd=capital,
-        max_order_notional_usd=capital * limits.max_order_notional_pct,
-        max_total_exposure_usd=capital * limits.max_exposure_pct,
-        max_leverage=limits.max_leverage,
-        max_trades_per_day=per_entry * limits.max_trades_per_day + limits.instance_orders_per_day,
-        flatten_on_halt=config.flatten_on_halt,
+        capital_usd=config.capital_for_sizing(),
+        max_order_notional_usd=float(caps["max_order_notional_usd"]),
+        max_total_exposure_usd=float(caps["max_total_exposure_usd"]),
+        max_leverage=config.limits.max_leverage,
+        max_trades_per_day=int(caps["max_trades_per_day"]),
+        flatten_on_halt=bool(caps["flatten_on_halt"]),
     )
 
 

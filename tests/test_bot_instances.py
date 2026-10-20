@@ -204,8 +204,11 @@ def _price(runtime: Runtime, venue, close: float) -> None:
 
 
 def _step(runtime: Runtime, moment: datetime | None = None) -> None:
+    """The robots' part of one cycle: the cycle's risk level, then one step of every instance."""
+    moment = moment or datetime.now(timezone.utc)
     with runtime.lock:
-        runtime._instances(runtime.collector.snapshot, moment or datetime.now(timezone.utc))
+        state = runtime._risk_state(runtime.collector.snapshot, moment)
+        runtime._instances(runtime.collector.snapshot, moment, state=state)
 
 
 def test_an_instance_needs_orders_reserved_for_robots(tmp_path, monkeypatch, venue) -> None:

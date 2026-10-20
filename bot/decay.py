@@ -1,7 +1,8 @@
 """Live evidence against the backtest: demote a strategy, a strategy on one pair, or block a pair.
 
 Like with like (D26): the live daily Sharpe is measured over the last 30 calendar
-UTC days, a day without a close counting 0, and compared with the backtest's
+UTC days (fewer when the strategy was validated within them), a day without a
+close counting 0, and compared with the backtest's
 ``daily_sharpe``, which counts idle days as 0 too and uses the same √365 scale.
 The backtest side is the best passed timeframe's value. Every check reads closed
 strategy trades only (``Store.closed_trades``: no test-mode, DCA or grid rows) and
@@ -20,7 +21,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from bot.store import Store
@@ -78,8 +79,10 @@ def review_strategy(store: Store, strategy_id: str, *, capital: float, now: date
 
     Two triggers, both on trades closed since the current validation:
     - with at least ``MIN_WINDOW_TRADES`` of them in the last ``LIVE_DAYS`` calendar
-      days, the zero-filled live daily Sharpe of those days is below ``SHARPE_FLOOR``
-      times the best passed timeframe's backtest daily Sharpe (when that is positive);
+      days, the zero-filled live daily Sharpe is below ``SHARPE_FLOOR`` times the best
+      passed timeframe's backtest daily Sharpe (when that is positive). Its days run
+      from the later of the window's first day and ``validated_at`` to ``now``'s day,
+      with the trades closed before ``validated_at`` left out, and it needs two days;
     - the last ``RECENT_TRADES`` closed trades, every one with a recorded R, have a
       mean R below 0.
 
@@ -96,16 +99,15 @@ def review_strategy(store: Store, strategy_id: str, *, capital: float, now: date
     since = max(window_start, validated) if validated else window_start
 
     live: float | None = None
-    if len(store.closed_trades(strategy=strategy_id, since=since)) >= MIN_WINDOW_TRADES:
-        returns = store.strategy_daily_returns(strategy_id, capital, calendar_days=LIVE_DAYS, now=moment)
-        if returns:
-            live = live_sharpe(returns)
+    trades, returns = _live_days(store, strategy_id, since, moment.date(), capital)
+    if trades >= MIN_WINDOW_TRADES and len(returns) >= 2:
+        live = live_sharpe(returns)
 
     reason: str | None = None
     backtest = backtest_daily_sharpe(row)
     if live is not None and backtest is not None and backtest > 0 and live < backtest * SHARPE_FLOOR:
         reason = (
-            f"Sharpe diário dos últimos {LIVE_DAYS} dias ({live:.2f}) abaixo de metade "
+            f"Sharpe diário dos últimos {len(returns)} dias ({live:.2f}) abaixo de metade "
             f"do backtest ({backtest:.2f})"
         )
     if reason is None:
@@ -176,6 +178,25 @@ def apply_decay(store: Store, strategy_id: str, daily_returns: list[float]) -> b
         updated["signal_only"] = True
     store.save_strategy(updated)
     return demoted
+
+
+def _live_days(store: Store, strategy_id: str, since: str, today: date, capital: float) -> tuple[int, list[float]]:
+    """The strategy's closed trades at or after ``since`` up to ``today``, and their PnL per UTC day.
+
+    Returns the trade count and one value per calendar day from ``since``'s day to
+    ``today``, oldest first, as a fraction of ``capital``; a day without a close
+    counts 0. Only trades closed at or after ``since`` count, also on its first
+    day. A capital of 0 or less measures no day.
+    """
+    first = date.fromisoformat(since[:10])
+    pnl = {(first + timedelta(days=offset)).isoformat(): 0.0 for offset in range((today - first).days + 1)}
+    count = 0
+    for trade in store.closed_trades(strategy=strategy_id, since=since):
+        day = str(trade["closed_at"])[:10]
+        if day in pnl:
+            pnl[day] += float(trade.get("realized_pnl") or 0.0)
+            count += 1
+    return count, [value / capital for value in pnl.values()] if capital > 0 else []
 
 
 def _mean_r(trades: Sequence[Mapping[str, Any]], count: int) -> float | None:

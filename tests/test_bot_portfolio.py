@@ -316,8 +316,9 @@ def test_kelly_lowers_the_risk_share_when_the_edge_is_thin() -> None:
 def test_a_row_with_no_estimated_edge_is_refused_but_a_test_row_is_not() -> None:
     limits = RiskLimits(kelly_fraction=0.25)
     manager = RiskManager(limits, 1000.0)
-    common = dict(open_positions=[], exposure_usd=0.0, day_pnl=0.0, peak_equity=1000.0, equity=1000.0,
-                  trades_today=0, returns_by_symbol={}, stale=False, signal_only=False)
+    state = manager.portfolio_state(day_change=0.0, peak_equity=1000.0, equity=1000.0)
+    common = dict(open_positions=[], exposure_usd=0.0,
+                  trades_today=0, returns_by_symbol={}, stale=False, signal_only=False, state=state)
     refused = manager.assess(_rated(0.30), **common)
     assert refused.allowed is False and "sem vantagem estimada" in refused.reason
     assert manager.assess(_rated(0.30, test_only=True), **common).allowed is True

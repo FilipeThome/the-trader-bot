@@ -13,7 +13,7 @@ import json
 import math
 import sqlite3
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, TypeVar, cast
 
@@ -680,45 +680,17 @@ class Store:
         return [dict(row) for row in self._conn.execute(query, values).fetchall()]
 
     @_locked
-    def strategy_daily_returns(
-        self,
-        strategy_id: str,
-        capital: float,
-        *,
-        calendar_days: int | None = None,
-        now: datetime | None = None,
-    ) -> list[float]:
-        """Realized PnL per UTC close day as a fraction of ``capital``, oldest first.
-
-        Without ``calendar_days``, one value per day that closed a trade. With it, exactly
-        that many UTC days ending on the day of ``now`` (default: the current time), a day
-        without a close counting 0, so a Sharpe over them is comparable with a backtest's.
-        A capital of 0 or less measures nothing and returns no day in either form.
-        """
-        if calendar_days is not None and calendar_days < 1:
-            raise ValueError("calendar_days must be at least 1")
+    def strategy_daily_returns(self, strategy_id: str, capital: float) -> list[float]:
+        """Realized PnL per UTC close day as a fraction of ``capital``, oldest first."""
         if capital <= 0:
             return []
-        filters = "strategy=? AND status='closed' AND closed_at IS NOT NULL AND test_only=0"
-        if calendar_days is None:
-            rows = self._conn.execute(
-                f"""SELECT substr(closed_at, 1, 10) AS day, SUM(realized_pnl) AS pnl
-                FROM positions WHERE {filters} GROUP BY day ORDER BY day""",
-                (strategy_id,),
-            ).fetchall()
-            return [float(row["pnl"]) / capital for row in rows]
-        moment = now or datetime.now(timezone.utc)
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=timezone.utc)
-        today = moment.astimezone(timezone.utc).date()
-        days = [(today - timedelta(days=offset)).isoformat() for offset in range(calendar_days - 1, -1, -1)]
         rows = self._conn.execute(
-            f"""SELECT substr(closed_at, 1, 10) AS day, SUM(realized_pnl) AS pnl
-            FROM positions WHERE {filters} AND closed_at >= ? AND closed_at < ? GROUP BY day""",
-            (strategy_id, days[0], (today + timedelta(days=1)).isoformat()),
+            """SELECT substr(closed_at, 1, 10) AS day, SUM(realized_pnl) AS pnl
+            FROM positions WHERE strategy=? AND status='closed' AND closed_at IS NOT NULL AND test_only=0
+            GROUP BY day ORDER BY day""",
+            (strategy_id,),
         ).fetchall()
-        pnl = {row["day"]: float(row["pnl"]) for row in rows}
-        return [pnl.get(day, 0.0) / capital for day in days]
+        return [float(row["pnl"]) / capital for row in rows]
 
     # -- daily PnL and equity ----------------------------------------------
 
