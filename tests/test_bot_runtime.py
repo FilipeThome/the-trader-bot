@@ -20,11 +20,20 @@ from bot.store import Store
 from bot.strategies.base import Setup
 
 
-def _validated(strategy_id: str, policy: str, timeframe: str = "1h", **outcomes: Any) -> dict[str, Any]:
-    """A current (gate v2) validation that passed on ``timeframe``, with the default market filter and hysteresis."""
+def _validated(
+    strategy_id: str, policy: str, timeframe: str = "1h", *, symbols: list[str] | None = None, **outcomes: Any
+) -> dict[str, Any]:
+    """A current (gate v2) validation that passed on ``timeframe`` over ``symbols``, with the default
+    market filter and hysteresis. ``outcomes`` (wins, trades, ...) go to the pooled record and to
+    the timeframe's result, which the hit rate reads."""
     return {
         **validation_params(
-            strategy_id, policy, timeframes={timeframe: {"passed": True}}, symbols=["BTC/USDT"], market_filter="off", hysteresis=True
+            strategy_id,
+            policy,
+            timeframes={timeframe: {"passed": True, **outcomes}},
+            symbols=symbols or ["BTC/USDT"],
+            market_filter="off",
+            hysteresis=True,
         ),
         **outcomes,
     }
@@ -65,6 +74,9 @@ class FakeExecutor:
         if self.raise_on_sync is not None:
             raise self.raise_on_sync
 
+    def mark(self, position_id: int, last: Any) -> None:
+        self.events.append(f"mark:{position_id}")
+
     def act(
         self, opportunities: list[Any], *, clock_blocked: bool, manual: bool = False, allow_test: bool = False
     ) -> list[dict[str, Any]]:
@@ -98,6 +110,7 @@ def _runtime(
     collector = FakeCollector(_snapshot(config.symbols))
     monkeypatch.setattr(service, "free_balance", lambda asset, profile_id: Decimal("100000"))
     monkeypatch.setattr(service, "market_rules", lambda symbol, profile_id: None)
+    monkeypatch.setattr(service, "trading_fees", lambda symbol, profile_id: None)
     runtime = Runtime(config, Store(tmp_path / "bot.sqlite"), collector)  # type: ignore[arg-type]
     executor = FakeExecutor()
     runtime.executor = executor  # type: ignore[assignment]
@@ -156,11 +169,15 @@ def test_a_lower_capital_is_not_a_drawdown(tmp_path, monkeypatch) -> None:
     runtime.tick()
     runtime.config = runtime.config.model_copy(update={"allocated_capital_usd": 150.0})
     runtime.tick()
-    assert runtime.halted is False
-    # A real loss still counts against the lower capital: 20 of 150 is above 10%.
+    assert runtime.halted is False and runtime.store.get_state("risk_state")["level"] == "normal"
+    # A real loss still counts against the lower capital: 20 of 150 is past the 10% step (exits only)...
     runtime.store.record_day("2026-01-01", net_pnl=-20.0)
     halts: list[str] = []
     monkeypatch.setattr(runtime, "halt", lambda reason, **_kwargs: halts.append(reason))
+    runtime.tick()
+    assert halts == [] and runtime.store.get_state("risk_state")["level"] == "reducing"
+    # ...and 25 of 150 past the 15% halt step.
+    runtime.store.record_day("2026-01-02", net_pnl=-5.0)
     runtime.tick()
     assert halts and "drawdown" in halts[0]
 
@@ -199,7 +216,7 @@ def test_an_unprotected_position_halts_at_once_without_flatten(tmp_path, monkeyp
 def test_decay_runs_once_per_utc_day(tmp_path, monkeypatch) -> None:
     runtime, _collector, _executor = _runtime(tmp_path, monkeypatch)
     calls: list[str] = []
-    monkeypatch.setattr("bot.runtime.apply_decay", lambda _store, strategy_id, _returns: calls.append(strategy_id) or False)
+    monkeypatch.setattr("bot.runtime.review_strategy", lambda _store, strategy_id, **_kwargs: calls.append(strategy_id))
     runtime.tick()
     runtime.tick()
     assert sorted(calls) == sorted(STRATEGIES)
@@ -399,7 +416,7 @@ def test_test_rows_exist_only_in_the_spot_testnet_test_mode(tmp_path, monkeypatc
 
 
 def test_a_smaller_balance_shrinks_orders_without_a_drawdown_halt(tmp_path, monkeypatch) -> None:
-    runtime, _executor = _ready_cycle(tmp_path, monkeypatch)
+    runtime, _executor = _ready_cycle(tmp_path, monkeypatch, limits=RiskLimits(max_order_notional_pct=0.02))
     runtime.tick()
     # 2% of 1000 is the order cap; entries keep 10% of it as headroom for the stop.
     assert runtime.store.opportunities()[0]["size_usd"] == pytest.approx(18.0)
@@ -420,6 +437,13 @@ def test_auto_entries_share_the_free_balance_across_pairs(tmp_path, monkeypatch)
         min_win_rate=0.70,
         symbols=["BTC/USDT", "ETH/USDT", "SOL/USDT"],
         limits=RiskLimits(max_order_notional_pct=0.5, max_entries_per_cycle=5),
+    )
+    runtime.store.save_strategy(
+        {
+            "strategy_id": "trend",
+            "signal_only": False,
+            "params": _validated("trend", "trailing", symbols=["BTC/USDT", "ETH/USDT", "SOL/USDT"], wins=30, trades=40),
+        }
     )
     # Orders are sized on the 30 USDT the account holds: 13.50 each (15 less headroom); 28.47 can be spent.
     monkeypatch.setattr(service, "free_balance", lambda asset, profile_id: Decimal("30"))
@@ -495,7 +519,9 @@ def _open(runtime: Runtime, symbol: str, strategy: str, *, qty: float, avg: floa
 
 
 def test_open_risk_is_capped_on_the_configured_capital_not_the_balance(tmp_path, monkeypatch) -> None:
-    runtime, executor = _ready_cycle(tmp_path, monkeypatch, entry_mode="auto", min_win_rate=0.70)
+    runtime, executor = _ready_cycle(
+        tmp_path, monkeypatch, entry_mode="auto", min_win_rate=0.70, limits=RiskLimits(max_order_notional_pct=0.02)
+    )
     # 50 USDT at risk to the stop: under 6% of the configured 1000, far above 6% of the 200 the account funds.
     _open(runtime, "XRP/USDT", "trend", qty=100, avg=1.0, stop=0.5)
     monkeypatch.setattr(service, "free_balance", lambda asset, profile_id: Decimal("100"))
@@ -817,7 +843,8 @@ def test_a_full_analysed_list_is_read_whole_next_to_a_held_pair_outside_it(tmp_p
     collector.refresh = lambda symbols: (asked.append(list(symbols)), inner(symbols))[1]  # type: ignore[method-assign]
     assert runtime.tick()["status"] == "ok"
     # Every scored pair is read in this cycle; none falls back on an older cycle's candles.
-    assert asked == [["ETH/USDT", *analysed]]
+    # BTC/USDT is read too: the market filter and the correlation cluster need it.
+    assert asked == [["ETH/USDT", *analysed, "BTC/USDT"]]
 
 
 def test_a_leftover_row_of_a_pair_no_longer_analysed_is_refused(tmp_path, monkeypatch) -> None:

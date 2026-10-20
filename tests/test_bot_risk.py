@@ -82,7 +82,8 @@ def test_each_risk_limit_blocks_its_case() -> None:
 
 
 def test_order_is_capped_at_two_percent() -> None:
-    size = _manager().size_for(_opportunity())
+    # A saved bot.json keeps its 2% order cap (fresh installs default to 25%).
+    size = RiskManager(RiskLimits(max_order_notional_pct=0.02), capital_usd=10_000).size_for(_opportunity())
     assert size <= 10_000 * 0.02
     assert size > 0
 
@@ -360,7 +361,7 @@ def test_exposure_shrinks_then_refuses_and_open_risk_now_binds() -> None:
 
 
 def test_planned_notional_is_the_stop_risk_size_under_the_ceiling() -> None:
-    assert planned_notional(RiskLimits(), CAPITAL, 0.01) == pytest.approx(180.0)
+    assert planned_notional(RiskLimits(max_order_notional_pct=0.02), CAPITAL, 0.01) == pytest.approx(180.0)
     assert planned_notional(_defaults(), CAPITAL, 0.08) == pytest.approx(1_250.0)
     assert planned_notional(_defaults(), CAPITAL, 0.0) == pytest.approx(2_250.0)
     assert planned_notional(_defaults(), math.nan, 0.02) == 0.0

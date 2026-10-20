@@ -203,7 +203,7 @@ function TopPicks({ selected, onSelect }: { selected: string; onSelect: (symbol:
     <section>
       <p className="mb-2 flex items-center text-sm text-neutral-500">
         Top 5 mais promissores
-        <Help text="Até cinco pares líquidos. Primeiro entram os setups do robô, com score e retorno líquido. Se faltarem cinco, entram altas do dia com volume: essas linhas não têm score nem estratégia e não são sinal de compra. Par em queda não entra. Clicar abre o gráfico." />
+        <Help text="Até cinco pares líquidos. Primeiro entram os setups do robô, com score e retorno líquido, lidos na vela ainda aberta (prévia da vela aberta): podem sumir até ela fechar, e o robô só entra com velas fechadas. Se faltarem cinco, entram altas do dia com volume: essas linhas não têm score nem estratégia e não são sinal de compra. Par em queda não entra. Clicar abre o gráfico." />
       </p>
       {phase === "loading" && <p className="text-sm text-neutral-500">Calculando o top 5…</p>}
       {phase === "error" && <p className="text-sm text-red-600">Não foi possível calcular os pares mais promissores.</p>}
@@ -228,6 +228,14 @@ function TopPicks({ selected, onSelect }: { selected: string; onSelect: (symbol:
                     {strategyName(row.strategy)} · score {row.score.toFixed(2)}
                   </span>
                   <span className={`block ${row.net_return >= 0 ? "text-green-600" : "text-red-600"}`}>{formatPct(row.net_return)} líquido</span>
+                  {row.forming_bar && (
+                    <span
+                      className="block text-xs text-amber-700 dark:text-amber-400"
+                      title="Lido na vela que ainda não fechou: o setup pode sumir até o fechamento. O robô só decide uma entrada com velas fechadas."
+                    >
+                      prévia da vela aberta
+                    </span>
+                  )}
                 </>
               ) : (
                 <>

@@ -14,6 +14,12 @@ def _load(tmp_path, data: dict) -> BotConfig:
     return BotConfig.load(path)
 
 
+def test_default_order_cap_is_25pct() -> None:
+    # The order cap is a safety ceiling only: the size comes from the risk per trade.
+    assert RiskLimits().max_order_notional_pct == 0.25
+    assert BotConfig().limits.max_order_notional_pct == 0.25
+
+
 def test_legacy_bot_json_keeps_its_saved_order_cap(tmp_path) -> None:
     config = _load(tmp_path, {"limits": {"max_order_notional_pct": 0.02, "max_exposure_pct": 0.5}})
     assert config.limits.max_order_notional_pct == 0.02

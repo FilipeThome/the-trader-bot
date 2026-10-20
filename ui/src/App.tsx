@@ -85,6 +85,20 @@ export function App() {
           <Help text="Quantas operações foram concluídas hoje neste ambiente." />
           <span>· violações evitadas {status.violations_avoided}</span>
           <Help text="Vezes em que uma ordem foi barrada porque passaria de um limite de risco, como tamanho, perda do dia ou número de posições." />
+          {(status.risk_state?.level === "cautious" || status.risk_state?.level === "reducing") && (
+            <>
+              <span className={status.risk_state.level === "reducing" ? "font-medium text-red-600" : "font-medium text-amber-600"}>
+                · {status.risk_state.level === "reducing" ? "modo só reduzir" : "modo cautela"}
+              </span>
+              <Help
+                text={
+                  status.risk_state.level === "reducing"
+                    ? "O patrimônio caiu além do drawdown máximo a partir do pico. Nenhuma compra nova; stops e saídas continuam. Volta sozinho quando a queda diminui. Detalhes em Controles."
+                    : "O patrimônio caiu além do primeiro degrau de drawdown. Cada trade arrisca a metade e entra no máximo uma posição por ciclo. Detalhes em Controles."
+                }
+              />
+            </>
+          )}
           <span>{status.halted ? "· halt ativo" : status.running ? "· em ciclo" : "· parado"}</span>
           <Help
             text={

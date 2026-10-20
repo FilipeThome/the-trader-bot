@@ -51,7 +51,10 @@ def is_usdt_pair(symbol: str) -> bool:
 class RiskLimits(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
-    max_order_notional_pct: float = 0.02
+    #: Safety ceiling of one order, as a share of the sizing capital: the size itself comes
+    #: from the risk per trade and the other caps (``RiskManager.sizing``). 0.25 is the default
+    #: of a fresh install only; a saved bot.json keeps its value until the operator changes it.
+    max_order_notional_pct: float = 0.25
     max_exposure_pct: float = 0.60
     #: Spot has no leverage. A saved value above 1 is read as 1.
     max_leverage: float = 1.0

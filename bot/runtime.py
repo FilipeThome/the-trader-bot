@@ -16,6 +16,16 @@ one position per pair, within the position slots, the open-risk limit and the
 cash (``bot.risk.allocate``). Orders are sized on the smaller of the configured
 capital and what the account holds; equity, daily loss and drawdown stay on
 the configured capital, so a withdrawal does not read as a loss.
+
+Each cycle reads the account's risk level once, after the exits (``_risk_state``):
+a drawdown past ``dd_reduce_pct`` halves the risk and allows one entry, past
+``max_drawdown_pct`` only exits run (REDUCING, which the executor enforces from
+``bot_state.risk_state``), and ``halt_drawdown_pct`` halts. The daily loss is
+measured on equity, open positions included, and pauses the day. A row trades
+only when the strategy passed validation on the row's timeframe and pair set,
+its Monte Carlo drawdown fits the limit, and the pair is neither demoted nor over
+its slippage budget; the market filter, the macro calendar and the signal age
+can hold entries back too.
 """
 
 from __future__ import annotations
@@ -23,7 +33,9 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from dataclasses import dataclass
+import math
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -33,16 +45,17 @@ import pandas as pd
 
 from bot.collector import Collector, MarketSnapshot
 from bot.config import BotConfig, RiskLimits
-from bot.decay import apply_decay
+from bot.decay import pair_demoted, pair_slippage_blocked, review_strategy
 from bot.evaluator import SPOT_TAKER, Opportunity, classify, estimate_win_rate
 from bot.exchange import service
 from bot.exchange.weight import weight_pressure
 from bot.executor import Executor, UnprotectedPosition
-from bot.indicators import ema
+from bot.indicators import atr_pct_daily, btc_trend_ok, ema
 from bot.instances import (
     ORDERS_PER_LEG,
     DcaParams,
     GridParams,
+    cooldown_ends,
     creation_problems,
     dca_ladder,
     dca_next,
@@ -61,7 +74,20 @@ from bot.live.mandate.store import load_mandate
 from bot.markets import merge_symbols, rank_promising, venue_symbols
 from bot.paths import base_runtime_root
 from bot.reports import append_ledger
-from bot.risk import LOSS_GUARD_WINDOW, RiskManager, allocate, breakeven_win_rate, open_risk, protect, utc_day
+from bot.risk import (
+    CLUSTER_ANCHOR,
+    LOSS_GUARD_WINDOW,
+    RiskManager,
+    RiskState,
+    allocate,
+    breakeven_win_rate,
+    open_risk,
+    planned_notional,
+    protect,
+    utc_day,
+    vol_target_cap,
+    vol_throttle,
+)
 from bot.store import Store
 from bot.strategies import (
     DAY_STRATEGIES,
@@ -73,6 +99,8 @@ from bot.strategies import (
     TrendBreakout,
     VwapPullback,
     exit_policy_for,
+    timeframe_passed,
+    timeframe_result,
     validated_for,
 )
 from bot.strategies.day import DAY_WIN_RATE_MARGIN, in_quiet_hours
@@ -99,6 +127,12 @@ _MOMENTUM = Momentum()
 RETENTION_DAYS = 30
 #: Seconds between two automatic choices of the analysed pairs.
 AUTO_SELECT_SECONDS = 3600
+#: Read every cycle, analysed or not: the market filter and the correlation cluster need it.
+MARKET_SYMBOL = CLUSTER_ANCHOR
+#: Exit frames of positions opened before the entry timeframe was recorded.
+LEGACY_EXIT_TIMEFRAMES = {"trend": "1h", "mean_reversion": "15m", "momentum": "4h"}
+#: Refusal of a strategy with no current validation, or one demoted to signal only.
+SIGNAL_ONLY = "estratégia em somente sinal: sem validação no histórico ou rebaixada"
 
 
 @dataclass(frozen=True)
@@ -111,6 +145,17 @@ class _Market:
     positions: frozenset[tuple[int, str, str, float]] = frozenset()
     #: Pairs this collect read: the analysed ones plus every pair with a live position.
     read: frozenset[str] = frozenset()
+    #: The account's taker fee per pair, when known (``service.trading_fees``).
+    takers: Mapping[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _PairInputs:
+    """What sizing reads of one pair in one cycle (``RiskManager.sizing``)."""
+
+    venue_cap: Any
+    atr_daily: float | None
+    throttle: float
 
 
 def profile_for(config: BotConfig) -> str:
@@ -143,7 +188,13 @@ class Runtime:
         #: Last (status, reason) recorded per (symbol, strategy): a setup re-read every cycle from the
         #: same closed bar is recorded once, when its decision changes, not 240 times per 4h bar.
         self._decided: dict[tuple[str, str], tuple[str, str]] = {}
-        self.executor = Executor(store, profile_for(config), exit_policy=config.exit_policy)
+        self.executor = Executor(
+            store,
+            profile_for(config),
+            exit_policy=config.exit_policy,
+            ledger=self._ledger,
+            exit_hysteresis=config.exit_hysteresis,
+        )
 
     @property
     def running(self) -> bool:
@@ -176,11 +227,15 @@ class Runtime:
             return {"status": "ok", "running": False}
 
     def halt(self, reason: str, *, flatten: bool | None = None, by: str = "file") -> dict[str, Any]:
-        """Stop the cycle, flatten when asked, then write the sticky HALT flag."""
+        """Stop the cycle, flatten when asked, then write the sticky HALT flag.
+
+        Without ``flatten``, the committed mandate's ``flatten_on_halt`` decides when a
+        mandate is on file, else the config's (D23).
+        """
         with self.lock:
             self.store.set_state("running", False)
             flattened: list[dict[str, Any]] = []
-            if flatten if flatten is not None else self.config.flatten_on_halt:
+            if flatten if flatten is not None else self._flatten_on_halt():
                 try:
                     flattened = self.executor.flatten()
                 except Exception as exc:  # noqa: BLE001 - the flag below must be written regardless
@@ -198,6 +253,10 @@ class Runtime:
             self._ledger("halt", {"reason": reason, "flattened": len(flattened), "flatten_failed": len(failed)})
             self.publish({"type": "halt", "reason": reason})
             return {"status": "ok", "halted": True, "reason": reason, "flatten": flattened}
+
+    def _flatten_on_halt(self) -> bool:
+        mandate = load_mandate("binance")
+        return bool(mandate.flatten_on_halt) if mandate is not None else self.config.flatten_on_halt
 
     def tick(self, *, now: datetime | None = None) -> dict[str, Any]:
         if not self._ticking.acquire(blocking=False):
@@ -256,8 +315,10 @@ class Runtime:
             reason = "par fora da lista analisada; aguarde o próximo ciclo"
             return {"results": [{"decision": "bloqueado", "reason": reason}], "cycle_started": False}
         if opportunity.status == "pronta" and opportunity.direction > 0:
-            self._protect([opportunity], datetime.now(timezone.utc))
-            if opportunity.status != "pronta" or not self._allocate([opportunity], self._free_cash()):
+            now = datetime.now(timezone.utc)
+            self._protect([opportunity], now)
+            returns = _returns(self.collector.view(), now)
+            if opportunity.status != "pronta" or not self._allocate([opportunity], self._free_cash(), returns=returns):
                 self.store.add_decision(
                     {
                         "symbol": opportunity.symbol,
@@ -421,9 +482,11 @@ class Runtime:
             taker=taker,
             spread=spread,
             params=params,
+            live_instances=len(self.store.instances(live_only=True)),
+            max_instances=limits.max_instances,
         )
         if cap is None:
-            problems.append("teto por ordem indisponível: confirme o mandato em Controles")
+            problems.append(self._missing_cap_reason())
         risk = open_risk(book, pending_risk=capital * limits.risk_per_trade_pct)
         risk_cap = capital * limits.max_open_risk_pct
         if risk + float(plan["loss_at_stop_usd"]) > risk_cap:
@@ -451,6 +514,13 @@ class Runtime:
             "plan": plan,
             "problems": problems,
         }
+
+    def _missing_cap_reason(self) -> str:
+        """Why ``service.order_notional_cap`` gave no cap, pointing at the fix: the mandate, or on
+        the Spot Testnet the per-order cap binance.json must set for the quote asset."""
+        if load_mandate("binance") is not None and self.config.mode != "production":
+            return "teto por ordem do testnet indisponível: defina testnet_max_order_notional em binance.json"
+        return "teto por ordem indisponível: confirme o mandato em Controles"
 
     def _quote(self, symbol: str) -> tuple[float, float, float] | None:
         """Bid, ask and last price of ``symbol``; None when unreadable."""
@@ -502,14 +572,17 @@ class Runtime:
             )
         return rows
 
-    def _instances(self, snapshot: MarketSnapshot, moment: datetime, *, clock_blocked: bool = False) -> None:
+    def _instances(
+        self, snapshot: MarketSnapshot, moment: datetime, *, clock_blocked: bool = False, state: RiskState | None = None
+    ) -> None:
         """One step of every live instance. A blocked clock never lets them buy, only sell and stop.
         The daily-loss limit refuses this cycle's buys and pauses the cycle until the next UTC day
-        (the broker stops keep protecting what they hold); a drawdown halts, which stops them all."""
+        (the broker stops keep protecting what they hold); REDUCING refuses their buys while their
+        sales and stops go on; the halt step stops them all. ``state`` is the cycle's risk state."""
         instances = self.store.instances(live_only=True)
         if not instances:
             return
-        buy_block = self._robot_buy_block(snapshot, moment, clock_blocked=clock_blocked)
+        buy_block = self._robot_buy_block(snapshot, moment, clock_blocked=clock_blocked, state=state)
         if self.halted:
             return
         for instance in instances:
@@ -528,29 +601,28 @@ class Runtime:
     def _instance_position(self, instance_id: int) -> dict[str, Any] | None:
         return next((row for row in self.store.live_positions() if row.get("instance_id") == instance_id), None)
 
-    def _robot_buy_block(self, snapshot: MarketSnapshot, moment: datetime, *, clock_blocked: bool) -> str | None:
+    def _robot_buy_block(
+        self, snapshot: MarketSnapshot, moment: datetime, *, clock_blocked: bool, state: RiskState | None = None
+    ) -> str | None:
         """Why DCA and grid instances may not buy now, or None.
 
         The clock rule of entries, the daily pause, the trades-per-day limit for new
-        inventory, and the account-wide limits strategy entries obey
-        (``RiskManager.portfolio_verdict``): a daily loss pauses the day and a drawdown halts
-        here too, so a bot running only robots stays inside them.
+        inventory, and the account's risk level strategy entries obey (``_risk_state``):
+        a daily loss pauses the day, REDUCING allows sales only and the halt step halts
+        here too, so a bot running only robots stays inside them. Without ``state`` the
+        level is read now.
         """
         if clock_blocked:
             return "relógio fora de 1s — só cancelamentos e saídas"
         paused = self.store.get_state("paused_until")
-        if paused and paused > moment.isoformat():
+        paused = bool(paused and paused > moment.isoformat())
+        if state is None and not paused:
+            state = self._risk_state(snapshot, moment)
+        if state is not None and (state.level in ("halt", "reducing") or state.pause_day):
+            return state.reason
+        if paused:
             return "pausado até o próximo dia UTC"
-        capital = self.config.capital_for_sizing()
-        day_pnl, equity, peak = self._equity(snapshot, moment)
-        verdict = RiskManager(self._limits(), capital, capital).portfolio_verdict(day_pnl=day_pnl, peak_equity=peak, equity=equity)
-        if verdict is None:
-            return None
-        if verdict.halt:
-            self.halt(verdict.reason)
-        elif verdict.pause_day:
-            self._pause_day(moment)
-        return verdict.reason
+        return None
 
     def _trade_limit(self, moment: datetime) -> str | None:
         """New inventory (a DCA round, a grid restart) counts as a trade, like a strategy entry."""
@@ -629,6 +701,9 @@ class Runtime:
                     took = state.get("exit") == "take_profit" and closed.get("status") == "closed"
                     state["position_id"] = None
                     return self._end(instance_id, "alvo do DCA atingido" if took else "rodada do DCA encerrada pelo stop ou à mão")
+                waiting = self._round_cooldown(int(state["position_id"]), params.cooldown_minutes, moment)
+                if waiting is not None:
+                    return waiting
             block = buy_block or self._trade_limit(moment)
             if block is not None:
                 return f"rodada do DCA em espera: {block}"
@@ -709,6 +784,10 @@ class Runtime:
             # The grid only sells below its range through the stop.
             if closed.get("status") == "closed" and float(closed.get("exit_price") or 0) < params.lower:
                 return self._end(instance_id, "o stop do grid executou")
+            # Sold out above the range floor: the restart from an empty inventory waits the cooldown.
+            waiting = self._round_cooldown(int(state["position_id"]), params.cooldown_minutes, moment)
+            if waiting is not None:
+                return waiting
         if position is not None:
             state["position_id"] = int(position["id"])
             raw = position.get("pending_leg")
@@ -772,6 +851,18 @@ class Runtime:
             )
         return f"grid vendeu {new_k - k} nível(is) a {price:.8g}: {result.get('status')}"
 
+    def _round_cooldown(self, position_id: int, minutes: int, moment: datetime) -> str | None:
+        """Why a new instance round waits: ``minutes`` after the previous round's position closed."""
+        if minutes <= 0:
+            return None
+        closed_at = (self.store.position(position_id) or {}).get("closed_at")
+        if not closed_at:
+            return None
+        ends = cooldown_ends(str(closed_at), minutes)
+        if moment < ends:
+            return f"pausa entre rodadas até {ends:%H:%M} UTC"
+        return None
+
     def close_position(self, position_id: int) -> dict[str, Any]:
         with self.lock:
             if self.halted:
@@ -797,7 +888,7 @@ class Runtime:
     # -- cycle ---------------------------------------------------------------
 
     def _collect(self, moment: datetime) -> "_Market":
-        """Network reads of one cycle, outside the lock: pairs, clock, candles and free USDT."""
+        """Network reads of one cycle, outside the lock: pairs, clock, candles, account fees and free USDT."""
         chosen = self._choose_pairs(moment)
         if chosen is not None:
             with self.lock:
@@ -806,14 +897,40 @@ class Runtime:
         # (a hand edit, the automatic choice): their stops and exits need fresh candles.
         # No cap here: every analysed pair is scored, so every one must be read too.
         # A DCA or grid instance needs its pair's price even while it holds nothing.
+        # BTC/USDT is always read: the market filter and the correlation cluster need it.
         instanced = [str(row["symbol"]) for row in self.store.instances(live_only=True)]
-        symbols = list(dict.fromkeys([*sorted(_held(self._positions())), *instanced, *self.config.symbols]))
+        symbols = list(
+            dict.fromkeys([*sorted(_held(self._positions())), *instanced, *self.config.symbols, MARKET_SYMBOL])
+        )
         self.collector.sync_clock()
         snapshot = self.collector.refresh(symbols)
         read = frozenset(symbols)
+        takers = self._account_takers(symbols)
         positions = self._positions()
         _refuse_blind(snapshot, _held(positions), read)
-        return _Market(snapshot=snapshot, cash=self._free_cash(), positions=positions, read=read)
+        return _Market(snapshot=snapshot, cash=self._free_cash(), positions=positions, read=read, takers=takers)
+
+    def _account_takers(self, symbols: list[str]) -> dict[str, float]:
+        """The account's taker fee of each pair (``service.trading_fees``), outside the lock.
+
+        A pair is read from Binance at most once a day (once an hour after a failure);
+        the cache it fills is what ``service.market_rules`` books fees with. Under API
+        weight pressure nothing is read; a failed read leaves the pair out, so scoring
+        keeps ``SPOT_TAKER``.
+        """
+        if self.retired or weight_pressure():
+            return {}
+        profile = profile_for(self.config)
+        takers: dict[str, float] = {}
+        for symbol in symbols:
+            try:
+                fees = service.trading_fees(symbol, profile)
+            except Exception:  # noqa: BLE001 - a fee read never fails the cycle
+                logger.exception("account fee read failed for %s", symbol)
+                continue
+            if fees is not None and _finite(fees[1]):
+                takers[symbol] = float(fees[1])
+        return takers
 
     def _positions(self) -> frozenset[tuple[int, str, str, float]]:
         return frozenset(
@@ -836,13 +953,18 @@ class Runtime:
             self.store.add_decision({"decision": "nao_operar", "reason": "relógio divergente", "symbol": "", "strategy": ""})
         if trading:
             self.executor.sync_positions()
+            self._mark(snapshot)
             if not snapshot.clock_blocked:
                 self._trail(snapshot)
             self._exits(snapshot, moment)
-            self._instances(snapshot, moment, clock_blocked=snapshot.clock_blocked)
+        # Once per cycle, after the exits: robots and entries obey the same level.
+        state = self._risk_state(snapshot, moment)
+        if trading:
+            self._instances(snapshot, moment, clock_blocked=snapshot.clock_blocked, state=state)
         self._decay(moment)
         capital = self._sizing_capital(cash, snapshot)
-        opportunities = self._score(snapshot, moment, capital)
+        returns = _returns(snapshot, moment)
+        opportunities = self._score(snapshot, moment, capital, state=state, takers=market.takers, returns=returns)
         self._protect([item for item in opportunities if item.status == "pronta"], moment)
         ready = [item for item in opportunities if item.status == "pronta"]
         entries: list[Opportunity] = []
@@ -850,12 +972,12 @@ class Runtime:
         # best score first, so the whole flow can be exercised without validated strategies.
         test_auto = self.config.test_mode_active
         if self.config.entry_mode == "auto":
-            eligible = [item for item in ready if (item.test_only and test_auto) or self._clears_floor(item)]
-            entries = self._allocate(eligible, cash)
+            eligible = [item for item in ready if self._auto_eligible(item, test_auto)]
+            entries = self._allocate(eligible, cash, returns=returns, max_entries=state.max_entries)
         else:
             # The operator picks one row at a time, so each row is checked on its own.
             for item in ready:
-                self._allocate([item], cash)
+                self._allocate([item], cash, returns=returns, max_entries=state.max_entries)
         self.store.replace_opportunities([item.to_dict() for item in opportunities])
         acted: list[dict[str, Any]] = []
         if trading and self.running and not snapshot.clock_blocked and self.config.entry_mode == "auto":
@@ -874,6 +996,19 @@ class Runtime:
         self._ledger("tick", payload)
         self.publish({"type": "tick", **payload, "rows": [item.to_dict() for item in opportunities]})
         return payload
+
+    def _auto_eligible(self, item: Opportunity, test_auto: bool) -> bool:
+        """Whether automatic trading may take a ready row: its hit rate (or the test mode),
+        and a signal no older than ``max_signal_age_seconds`` (D21). A late row stays ready
+        for a manual or armed entry and says why the automatic one skipped it."""
+        if not ((item.test_only and test_auto) or self._clears_floor(item)):
+            return False
+        limit = self.config.limits.max_signal_age_seconds
+        age = item.signal_age_seconds
+        if limit > 0 and age is not None and age > limit:
+            item.reason = f"{item.reason}; sinal com {age:.0f} s de atraso: sem entrada automática"
+            return False
+        return True
 
     def _clears_floor(self, item: Opportunity) -> bool:
         """Whether a real (non-test) row's estimated hit rate allows an automatic entry.
@@ -980,8 +1115,19 @@ class Runtime:
         mandate = load_mandate("binance")
         return self.config.tightened(mandate.hard_caps if mandate else None)
 
-    def _allocate(self, rows: list[Opportunity], cash: float | None) -> list[Opportunity]:
-        """Open risk is measured on the configured capital, like equity; rows are already sized."""
+    def _allocate(
+        self,
+        rows: list[Opportunity],
+        cash: float | None,
+        *,
+        returns: Mapping[str, list[float]] | None = None,
+        max_entries: int | None = None,
+    ) -> list[Opportunity]:
+        """Open risk is measured on the configured capital, like equity; rows are already sized.
+
+        ``returns`` (hourly, BTC/USDT included) turns on the correlation count across this
+        cycle's rows and the BTC cluster's risk cap; ``max_entries`` is the risk level's.
+        """
         if not rows:
             return []
         return allocate(
@@ -992,6 +1138,8 @@ class Runtime:
             limits=self._limits(),
             min_notional=self._min_notional,
             min_profit_usd=self.config.min_profit_usd,
+            returns_by_symbol=returns,
+            max_entries=max_entries,
         )
 
     def _min_notional(self, symbol: str) -> float | None:
@@ -1032,6 +1180,13 @@ class Runtime:
     def _policy(self, position: dict[str, Any]) -> str:
         """The exit rule a position opened under; rows from before it was recorded follow the config."""
         return str(position.get("exit_policy") or self.config.exit_policy)
+
+    def _mark(self, snapshot: MarketSnapshot) -> None:
+        """Record each open position's lowest and highest last price (MAE and MFE). No order."""
+        for position in self.store.open_positions():
+            price = _last_price(snapshot, position["symbol"], "15m")
+            if price is not None and price > 0:
+                self.executor.mark(int(position["id"]), Decimal(str(price)))
 
     def _trail(self, snapshot: MarketSnapshot) -> None:
         positions = self.store.open_positions()
@@ -1092,20 +1247,16 @@ class Runtime:
             self._ledger("take_profit", {"symbol": position["symbol"], "position_id": position["id"], "outcome": outcome})
 
     def _decay(self, moment: datetime) -> None:
+        """Once per UTC day: demote a strategy whose live evidence contradicts its backtest
+        (``decay.review_strategy``), then prune old history."""
         day = utc_day(moment)
         if self.store.get_state("decay_day") == day:
             return
         capital = self.config.capital_for_sizing()
         for strategy_id in STRATEGIES:
-            if apply_decay(self.store, strategy_id, self.store.strategy_daily_returns(strategy_id, capital)):
-                self.store.add_decision(
-                    {
-                        "symbol": "",
-                        "strategy": strategy_id,
-                        "decision": "rebaixada",
-                        "reason": "Sharpe dos últimos 30 dias abaixo de metade do backtest",
-                    }
-                )
+            reason = review_strategy(self.store, strategy_id, capital=capital, now=moment)
+            if reason:
+                self.store.add_decision({"symbol": "", "strategy": strategy_id, "decision": "rebaixada", "reason": reason})
         self.store.set_state("decay_day", day)
         # Once a day, drop history older than the retention window; positions and PnL stay.
         # Housekeeping: a failure is logged and never fails the cycle.
@@ -1118,71 +1269,126 @@ class Runtime:
         if any(pruned.values()):
             self._ledger("prune", pruned)
 
-    def _score(self, snapshot: MarketSnapshot, moment: datetime, sizing_capital: float) -> list[Opportunity]:
+    def _score(
+        self,
+        snapshot: MarketSnapshot,
+        moment: datetime,
+        sizing_capital: float,
+        *,
+        state: RiskState | None = None,
+        takers: Mapping[str, float] | None = None,
+        returns: dict[str, list[float]] | None = None,
+    ) -> list[Opportunity]:
+        """Every enabled strategy's setup on every analysed pair: classified, checked and sized.
+
+        ``state`` is the cycle's risk level (read now when absent), ``takers`` the account's
+        taker fee per pair, and ``returns`` the closed hourly returns, BTC/USDT included.
+        """
         capital = self.config.capital_for_sizing()
-        risk = RiskManager(self._limits(), capital, sizing_capital)
+        limits = self._limits()
+        if state is None:
+            state = self._risk_state(snapshot, moment)
+        risk = RiskManager(limits, capital, sizing_capital, risk_scale=state.risk_scale)
+        if returns is None:
+            returns = _returns(snapshot, moment)
+        takers = takers or {}
+        profile = profile_for(self.config)
         ignored = self.store.ignored_keys(moment)
         positions = self.store.open_positions()
         live = {(row["symbol"], row["strategy"]) for row in self.store.live_positions()}
-        exposure = sum(abs(float(row["qty"]) * float(row["avg_price"])) for row in positions)
+        # Exposure at the last price, as the gate values it.
+        held_usd = _held_usd(positions, snapshot)
+        exposure = sum(abs(value) for value in held_usd.values())
         exposure += sum(float(row.get("reserved_usd") or 0) for row in self._book() if row["status"] == "reserved")
         day = utc_day(moment)
         day_pnl, equity, peak = self._equity(snapshot, moment)
         self.store.record_equity(equity, moment.isoformat(), pnl=equity - capital)
-        returns = _returns(snapshot)
         trades_today = self.store.trades_today(day)
+        market_block = self._market_block(snapshot, moment)
+        macro_block = self._macro_block(moment)
+        saved = self.store.get_state("pair_blocked")
+        blocks: dict[str, str] = dict(saved) if isinstance(saved, dict) else {}
+        enabled = {key: value for key, value in STRATEGIES.items() if self.config.strategies.get(key, False)}
+        stats_by_id = {strategy_id: self.store.strategy(strategy_id) for strategy_id in enabled}
         ranked: list[Opportunity] = []
         for symbol in self.config.symbols:
             if symbol in snapshot.failed:
                 # Its candles are from an earlier cycle: no setup is read from them.
                 continue
-            for strategy_id, strategy in STRATEGIES.items():
-                if not self.config.strategies.get(strategy_id, False):
-                    continue
-                setup = _setup(strategy, symbol, snapshot, self.config.funding_annualized_threshold, moment)
+            inputs: _PairInputs | None = None
+            slippage_block: str | None = None
+            for strategy_id, strategy in enabled.items():
+                stats = stats_by_id[strategy_id]
+                params = stats["params"] if stats is not None else None
+                # A validation run under other rules (exit, market filter, hysteresis) does not validate these.
+                keyed = stats is not None and validated_for(
+                    params,
+                    strategy_id,
+                    self.config.exit_policy,
+                    market_filter=self.config.market_filter,
+                    hysteresis=self.config.exit_hysteresis,
+                )
+                passed = tuple(tf for tf in strategy.timeframes if keyed and timeframe_passed(params, tf))
+                setup = _setup(strategy, symbol, snapshot, self.config.funding_annualized_threshold, moment, passed)
                 if setup is None:
                     # The setup is gone: the next one is a new decision.
                     self._decided.pop((symbol, strategy_id), None)
                     continue
-                stats = self.store.strategy(strategy_id)
+                if inputs is None:
+                    inputs = self._pair_inputs(symbol, snapshot, moment, limits, profile)
+                    slippage_block = self._pair_block(
+                        blocks, symbol, None, "slippage",
+                        pair_slippage_blocked(self.store, symbol, limits.slippage_budget_pct, now=moment),
+                    )
                 policy = exit_policy_for(strategy_id, self.config.exit_policy)
                 fixed = parse_fixed(policy)
                 if fixed is not None:
                     setup = fixed.apply(setup)
-                # A validation run under other exit rules does not validate these.
-                matches = stats is not None and validated_for(stats["params"], strategy_id, self.config.exit_policy)
-                signal_only = stats is None or bool(stats["signal_only"]) or not matches
+                result = timeframe_result(params, setup.timeframe) if keyed else None
+                signal_reason = self._signal_only_reason(
+                    stats, keyed, result, setup.timeframe, symbol, strategy_id, limits, moment, blocks
+                )
                 win_rate, win_rate_n = estimate_win_rate(
-                    stats["params"] if stats and matches else None,
+                    {"exit_policy": params.get("exit_policy"), **result} if params and result is not None else None,
                     self.store.strategy_outcomes(strategy_id, policy),
                     exit_policy=policy,
                     min_sample=self.config.min_win_rate_sample,
                 )
                 stale = snapshot.stale(symbol, _price_interval(setup.timeframe), now=moment)
-                # Day signals skip the thin hours whatever rule they exit by.
-                quiet = strategy_id in DAY_STRATEGIES and in_quiet_hours(moment)
                 draft = classify(
                     setup,
-                    slippage=snapshot.slippage(symbol, 1000),
-                    blocked_reason="hora sem liquidez: sem entrada de day trade entre 03:00 e 07:00 UTC" if quiet else None,
+                    slippage=snapshot.slippage(symbol, planned_notional(limits, sizing_capital, setup.stop_pct)),
+                    blocked_reason=_entry_block(strategy_id, moment, macro_block, slippage_block, market_block),
                     ignored=(symbol, strategy_id) in ignored,
                     in_position=(symbol, strategy_id) in live,
                     score_threshold=self.config.score_threshold,
                     cost_multiple=self.config.cost_multiple,
                     # The operator chose the payoff of a fixed rule; the hit-rate floor judges it.
                     min_reward_risk=0.0 if fixed is not None else self.config.min_reward_risk,
+                    # Never cheaper than the backtest's fee, whatever discount the account has.
+                    taker=max(SPOT_TAKER, takers.get(symbol, SPOT_TAKER)),
                 )
                 draft.data_age_seconds = _age(snapshot, symbol, setup.timeframe, moment)
+                draft.signal_age_seconds = _signal_age(snapshot, symbol, setup.timeframe, moment)
+                # The executor re-applies the target distance on the average fill.
+                draft.plan_target_pct = setup.target_pct if setup.target_pct > 0 else None
                 draft.win_rate = win_rate
                 draft.win_rate_n = win_rate_n
                 if self.config.test_mode_active and setup.market == "spot" and setup.direction > 0:
                     waivable = draft.status == "potencial" and draft.blocker in TESTABLE_BLOCKERS
-                    if waivable or (draft.status == "pronta" and signal_only):
+                    if waivable or (draft.status == "pronta" and signal_reason is not None):
                         draft.status = "pronta"
                         draft.test_only = True
                         draft.reason = f"[teste] {draft.reason}"
                 if draft.status == "em_posicao":
                     draft.action = "Manter; stop na corretora"
+                refuse_signal = signal_reason is not None and draft.status == "pronta" and not draft.test_only
+                vol_cap: float | None = None
+                if draft.status == "pronta" and not refuse_signal:
+                    planned = risk.sizing(
+                        draft, venue_cap_usd=inputs.venue_cap, atr_daily_pct=inputs.atr_daily, throttle=inputs.throttle
+                    )
+                    vol_cap = vol_target_cap(limits, sizing_capital, held_usd, symbol, planned.size_usd, returns)
                 verdict = risk.assess(
                     draft,
                     open_positions=positions,
@@ -1193,14 +1399,21 @@ class Runtime:
                     trades_today=trades_today,
                     returns_by_symbol=returns,
                     stale=stale,
-                    signal_only=signal_only and draft.status == "pronta" and not draft.test_only,
+                    signal_only=refuse_signal,
+                    state=state,
+                    venue_cap_usd=inputs.venue_cap,
+                    atr_daily_pct=inputs.atr_daily,
+                    throttle=inputs.throttle,
+                    vol_target_cap_usd=vol_cap,
                 )
                 if draft.status == "pronta" and not verdict.allowed:
                     draft.status = "bloqueada"
-                    draft.reason = verdict.reason
+                    draft.reason = signal_reason if refuse_signal and not stale and signal_reason else verdict.reason
                     self.store.record_day(day, violations_avoided=1)
                 if verdict.allowed:
                     draft.size_usd = verdict.size_usd
+                draft.size_limit = verdict.size_limit or None
+                draft.size_caps = verdict.caps or None
                 price = _last_price(snapshot, symbol, setup.timeframe)
                 if price and draft.direction > 0:
                     draft.stop_price = price * (1 - draft.risk_pct)
@@ -1218,15 +1431,107 @@ class Runtime:
                     )
                     # Marked after the write: a failed insert is retried next cycle.
                     self._decided[(symbol, strategy_id)] = (draft.status, draft.reason)
-                # The robots' gate may have halted on the same drawdown earlier in this cycle.
-                if verdict.halt:
-                    if not self.halted:
-                        self.halt(verdict.reason)
-                    return sorted(ranked, key=lambda item: item.score, reverse=True)
-                if verdict.pause_day:
-                    self._pause_day(moment)
         ranked.sort(key=lambda item: item.score, reverse=True)
         return ranked
+
+    def _signal_only_reason(
+        self,
+        stats: dict[str, Any] | None,
+        keyed: bool,
+        result: dict[str, Any] | None,
+        timeframe: str,
+        symbol: str,
+        strategy_id: str,
+        limits: RiskLimits,
+        moment: datetime,
+        blocks: dict[str, str],
+    ) -> str | None:
+        """Why a setup may only signal, or None when it may trade (6.5, 6.12).
+
+        The validation must hold for the current rules, the setup's own timeframe must have
+        passed, the pair must belong to the validated set, the Monte Carlo drawdown at the
+        risk per trade (``mc_p95_dd_r × risk_per_trade_pct``) must stay under
+        ``max_drawdown_pct``, and the strategy must not be demoted on this pair.
+        """
+        if stats is None or bool(stats.get("signal_only")) or not keyed:
+            return SIGNAL_ONLY
+        if not (result and result.get("passed")):
+            return f"somente sinal: o timeframe {timeframe} não passou na validação"
+        if symbol not in ((stats.get("params") or {}).get("symbols") or ()):
+            return f"somente sinal: {symbol} fora do conjunto de pares validado"
+        mc = result.get("mc_p95_dd_r")
+        drawdown = float(mc or 0) * limits.risk_per_trade_pct if _finite(mc) else 0.0
+        if drawdown >= limits.max_drawdown_pct:
+            return (
+                f"somente sinal — Monte Carlo: drawdown p95 de {_pct(drawdown)} passa do limite "
+                f"de {_pct(limits.max_drawdown_pct)}"
+            )
+        return self._pair_block(
+            blocks, symbol, strategy_id, "expectancy", pair_demoted(self.store, strategy_id, symbol, now=moment)
+        )
+
+    def _pair_block(
+        self, blocks: dict[str, str], symbol: str, strategy: str | None, kind: str, reason: str | None
+    ) -> str | None:
+        """Return ``reason``, writing a ``pair_blocked`` ledger event when the pair's block changed.
+
+        ``blocks`` is ``bot_state.pair_blocked`` of this cycle; it is saved on each change.
+        """
+        key = f"{symbol}|{strategy or ''}|{kind}"
+        if blocks.get(key) != reason:
+            if reason is None:
+                blocks.pop(key, None)
+            else:
+                blocks[key] = reason
+            self.store.set_state("pair_blocked", blocks)
+            self._ledger(
+                "pair_blocked",
+                {"symbol": symbol, "strategy": strategy, "reason": kind, "blocked": reason is not None, "detail": reason},
+            )
+        return reason
+
+    def _pair_inputs(
+        self, symbol: str, snapshot: MarketSnapshot, moment: datetime, limits: RiskLimits, profile: str
+    ) -> _PairInputs:
+        """The venue cap, the daily ATR and the 7-day volatility throttle of one pair, from closed 4h bars.
+
+        The cap is read from the mandate and binance.json (no network); an unreadable one allows nothing.
+        """
+        four_hour = _closed(snapshot, symbol, "4h", moment)
+        atr = atr_pct_daily(four_hour) if four_hour is not None else None
+        throttle = vol_throttle(four_hour["close"].to_numpy(), limits.vol_throttle_ratio) if four_hour is not None else 1.0
+        try:
+            cap: Any = service.order_notional_cap(symbol, profile)
+        except Exception:  # noqa: BLE001 - an unreadable cap sizes the order to zero
+            logger.exception("order cap read failed for %s", symbol)
+            cap = Decimal(0)
+        return _PairInputs(cap, atr, throttle)
+
+    def _market_block(self, snapshot: MarketSnapshot, moment: datetime) -> str | None:
+        """The market filter (D13): with ``btc_ema40d``, no entry while BTC's last closed 4h close
+        is under its 240-bar EMA, nor while BTC could not be read."""
+        if self.config.market_filter == "off":
+            return None
+        frame = None if MARKET_SYMBOL in snapshot.failed else _closed(snapshot, MARKET_SYMBOL, "4h", moment)
+        if frame is None:
+            return "filtro de mercado: BTC sem leitura neste ciclo"
+        if not btc_trend_ok(frame["close"]):
+            return "filtro de mercado: BTC abaixo da EMA de 40 dias"
+        return None
+
+    def _macro_block(self, moment: datetime) -> str | None:
+        """The operator's macro calendar (D21): day entries pause within ``macro_pause_minutes`` of an event.
+        A convention of the operator: the backtest does not replay it."""
+        minutes = self.config.macro_pause_minutes
+        if minutes <= 0:
+            return None
+        window = timedelta(minutes=minutes)
+        for raw in self.config.macro_events_utc:
+            event = datetime.fromisoformat(raw)
+            event = event if event.tzinfo else event.replace(tzinfo=timezone.utc)
+            if abs(moment - event) <= window:
+                return f"pausa de evento macro até {event + window:%H:%M} UTC"
+        return None
 
     def _equity(self, snapshot: MarketSnapshot, moment: datetime) -> tuple[float, float, float]:
         """Today's net PnL, the equity (configured capital, every closed day, the open positions
@@ -1240,6 +1545,80 @@ class Runtime:
         capital = self.config.capital_for_sizing()
         pnl = sum(float(row["net_pnl"]) for row in days) + _unrealized(positions, snapshot)
         return day_pnl, capital + pnl, capital + max(self.store.peak_pnl(), pnl)
+
+    def _risk_state(self, snapshot: MarketSnapshot, moment: datetime) -> RiskState:
+        """The account's risk level of this cycle (D5, D20), acted on and stored for the executor.
+
+        The drawdown is measured from the PnL peak and the daily loss on equity (open
+        positions at the last price) against the first cycle of the UTC day. The level is
+        stored in ``bot_state.risk_state``, where the executor refuses every buy while it is
+        ``reducing``; the halt step is stored as ``reducing`` too, so buys stay refused after
+        a manual resume until the drawdown recovers. A change of level goes to the ledger and
+        the panel. The halt step halts; the daily loss exits the day trades first when
+        ``flatten_day_on_daily_loss`` is on and the cycle runs, then pauses the day.
+        """
+        capital = self.config.capital_for_sizing()
+        day_pnl, equity, peak = self._equity(snapshot, moment)
+        day_change = self._day_change(moment, equity, capital, day_pnl)
+        previous = self.store.get_state("risk_state")
+        previous = previous if isinstance(previous, dict) else None
+        state = RiskManager(self._limits(), capital, capital).portfolio_state(
+            day_change=day_change, peak_equity=peak, equity=equity, previous=previous
+        )
+        self._save_risk_state(state, previous, moment)
+        if state.level == "halt":
+            if not self.halted:
+                self.halt(state.reason)
+            return state
+        if state.pause_day:
+            if self.config.flatten_day_on_daily_loss and self.running and not self.halted:
+                self._flatten_day_trades()
+            self._pause_day(moment)
+        return state
+
+    def _day_change(self, moment: datetime, equity: float, capital: float, day_pnl: float) -> float:
+        """Equity now minus the equity at the start of the UTC day (``bot_state.day_start_equity``).
+
+        The start is written by the first cycle of the day, less what closed earlier that day
+        (a bot started mid-day still counts the day's realised loss). A change of the configured
+        capital moves the equity, not the result, so it is netted out.
+        """
+        day = utc_day(moment)
+        start = self.store.get_state("day_start_equity")
+        if not isinstance(start, dict) or start.get("day") != day or not _finite(start.get("equity")):
+            if not (_finite(equity) and _finite(day_pnl)):
+                return math.nan
+            start = {"day": day, "equity": equity - day_pnl, "capital": capital}
+            self.store.set_state("day_start_equity", start)
+        base = float(start["capital"]) if _finite(start.get("capital")) else capital
+        return (equity - capital) - (float(start["equity"]) - base)
+
+    def _save_risk_state(self, state: RiskState, previous: dict[str, Any] | None, moment: datetime) -> None:
+        level = "reducing" if state.level == "halt" else state.level
+        before = str((previous or {}).get("level") or "normal")
+        since = (previous or {}).get("since") if before == level else None
+        record = {
+            "level": level,
+            "since": since or moment.isoformat(),
+            "drawdown": round(state.drawdown, 6),
+            "reason": state.reason,
+        }
+        if record != previous:
+            self.store.set_state("risk_state", record)
+        if level != before:
+            self._ledger("risk_state", {"from": before, "to": level, "drawdown": state.drawdown, "reason": state.reason})
+            self.publish({"type": "risk_state", **record})
+
+    def _flatten_day_trades(self) -> None:
+        """Exit every open day trade before the daily pause (``flatten_day_on_daily_loss``)."""
+        positions = [row for row in self.store.open_positions() if self._policy(row) == "day"]
+        if not positions:
+            return
+        results = []
+        for position in positions:
+            result = self.executor.exit_position(int(position["id"]), "perda diária: day trade zerado antes da pausa")
+            results.append({"position_id": position["id"], "symbol": position["symbol"], "status": result.get("status")})
+        self._ledger("daily_loss_flatten", {"positions": len(positions), "results": results})
 
     def _pause_day(self, moment: datetime) -> None:
         """Stop the cycle until the next UTC day: the daily-loss limit."""
@@ -1278,23 +1657,26 @@ def _target_reason(position: dict[str, Any], snapshot: MarketSnapshot) -> str | 
 def _exit_reason(
     position: dict[str, Any], snapshot: MarketSnapshot, moment: datetime, *, use_target: bool = True
 ) -> str | None:
-    """Target (unless the stop trails instead) and the strategy's own exit."""
+    """Target (unless the stop trails instead) and the strategy's own exit.
+
+    The exit reads the closed bars of the timeframe the position entered on, as the
+    replay does, with the exit hysteresis it entered with. A row from before both were
+    recorded keeps the old frames (``LEGACY_EXIT_TIMEFRAMES``) and exits without hysteresis.
+    """
     symbol = position["symbol"]
     if use_target and (reached := _target_reason(position, snapshot)):
         return reached
-    strategy = position["strategy"]
-    hourly = _closed(snapshot, symbol, "1h", moment)
-    if strategy == "trend" and hourly is not None:
-        reason = _TREND.exit_reason(hourly, "buy")
-        if reason:
-            return reason
-    if strategy == "momentum":
-        four_hour = _closed(snapshot, symbol, "4h", moment)
-        reason = _MOMENTUM.exit_reason(four_hour, "buy") if four_hour is not None else None
+    strategy = str(position["strategy"])
+    timeframe = str(position.get("timeframe") or LEGACY_EXIT_TIMEFRAMES.get(strategy, "1h"))
+    hysteresis = bool(position.get("exit_hysteresis"))
+    if strategy in ("trend", "momentum"):
+        frame = _closed(snapshot, symbol, timeframe, moment)
+        rule = _TREND if strategy == "trend" else _MOMENTUM
+        reason = rule.exit_reason(frame, "buy", hysteresis=hysteresis) if frame is not None else None
         if reason:
             return reason
     if strategy == "mean_reversion":
-        frame = _closed(snapshot, symbol, "15m", moment)
+        frame = _closed(snapshot, symbol, timeframe, moment)
         if frame is not None and len(frame) >= 20 and float(frame["close"].iloc[-1]) >= float(ema(frame["close"], 20).iloc[-1]):
             return "preço voltou à média"
     return None
@@ -1310,8 +1692,18 @@ def _unrealized(positions: list[dict[str, Any]], snapshot: MarketSnapshot) -> fl
 
 
 def _setup(
-    strategy: Strategy, symbol: str, snapshot: MarketSnapshot, funding_threshold: float, moment: datetime
+    strategy: Strategy,
+    symbol: str,
+    snapshot: MarketSnapshot,
+    funding_threshold: float,
+    moment: datetime,
+    passed: tuple[str, ...] = (),
 ) -> Setup | None:
+    """The strategy's setup on the pair's closed bars, or None.
+
+    A swing strategy tries its timeframes in order, the ones in ``passed`` (validated)
+    first, so a setup on a validated timeframe is preferred to one that may only signal.
+    """
     if isinstance(strategy, (IntradayMomentum, VwapPullback)):
         # 15m entries filtered by the closed 1h bars (bot.strategies.day).
         entry = _closed(snapshot, symbol, "15m", moment)
@@ -1331,7 +1723,8 @@ def _setup(
             threshold=funding_threshold,
         )
         return found
-    for timeframe in strategy.timeframes:
+    ordered = [tf for tf in strategy.timeframes if tf in passed] + [tf for tf in strategy.timeframes if tf not in passed]
+    for timeframe in ordered:
         frame = _closed(snapshot, symbol, timeframe, moment)
         if frame is None:
             continue
@@ -1403,13 +1796,62 @@ def _age(snapshot: MarketSnapshot, symbol: str, timeframe: str, moment: datetime
     return (moment - series.fetched_at).total_seconds()
 
 
-def _returns(snapshot: MarketSnapshot) -> dict[str, list[float]]:
+def _signal_age(snapshot: MarketSnapshot, symbol: str, timeframe: str, moment: datetime) -> float | None:
+    """Seconds since the bar that produced the signal closed; None without a closed bar of that width."""
+    width = _BAR.get(timeframe)
+    frame = _closed(snapshot, symbol, timeframe, moment) if width is not None else None
+    if frame is None or width is None:
+        return None
+    closed_at = pd.Timestamp(frame.index[-1]) + width
+    return max(0.0, float((pd.Timestamp(moment) - closed_at).total_seconds()))
+
+
+def _entry_block(
+    strategy_id: str, moment: datetime, macro: str | None, slippage: str | None, market: str | None
+) -> str | None:
+    """Why no entry of this strategy may open now, whatever its score: day trades skip the
+    thin hours and the macro windows, a pair over its slippage budget takes no entry, and
+    the market filter holds every entry."""
+    if strategy_id in DAY_STRATEGIES:
+        if in_quiet_hours(moment):
+            return "hora sem liquidez: sem entrada de day trade entre 03:00 e 07:00 UTC"
+        if macro:
+            return macro
+    return slippage or market
+
+
+def _held_usd(positions: list[dict[str, Any]], snapshot: MarketSnapshot) -> dict[str, float]:
+    """What each held pair is worth at the last price (the average price when unread)."""
+    held: dict[str, float] = {}
+    for row in positions:
+        price = _last_price(snapshot, row["symbol"], "15m") or float(row["avg_price"] or 0)
+        held[str(row["symbol"])] = held.get(str(row["symbol"]), 0.0) + float(row["qty"] or 0) * price
+    return held
+
+
+def _returns(snapshot: MarketSnapshot, moment: datetime | None = None) -> dict[str, list[float]]:
+    """Hourly returns of every pair read, on closed bars when ``moment`` is given."""
     out: dict[str, list[float]] = {}
     for (symbol, interval), series in snapshot.candles.items():
         if interval != "1h" or series.frame.empty:
             continue
-        out[symbol] = series.frame["close"].pct_change().dropna().tolist()
+        frame = _closed(snapshot, symbol, "1h", moment) if moment is not None else series.frame
+        if frame is None:
+            continue
+        out[symbol] = frame["close"].pct_change().dropna().tolist()
     return out
+
+
+def _finite(value: Any) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _pct(value: float) -> str:
+    """A share as a percentage with at most one decimal: 0.05 → 5%, 0.075 → 7.5%."""
+    return f"{value:.1%}".replace(".0%", "%")
 
 
 def mode_root(config: BotConfig) -> Path:

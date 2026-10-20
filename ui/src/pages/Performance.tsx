@@ -1,12 +1,40 @@
-import { useEffect, useRef } from "react";
+import { type ReactNode, useEffect, useRef } from "react";
 import * as echarts from "echarts";
 
 import { Help } from "../Help";
+import { stopWindowKinds, strategyName } from "../labels";
+import { formatR } from "../numbers";
 import { useBot } from "../store";
+import type { Status, TimeframeResult } from "../types";
+
+/** The deflated Sharpe the gate needs (runner.MIN_DSR). */
+const MIN_DSR = 0.95;
+
+function pct(value: number | null | undefined, digits = 1): string {
+  if (value == null || !Number.isFinite(value)) return "—";
+  return `${(value * 100).toFixed(digits).replace(".", ",")}%`;
+}
+
+function num(value: number | null | undefined, digits = 2): string {
+  if (value == null || !Number.isFinite(value)) return "—";
+  return value.toFixed(digits).replace(".", ",");
+}
+
+function ms(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "—";
+  return value >= 1000 ? `${num(value / 1000, 1)} s` : `${Math.round(value)} ms`;
+}
+
+function day(iso: string): string {
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? iso : date.toLocaleDateString("pt-BR");
+}
 
 export function Performance() {
   const days = useBot((state) => state.days);
   const calibration = useBot((state) => state.calibration);
+  const pairs = useBot((state) => state.pairs);
+  const status = useBot((state) => state.status);
   const dark = useBot((state) => state.dark);
   const node = useRef<HTMLDivElement>(null);
 
@@ -38,6 +66,7 @@ export function Performance() {
   const csv = ["day,net_pnl,gross_pnl,fees,slippage,funding,trades", ...days.map((day) =>
     [day.day, day.net_pnl, day.gross_pnl, day.fees, day.slippage, day.funding, day.trades].join(","),
   )].join("\n");
+  const budget = status?.limits.slippage_budget_pct;
 
   return (
     <section>
@@ -80,6 +109,217 @@ export function Performance() {
           </tbody>
         </table>
       )}
+
+      <div className="mt-8 grid gap-6 text-sm lg:grid-cols-2">
+        <StopWindows status={status} />
+        <div>
+          <p className="mb-2 flex items-center font-medium">
+            Derrapagem por par (30 dias)
+            <Help text={`Diferença entre o preço de referência e o executado, somando entrada e saída, na média dos últimos 20 trades fechados do par. Acima do orçamento de ${pct(budget, 2)}, o par fica bloqueado para entradas novas até a média voltar ou os trades saírem da janela de 30 dias. As posições abertas seguem com stop e saídas.`} />
+          </p>
+          {pairs.length === 0 ? (
+            <p className="text-neutral-500">Nenhum par analisado.</p>
+          ) : (
+            <table className="text-left">
+              <thead className="text-neutral-500">
+                <tr>
+                  <th className="pr-4 font-medium">Par</th>
+                  <th className="pr-4 font-medium">Trades</th>
+                  <th className="pr-4 font-medium">Ida e volta</th>
+                  <th className="font-medium">Situação</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pairs.map((row) => (
+                  <tr key={row.symbol} className="border-t border-neutral-200 dark:border-neutral-800">
+                    <td className="pr-4">{row.symbol}</td>
+                    <td className="pr-4">{row.trades}</td>
+                    <td className={`pr-4 ${budget != null && row.slippage_rt != null && budget > 0 && row.slippage_rt > budget ? "text-red-600" : ""}`}>
+                      {pct(row.slippage_rt, 2)}
+                    </td>
+                    <td className={row.blocked ? "font-medium text-red-600" : "text-neutral-500"}>
+                      {row.blocked ? `bloqueado${row.blocked_reason ? `: ${row.blocked_reason}` : ""}` : "liberado"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+
+      <Validation status={status} />
     </section>
+  );
+}
+
+function StopWindows({ status }: { status: Status | null }) {
+  const stats = status?.stop_windows;
+  const kinds = Object.entries(stats?.by_kind ?? {});
+  return (
+    <div>
+      <p className="mb-2 flex items-center font-medium">
+        Janela sem stop (30 dias)
+        <Help text="Para trocar um stop (stop móvel, TP1 do day trade, venda parcial, novo stop depois de uma compra), o robô cancela o antigo e põe o novo. Entre os dois, a posição fica sem stop na corretora. Aqui está quanto durou essa janela: média, p95 (95% das trocas foram mais rápidas) e a pior." />
+      </p>
+      {!stats || stats.count === 0 ? (
+        <p className="text-neutral-500">Nenhuma troca de stop nos últimos 30 dias.</p>
+      ) : (
+        <>
+          <p>
+            {stats.count} trocas · média {ms(stats.mean_ms)} · p95 {ms(stats.p95_ms)} · pior{" "}
+            <span className={(stats.max_ms ?? 0) > 2000 ? "text-red-600" : ""}>{ms(stats.max_ms)}</span>
+          </p>
+          {kinds.length > 0 && (
+            <table className="mt-2 text-left">
+              <thead className="text-neutral-500">
+                <tr>
+                  <th className="pr-4 font-medium">Tipo</th>
+                  <th className="pr-4 font-medium">Trocas</th>
+                  <th className="pr-4 font-medium">Média</th>
+                  <th className="font-medium">Pior</th>
+                </tr>
+              </thead>
+              <tbody>
+                {kinds.map(([kind, row]) => (
+                  <tr key={kind} className="border-t border-neutral-200 dark:border-neutral-800">
+                    <td className="pr-4">{stopWindowKinds[kind] ?? kind}</td>
+                    <td className="pr-4">{row.count}</td>
+                    <td className="pr-4">{ms(row.mean_ms)}</td>
+                    <td>{ms(row.max_ms)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function Validation({ status }: { status: Status | null }) {
+  const detail = status?.validation_detail ?? {};
+  const ids = Object.keys(detail).filter((id) => Object.keys(detail[id] ?? {}).length > 0);
+  return (
+    <div className="mt-8 text-sm">
+      <p className="mb-1 flex items-center font-medium">
+        Validação no histórico
+        <Help text="O teste que libera cada estratégia, por tempo gráfico. Aprova com: pelo menos 30 trades fora do hold-out, Sharpe acima de 1, queda menor que 20%, 3 de 4 janelas do walk-forward no lucro com eficiência (WFE) de pelo menos 0,5, hold-out final sem prejuízo e Sharpe deflacionado (DSR) de pelo menos 0,95. O DSR desconta quantas combinações foram testadas desde a última aprovação: quanto mais tentativas, mais exigente. Só o tempo gráfico aprovado opera." />
+      </p>
+      <p className="mb-3 text-neutral-500">PBO não calculado: sem otimização de parâmetros.</p>
+      {ids.length === 0 && <p className="text-neutral-500">Nenhuma validação registrada neste ambiente.</p>}
+      {ids.map((id) => (
+        <StrategyValidation
+          key={id}
+          id={id}
+          results={detail[id]}
+          validated={Boolean(status?.validated?.[id])}
+          trials={status?.trials?.[id]}
+          riskPerTrade={status?.limits.risk_per_trade_pct}
+          maxDrawdown={status?.limits.max_drawdown_pct}
+        />
+      ))}
+    </div>
+  );
+}
+
+function StrategyValidation({
+  id,
+  results,
+  validated,
+  trials,
+  riskPerTrade,
+  maxDrawdown,
+}: {
+  id: string;
+  results: Record<string, TimeframeResult>;
+  validated: boolean;
+  trials?: number;
+  riskPerTrade?: number;
+  maxDrawdown?: number;
+}) {
+  const timeframes = Object.keys(results);
+  const rows: [string, string, (result: TimeframeResult) => ReactNode][] = [
+    ["Resultado", "Aprovado opera; reprovado fica só como sinal. O motivo vem do teste.", (r) => (
+      <span className={r.passed ? "text-green-600" : "text-red-600"}>
+        {r.passed ? "aprovado" : "reprovado"}
+        {!r.passed && r.reason ? <span className="block text-xs text-neutral-500">{r.reason}</span> : null}
+      </span>
+    )],
+    ["Trades", "Trades julgados pelo teste (fora do hold-out) de todos os replayados, e os dias de histórico.", (r) =>
+      `${r.gate_trades ?? "—"} de ${r.trades ?? "—"} · ${r.days ?? "—"} dias`],
+    ["Sharpe (bruto)", "O Sharpe do teste, sem desconto de tentativas. Precisa passar de 1.", (r) => num(r.sharpe)],
+    ["Sharpe diário", "Sharpe dos retornos por dia, com os dias sem trade. É o número comparado com o real para rebaixar uma estratégia que piorou.", (r) => num(r.daily_sharpe)],
+    ["Sharpe deflacionado", `Probabilidade de o Sharpe por trade ser maior que o de sorte, descontadas as tentativas. Aprova a partir de ${num(MIN_DSR)}.`, (r) => (
+      <span className={(r.dsr ?? 0) >= MIN_DSR ? "text-green-600" : "text-red-600"}>
+        {num(r.dsr)} <span className="text-neutral-500">(N={r.trials ?? 1})</span>
+      </span>
+    )],
+    ["Walk-forward", "O histórico dividido em 4 janelas pela data de saída, com o resultado líquido e os trades de cada uma. Precisa de 3 no lucro. WFE é a eficiência: o ritmo de cada janela comparado ao das anteriores.", (r) => (
+      <span>
+        {(r.windows ?? []).map((window, index) => (
+          <span key={index} className={`mr-2 ${window.profitable ? "text-green-600" : "text-red-600"}`} title={`${day(window.start)} a ${day(window.end)}`}>
+            {pct(window.net)} ({window.trades})
+          </span>
+        ))}
+        <span className="block text-xs text-neutral-500">WFE {num(r.wfe)}</span>
+      </span>
+    )],
+    ["Hold-out", "Os últimos 20% do histórico, guardados fora do teste. Não pode dar prejuízo.", (r) =>
+      r.holdout ? (
+        <span className={r.holdout.passed ? "text-green-600" : "text-red-600"}>
+          {pct(r.holdout.net)} em {r.holdout.trades} trades <span className="text-neutral-500">desde {day(r.holdout.start)}</span>
+        </span>
+      ) : "—"],
+    ["Monte Carlo", "1000 sorteios da ordem dos trades: a queda p95 em R, vezes o risco por trade de hoje, comparada ao drawdown máximo. Acima do limite, as linhas ficam só como sinal, sem precisar validar de novo.", (r) => {
+      const p95 = r.mc_p95_dd_r;
+      const loss = p95 != null && riskPerTrade != null ? p95 * riskPerTrade : null;
+      return (
+        <span className={r.mc_ok === false ? "text-red-600" : r.mc_ok ? "text-green-600" : ""}>
+          {num(p95, 1)} R × {pct(riskPerTrade)} = {pct(loss)} <span className="text-neutral-500">(limite {pct(maxDrawdown, 0)})</span>
+        </span>
+      );
+    }],
+    ["Fator de lucro", "Ganhos brutos divididos pelas perdas brutas. Acima de 1 ganha mais do que perde.", (r) => num(r.profit_factor)],
+    ["Expectativa", "Resultado médio por trade em unidades de risco: +0,2 R ganha em média um quinto do que arrisca.", (r) => formatR(r.expectancy_r)],
+    ["Queda máxima", "A maior queda do teste, por unidade investida. Precisa ficar abaixo de 20%.", (r) => pct(r.max_drawdown)],
+  ];
+  return (
+    <div className="mb-6 overflow-x-auto rounded border border-neutral-300 p-3 dark:border-neutral-700">
+      <p className="mb-2 font-medium">
+        {strategyName(id)} · {validated ? <span className="text-green-600">opera</span> : <span className="text-neutral-500">só sinal</span>}
+        <span className="ml-2 font-normal text-neutral-500">
+          {trials != null ? `${trials} tentativa(s) desde a última aprovação` : ""}
+        </span>
+      </p>
+      <table className="text-left">
+        <thead className="text-neutral-500">
+          <tr>
+            <th className="pr-4 font-medium" />
+            {timeframes.map((timeframe) => (
+              <th key={timeframe} className="pr-4 font-medium">
+                {timeframe}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(([label, help, cell]) => (
+            <tr key={label} className="border-t border-neutral-200 align-top dark:border-neutral-800">
+              <td className="pr-4 whitespace-nowrap text-neutral-500">
+                {label}
+                <Help text={help} />
+              </td>
+              {timeframes.map((timeframe) => (
+                <td key={timeframe} className="pr-4">
+                  {cell(results[timeframe])}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }

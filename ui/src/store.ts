@@ -1,7 +1,7 @@
 import { create } from "zustand";
 
 import { api } from "./api";
-import type { CalibrationRow, Opportunity, PnlDay, Position, Status } from "./types";
+import type { CalibrationRow, Opportunity, PairSlippage, PnlDay, Position, Status } from "./types";
 
 /** What the last panel action did, shown where it is always visible. */
 export type Notice = { kind: "busy" | "ok" | "error"; text: string };
@@ -12,6 +12,8 @@ type BotState = {
   positions: Position[];
   days: PnlDay[];
   calibration: CalibrationRow[];
+  /** Per-pair round-trip slippage of the last 30 days and the budget block. */
+  pairs: PairSlippage[];
   history: Record<string, unknown>[];
   error: string;
   dark: boolean;
@@ -35,6 +37,7 @@ export const useBot = create<BotState>((set, get) => ({
   positions: [],
   days: [],
   calibration: [],
+  pairs: [],
   history: [],
   error: "",
   dark: window.matchMedia("(prefers-color-scheme: dark)").matches,
@@ -57,6 +60,7 @@ export const useBot = create<BotState>((set, get) => ({
         positions: positions.rows,
         days: performance.days,
         calibration: performance.calibration ?? [],
+        pairs: performance.pairs ?? [],
         history: history.rows,
         error: "",
       });

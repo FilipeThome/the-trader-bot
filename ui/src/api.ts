@@ -1,4 +1,4 @@
-import type { ArmedEntry, Balance, BotInstance, CalibrationRow, DayPreset, Decision, Features, InstanceKind, InstancePreview, Market, Opportunity, PnlDay, Position, Recommendation, Status, Trade } from "./types";
+import type { ArmedEntry, Balance, BotInstance, CalibrationRow, DayPreset, Decision, Features, InstanceKind, InstancePreview, Market, Opportunity, PairSlippage, PnlDay, Position, Recommendation, Status, Trade } from "./types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -33,7 +33,8 @@ export const api = {
   status: () => request<Status>("/bot/status"),
   opportunities: () => request<{ rows: Opportunity[] }>("/bot/opportunities"),
   positions: () => request<{ rows: Position[] }>("/bot/positions"),
-  performance: () => request<{ days: PnlDay[]; calibration: CalibrationRow[] }>("/bot/performance"),
+  performance: () =>
+    request<{ days: PnlDay[]; calibration: CalibrationRow[]; pairs?: PairSlippage[]; equity_peak?: number }>("/bot/performance"),
   trade: (positionId: number) => request<Trade>(`/bot/trades/${positionId}`),
   features: (symbol: string) => request<Features>(`/bot/features?symbol=${encodeURIComponent(symbol)}`),
   markets: () => request<{ symbols: Market[] }>("/bot/markets"),
@@ -79,6 +80,10 @@ export const api = {
       body: JSON.stringify({ kind, symbol, params }),
     }),
   stopInstance: (id: number) => request<{ instance_status: string; outcome: string }>(`/bot/instances/${id}/stop`, { method: "POST" }),
+  /**
+   * PUT /bot/config. ``reconfirm_mandate: true`` rewrites the mandate from the resulting config;
+   * a ``flatten_on_halt`` change without it is refused (409), because the halt follows the mandate.
+   */
   updateConfig: (payload: Record<string, unknown>) =>
     request("/bot/config", { method: "PUT", body: JSON.stringify(payload) }),
 };
