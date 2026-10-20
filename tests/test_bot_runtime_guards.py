@@ -211,24 +211,55 @@ def test_review_strategy_runs_in_the_daily_decay_and_records_the_demotion(tmp_pa
 # -- signal age and macro calendar (6.13) --------------------------------------
 
 
-def _aged(tmp_path, monkeypatch, entry_mode: str) -> tuple[Runtime, Any]:
+def _aged(tmp_path, monkeypatch, entry_mode: str, live: float = 100.0, moment: datetime = MOMENT) -> tuple[Runtime, Any]:
+    """Closed 1h bars at 100 and the bar forming at ``moment`` trading at ``live`` (stop 1%, so 1 R = 1.0)."""
     runtime, executor = _scored(tmp_path, monkeypatch, _params({"1h": PASSED}), entry_mode=entry_mode)
-    runtime.collector.snapshot = MarketSnapshot(candles={("BTC/USDT", "1h"): _series([100.0] * 80, "1h")})  # type: ignore[attr-defined]
+    series = _series([100.0] * 80, "1h", moment)
+    series.frame.iloc[-1, series.frame.columns.get_loc("close")] = live
+    runtime.collector.snapshot = MarketSnapshot(candles={("BTC/USDT", "1h"): series})  # type: ignore[attr-defined]
     return runtime, executor
 
 
-def test_auto_entry_refuses_a_signal_older_than_120s(tmp_path, monkeypatch) -> None:
-    runtime, executor = _aged(tmp_path, monkeypatch, "auto")
-    # The 11:00 bar closed at 12:00: at 12:05 its signal is 300 s old.
+def test_a_fresh_signal_enters_automatically(tmp_path, monkeypatch) -> None:
+    runtime, executor = _aged(tmp_path, monkeypatch, "auto", live=103.0, moment=MOMENT.replace(minute=1))
+    runtime.tick(now=MOMENT.replace(minute=1))
+    row = runtime.store.opportunities()[0]
+    # 60 s after the close the price is not judged, even 3 R above the signal.
+    assert row["signal_age_seconds"] == pytest.approx(60.0) and row["entry_drift_r"] == pytest.approx(3.0)
+    assert executor.events[-1] == "act:1"
+
+
+def test_a_late_signal_enters_automatically_while_the_price_stays_near_it(tmp_path, monkeypatch) -> None:
+    # The 11:00 bar closed at 12:00: at 12:05 its signal is 300 s old, but the price is still 0.3 R above it.
+    runtime, executor = _aged(tmp_path, monkeypatch, "auto", live=100.3)
     runtime.tick(now=MOMENT)
     row = runtime.store.opportunities()[0]
-    assert row["signal_age_seconds"] == pytest.approx(300.0)
-    assert row["status"] == "pronta" and "sinal com 300 s de atraso" in row["reason"]
+    assert row["signal_age_seconds"] == pytest.approx(300.0) and row["entry_drift_r"] == pytest.approx(0.3)
+    assert "atraso" not in row["reason"]
+    assert executor.events[-1] == "act:1"
+
+
+@pytest.mark.parametrize(
+    ("live", "why"),
+    [(100.6, "preço 0.60 R acima do sinal"), (99.0, "preço 1.00 R abaixo do sinal, além do stop")],
+)
+def test_a_late_signal_the_price_left_is_not_entered_automatically(tmp_path, monkeypatch, live, why) -> None:
+    runtime, executor = _aged(tmp_path, monkeypatch, "auto", live=live)
+    runtime.tick(now=MOMENT)
+    row = runtime.store.opportunities()[0]
+    assert row["status"] == "pronta"
+    assert f"sinal com 300 s de atraso e {why}: sem entrada automática" in row["reason"]
     assert executor.events[-1] == "act:0"
-    fresh, fresh_executor = _aged(tmp_path / "fresh", monkeypatch, "auto")
-    fresh.tick(now=MOMENT.replace(minute=1))
-    assert fresh.store.opportunities()[0]["signal_age_seconds"] == pytest.approx(60.0)
-    assert fresh_executor.events[-1] == "act:1"
+
+
+def test_a_late_signal_without_a_live_price_is_not_entered_automatically(tmp_path, monkeypatch) -> None:
+    runtime, executor = _aged(tmp_path, monkeypatch, "auto")
+    monkeypatch.setattr("bot.runtime._last_price", lambda *_args: None)
+    runtime.tick(now=MOMENT)
+    row = runtime.store.opportunities()[0]
+    assert row["entry_drift_r"] is None
+    assert "atraso e preço atual sem leitura" in row["reason"]
+    assert executor.events[-1] == "act:0"
 
 
 def test_manual_entry_shows_the_age_but_is_allowed(tmp_path, monkeypatch) -> None:

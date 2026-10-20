@@ -122,6 +122,10 @@ TESTABLE_BLOCKERS = frozenset({"score", "cost", "reward_risk", "regime"})
 _PRICE_INTERVALS = ("1m", "15m", "1h", "4h")
 #: Failed cycles in a row that trip the halt.
 MAX_FAILURES = 3
+#: A signal older than ``max_signal_age_seconds`` is taken automatically only while the price
+#: is at most this many stop distances above the signal bar's close: further up, the entry
+#: chases a move the replay never paid for.
+MAX_LATE_DRIFT_R = 0.5
 #: Exit policies of DCA and grid inventory: their instance decides every exit.
 INSTANCE_POLICIES = frozenset({"dca", "grid"})
 #: How long an armed entry may wait for its trigger, in hours.
@@ -1221,16 +1225,33 @@ class Runtime:
 
     def _auto_eligible(self, item: Opportunity, test_auto: bool) -> bool:
         """Whether automatic trading may take a ready row: its hit rate (or the test mode),
-        and a signal no older than ``max_signal_age_seconds`` (D21). A late row stays ready
-        for a manual or armed entry and says why the automatic one skipped it."""
+        and a signal that is still worth its price (D21).
+
+        A signal younger than ``max_signal_age_seconds`` is always taken. An older one is
+        taken only while the price has not left it: at most ``MAX_LATE_DRIFT_R`` above the
+        signal bar's close, and not a whole stop below it. A row stays ready on its closed
+        bar for the bar's whole width (four hours on 4h), so a clock limit alone would let
+        automatic trading enter only in the first minutes after each close and never after
+        a restart; the risk of a late entry is chasing the price, which this measures. A
+        late row the rule skips stays ready for a manual or armed entry and says why.
+        """
         if not ((item.test_only and test_auto) or self._clears_floor(item)):
             return False
         limit = self.config.limits.max_signal_age_seconds
         age = item.signal_age_seconds
-        if limit > 0 and age is not None and age > limit:
-            item.reason = f"{item.reason}; sinal com {age:.0f} s de atraso: sem entrada automática"
-            return False
-        return True
+        if limit <= 0 or age is None or age <= limit:
+            return True
+        drift = item.entry_drift_r
+        if drift is None:
+            why = "preço atual sem leitura"
+        elif drift > MAX_LATE_DRIFT_R:
+            why = f"preço {drift:.2f} R acima do sinal"
+        elif drift <= -1.0:
+            why = f"preço {abs(drift):.2f} R abaixo do sinal, além do stop"
+        else:
+            return True
+        item.reason = f"{item.reason}; sinal com {age:.0f} s de atraso e {why}: sem entrada automática"
+        return False
 
     def _clears_floor(self, item: Opportunity) -> bool:
         """Whether a real (non-test) row's estimated hit rate allows an automatic entry.
@@ -1592,6 +1613,7 @@ class Runtime:
                 )
                 draft.data_age_seconds = _age(snapshot, symbol, setup.timeframe, moment)
                 draft.signal_age_seconds = _signal_age(snapshot, symbol, setup.timeframe, moment)
+                draft.entry_drift_r = _entry_drift_r(snapshot, symbol, setup.timeframe, moment, draft.risk_pct)
                 # The executor re-applies the target distance on the average fill.
                 draft.plan_target_pct = setup.target_pct if setup.target_pct > 0 else None
                 draft.win_rate = win_rate
@@ -2042,6 +2064,23 @@ def _age(snapshot: MarketSnapshot, symbol: str, timeframe: str, moment: datetime
     if series is None:
         return None
     return (moment - series.fetched_at).total_seconds()
+
+
+def _entry_drift_r(
+    snapshot: MarketSnapshot, symbol: str, timeframe: str, moment: datetime, risk_pct: float
+) -> float | None:
+    """The live price's distance from the signal bar's close, in stop distances (R).
+
+    None when the closed bar, the live price or a positive stop distance is missing.
+    """
+    frame = _closed(snapshot, symbol, timeframe, moment)
+    last = _last_price(snapshot, symbol, timeframe)
+    if frame is None or frame.empty or last is None or not risk_pct > 0:
+        return None
+    signal = float(frame["close"].iloc[-1])
+    if not (signal > 0 and math.isfinite(signal) and math.isfinite(last)):
+        return None
+    return (last / signal - 1) / risk_pct
 
 
 def _signal_age(snapshot: MarketSnapshot, symbol: str, timeframe: str, moment: datetime) -> float | None:

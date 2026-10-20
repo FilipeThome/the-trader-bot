@@ -110,6 +110,9 @@ class Opportunity:
     size_caps: dict[str, float] | None = None
     #: Seconds since the candle that produced the signal closed.
     signal_age_seconds: float | None = None
+    #: How far the live price is from that candle's close, in stop distances (R): 0.5 means
+    #: half a stop above the signal, -1 a full stop below it. None when either price is unread.
+    entry_drift_r: float | None = None
     #: Correlation cluster of the pair (for example "BTC"), or None when it trades on its own.
     cluster: str | None = None
     #: Slippage share of the round-trip cost.

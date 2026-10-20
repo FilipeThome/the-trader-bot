@@ -21,6 +21,8 @@ export type Opportunity = {
   size_caps?: Record<string, number> | null;
   /** Seconds since the candle that produced the signal closed. */
   signal_age_seconds?: number | null;
+  /** Live price minus the signal bar's close, in stop distances (R). */
+  entry_drift_r?: number | null;
   /** Correlation cluster of the pair ("BTC"), or null when it trades on its own. */
   cluster?: string | null;
   /** Estimated slippage, a share of the price, inside the round-trip cost. */

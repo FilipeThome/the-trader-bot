@@ -83,7 +83,7 @@ def test_classify_uses_the_given_taker() -> None:
 
 def test_new_opportunity_fields_default_and_come_last() -> None:
     row = classify(_setup(), slippage=0.0007).to_dict()
-    added = ["size_limit", "size_caps", "signal_age_seconds", "cluster", "slippage_est", "plan_target_pct"]
+    added = ["size_limit", "size_caps", "signal_age_seconds", "entry_drift_r", "cluster", "slippage_est", "plan_target_pct"]
     assert list(row)[-len(added):] == added
     assert row["slippage_est"] == 0.0007
     assert all(row[name] is None for name in added if name != "slippage_est")

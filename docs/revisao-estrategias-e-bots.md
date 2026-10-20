@@ -494,3 +494,7 @@ Uma revisão rigorosa da branch inteira, em seis fatias, reprovou o código com 
 - **Stop atravessado.** Exige também que o último negócio tenha chegado ao stop, que é o que dispara um STOP_LOSS_LIMIT.
 - **Exposição do mandato.** As compras paradas dos robôs contam na exposição das compras, mas não na das vendas: um stop de outro par nunca é recusado por causa delas.
 - **Uma regra para o Monte Carlo** (`risk.mc_drawdown_ok`) e **uma derivação dos tetos do mandato** (`mandate_caps_for`), usadas pelo ciclo, pela API e pelo painel.
+
+### Idade do sinal medida pelo preço (2026-10-20)
+
+No testnet, com o modo automático e o modo teste ligados, nenhuma linha Pronta era executada: o limite de 120 s fixos valia para todo timeframe, e uma linha de 4h fica Pronta por até quatro horas. O automático só entrava nos dois primeiros minutos depois de cada fechamento, e nunca depois de um reinício. A regra passou a ser: até `max_signal_age_seconds` entra sempre; mais velho, entra só com o preço até 0,5 R acima do fechamento da vela do sinal e menos de 1 R abaixo dele (`MAX_LATE_DRIFT_R` em `bot/runtime.py`, campo `entry_drift_r` na oportunidade). Sem leitura do preço, a entrada atrasada não sai.

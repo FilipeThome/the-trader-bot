@@ -25,8 +25,9 @@ function capsText(row: Opportunity): string {
 }
 
 /** "sinal há 45 s" or "sinal há 3 min": time since the candle that produced the signal closed. */
-function signalAge(seconds: number): string {
-  return seconds < 120 ? `sinal há ${Math.round(seconds)} s` : `sinal há ${Math.round(seconds / 60)} min`;
+function signalAge(seconds: number, drift?: number | null): string {
+  const age = seconds < 120 ? `sinal há ${Math.round(seconds)} s` : `sinal há ${Math.round(seconds / 60)} min`;
+  return drift == null ? age : `${age}, preço ${drift >= 0 ? "+" : ""}${drift.toFixed(2)} R`;
 }
 
 export function Opportunities() {
@@ -188,8 +189,8 @@ export function Opportunities() {
                   <span className="ml-2 text-neutral-500">idade {Math.round(row.data_age_seconds)}s</span>
                 )}
                 {row.signal_age_seconds != null && (
-                  <span className="ml-2 text-neutral-500" title="Tempo desde o fechamento da vela que gerou o sinal. Acima do limite de idade, o trade automático não entra; a entrada manual mostra a idade e continua permitida.">
-                    {signalAge(row.signal_age_seconds)}
+                  <span className="ml-2 text-neutral-500" title="Tempo desde o fechamento da vela que gerou o sinal e quanto o preço andou desde ela, em distâncias do stop (R). Passado o limite de idade, o trade automático só entra enquanto o preço fica até 0,5 R acima do sinal e não cai um stop inteiro abaixo dele; a entrada manual continua permitida.">
+                    {signalAge(row.signal_age_seconds, row.entry_drift_r)}
                   </span>
                 )}
                 <button className="ml-2 underline" type="button" onClick={() => setSelected(row)}>
@@ -276,7 +277,7 @@ export function Opportunities() {
           <p className="mt-1 text-neutral-500">
             {selected.slippage_est != null && <>Derrapagem estimada {formatPct(selected.slippage_est)} na ida e volta, já no custo. </>}
             {selected.cluster && <>Grupo de correlação: {selected.cluster}. </>}
-            {selected.signal_age_seconds != null && <>{signalAge(selected.signal_age_seconds)}. </>}
+            {selected.signal_age_seconds != null && <>{signalAge(selected.signal_age_seconds, selected.entry_drift_r)}. </>}
             {selected.timeframe && <>Tempo gráfico {selected.timeframe}.</>}
           </p>
           {selected.action.startsWith("Compr") && (
