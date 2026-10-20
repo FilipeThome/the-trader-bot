@@ -124,13 +124,14 @@ def test_validation_runs_in_the_background_and_records_the_verdict(api_client, m
     assert response.status_code == 202 and response.json()["status"] == "running"
     _join_validations()
     job = api_client.get("/bot/status").json()["validations"]["trend"]
-    assert job["status"] == "done" and job["done"] == job["total"] == 5
-    assert job["result"]["passed"] is False
+    # Five pairs on each of trend's two timeframes.
+    assert job["status"] == "done" and job["done"] == job["total"] == 10
+    assert job["result"]["passed"] is False and set(job["result"]["timeframes"]) == {"1h", "4h"}
     assert ctx.runtime is not None
     stats = ctx.runtime.store.strategy("trend")
-    assert stats is not None and stats["signal_only"] is True and stats["params"]["days"] == 180
+    assert stats is not None and stats["signal_only"] is True and stats["params"]["days"] == {"1h": 240, "4h": 480}
     started = pd.Timestamp(loader.starts[0])
-    assert 179 <= (pd.Timestamp.now(tz="UTC") - started).days <= 180
+    assert 239 <= (pd.Timestamp.now(tz="UTC") - started).days <= 240
     assert api_client.post("/bot/strategies/funding_carry/validate").status_code == 422
 
 

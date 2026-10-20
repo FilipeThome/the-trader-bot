@@ -38,6 +38,8 @@ class Venue:
 
     ``responses`` queues results by ``"{side}:{order_type}"`` (``"sell:limit"``) or,
     for either side, by the order type alone (``"limit"``); the side key wins.
+    Unscripted, a buy LIMIT IOC (a strategy entry) fills in full at the ask when the
+    ask is at or under its limit, and expires with nothing filled otherwise.
     """
 
     def __init__(self) -> None:
@@ -54,6 +56,8 @@ class Venue:
         self.blocker: str | None = None
         self.journal_blocked = False
         self.fail_market: Exception | None = None
+        #: Raised on a buy LIMIT order (a strategy entry), after it is recorded as sent.
+        self.fail_entry: Exception | None = None
         #: Per-order notional cap the gate enforces; None means unreadable.
         self.cap: Decimal | None = Decimal("1000")
         #: Last trade price when it differs from the bid.
@@ -66,13 +70,17 @@ class Venue:
         self.on_cancel: Callable[[str], dict[str, Any] | None] | None = None
 
     def submit_order(self, symbol: str, profile_id: str, *, held: Any = None, **kwargs: Any) -> dict[str, Any]:
-        self.events.append(f"submit:{kwargs['order_type']}")
+        entry = kwargs["order_type"] == "limit" and kwargs.get("side") == "buy"
+        # "submit:limit" stays an exit sale; an entry IOC logs as "submit:buy:limit".
+        self.events.append("submit:buy:limit" if entry else f"submit:{kwargs['order_type']}")
         self.calls.append({"symbol": symbol, "held": held, **kwargs})
         self.counter += 1
         client_id = f"c{self.counter}"
         if kwargs["order_type"] == "market" and self.fail_market is not None:
             raise self.fail_market
-        if kwargs["order_type"] == "limit":
+        if entry and self.fail_entry is not None:
+            raise self.fail_entry
+        if kwargs["order_type"] == "limit" and not entry:
             self.limit_calls += 1
             if self.limit_calls == self.fail_limit_at:
                 raise RuntimeError("binance.json unreadable")
@@ -93,6 +101,20 @@ class Venue:
             }
         elif kwargs["order_type"] == "stop_loss_limit":
             result = {"status": "ok", "order_id": f"stop{self.counter}"}
+        elif entry:
+            qty = Decimal(kwargs["quantity"])
+            ask = self.ask if self.ask is not None else self.bid
+            if ask > Decimal(kwargs["limit_price"]):
+                result = {"status": "ok", "order_id": f"o{self.counter}", "filled": "0", "cost": "0", "fees": []}
+            else:
+                result = {
+                    "status": "ok",
+                    "order_id": f"o{self.counter}",
+                    "filled": str(qty),
+                    "cost": str(qty * ask),
+                    "average": str(ask),
+                    "fees": [{"cost": float(qty * Decimal("0.001")), "currency": "BTC"}],
+                }
         else:
             qty = Decimal(kwargs["quantity"])
             cost = qty * Decimal(kwargs["limit_price"])

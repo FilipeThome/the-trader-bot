@@ -41,7 +41,7 @@ def test_positions_show_the_day_deadline_and_first_target(api_client) -> None:
     assert row["exit_deadline"] == "2026-10-16T18:00:00+00:00" and row["tp1_done"] == 0
 
 
-def test_a_day_validation_reads_90_days_of_15m_and_the_1h_bars(api_client, monkeypatch) -> None:
+def test_a_day_validation_reads_120_days_of_15m_and_the_1h_bars(api_client, monkeypatch) -> None:
     import threading
 
     import pandas as pd
@@ -61,8 +61,9 @@ def test_a_day_validation_reads_90_days_of_15m_and_the_1h_bars(api_client, monke
     for thread in threading.enumerate():
         if thread.name.startswith("validate-"):
             thread.join(10)
-    assert fetched[0] == ("15m", 90)
-    assert fetched[1][0] == "1h" and fetched[1][1] >= 90
+    assert fetched[0] == ("15m", 120)
+    # The 1h trend filter warms its EMA 50 on 5 extra days.
+    assert fetched[1] == ("1h", 125)
     job = api_client.get("/bot/status").json()["validations"]["intraday_momentum"]
     assert job["status"] == "done" and job["result"]["exit_policy"] == "day"
 

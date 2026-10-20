@@ -44,18 +44,22 @@ def test_entry_opens_the_position_and_rests_a_stop_for_the_net_quantity(tmp_path
     assert decision["decision"] == "operar"
     assert decision["position_id"] == executor.store.open_positions()[0]["id"]
     entry, stop = venue.calls
-    assert entry["order_type"] == "market" and entry["notional"] == "100.00" and entry["held"] == []
-    # 1 BTC filled, 0.001 BTC fee, then the 0.1% sell margin, floored to the lot.
+    # A LIMIT IOC 0.2% above the ask, sized in base: 100 USD / 100.2, floored to the lot.
+    assert entry["side"] == "buy" and entry["order_type"] == "limit" and entry["time_in_force"] == "ioc"
+    assert entry["quantity"] == "0.998" and entry["limit_price"] == "100.2" and entry["held"] == []
+    assert "notional" not in entry
+    # 0.998 BTC filled at 100, 0.000998 BTC fee, then the 0.1% sell margin, floored to the lot.
     assert stop["order_type"] == "stop_loss_limit"
-    assert stop["quantity"] == "0.998"
-    assert stop["stop_price"] == "98" and stop["limit_price"] == "97.51"
+    assert stop["quantity"] == "0.996"
+    # The plan's 2% stop counts from the fee-inclusive average fill (99.8 / 0.997002), floored to the tick.
+    assert stop["stop_price"] == "98.09" and stop["limit_price"] == "97.59"
     position = executor.store.open_positions()[0]
     assert position["stop_order_id"] == "stop2"
     assert executor.store.pnl_days()[0]["trades"] == 1
 
 
 def test_a_rejected_entry_does_not_block_the_next_one(tmp_path, venue) -> None:
-    venue.responses["market"] = [{"status": "error", "reasons": ["balance_insufficient"]}]
+    venue.responses["buy:limit"] = [{"status": "error", "reasons": ["balance_insufficient"]}]
     executor = _executor(tmp_path)
     first = executor.enter(_ready())
     assert first["decision"] == "bloqueado" and "balance_insufficient" in first["reason"]
@@ -79,13 +83,13 @@ def test_entry_needs_budget_for_entry_stop_and_exit(tmp_path, venue) -> None:
 
 
 def test_an_idempotent_replay_reads_the_order_instead_of_inventing_a_fill(tmp_path, venue) -> None:
-    venue.responses["market"] = [{"status": "ok", "idempotent_replay": True, "client_order_id": "cid"}]
+    venue.responses["buy:limit"] = [{"status": "ok", "idempotent_replay": True, "client_order_id": "cid"}]
     venue.orders["cid"] = {"status": "ok", "order": {"status": "canceled", "filled": 0}}
     executor = _executor(tmp_path)
     executor.enter(_ready())
     assert "status:cid" in venue.events
     assert executor.store.live_positions() == []
-    assert [call["order_type"] for call in venue.calls] == ["market"]
+    assert [call["order_type"] for call in venue.calls] == ["limit"]
 
 
 def test_target_exit_takes_the_stop_off_then_sells_with_ioc(tmp_path, venue) -> None:
@@ -98,7 +102,7 @@ def test_target_exit_takes_the_stop_off_then_sells_with_ioc(tmp_path, venue) -> 
     assert venue.cancelled == ["stop2"]
     sell = venue.calls[-1]
     assert sell["order_type"] == "limit" and sell["time_in_force"] == "ioc"
-    assert sell["quantity"] == "0.998" and sell["limit_price"] == "104.47"
+    assert sell["quantity"] == "0.996" and sell["limit_price"] == "104.47"
     assert venue.events.index("cancel:stop2") < len(venue.events) - 1
     closed = executor.store.position(position["id"])
     assert closed is not None and closed["status"] == "closed"
@@ -123,34 +127,35 @@ def test_a_partial_ioc_re_places_the_stop_on_the_remainder(tmp_path, venue) -> N
     executor = _executor(tmp_path)
     executor.enter(_ready())
     position = executor.store.open_positions()[0]
-    venue.responses["limit"] = [{"status": "ok", "filled": "0.5", "cost": "50", "fees": []}]
+    venue.responses["sell:limit"] = [{"status": "ok", "filled": "0.5", "cost": "50", "fees": []}]
     result = executor.exit_position(position["id"], "alvo atingido")
     assert result["status"] == "error"
     restop = venue.calls[-1]
-    assert restop["order_type"] == "stop_loss_limit" and restop["quantity"] == "0.498"
+    assert restop["order_type"] == "stop_loss_limit" and restop["quantity"] == "0.496"
     stops = [call["idempotency_key"] for call in venue.calls if call["order_type"] == "stop_loss_limit"]
     assert len(set(stops)) == 2
     left = executor.store.position(position["id"])
-    assert left is not None and left["status"] == "open" and left["qty"] == pytest.approx(0.498)
+    assert left is not None and left["status"] == "open" and left["qty"] == pytest.approx(0.496)
 
 
 def test_a_refused_stop_exits_at_once(tmp_path, venue) -> None:
     venue.responses["stop_loss_limit"] = [{"status": "blocked", "reason": "order breaches max_trades_per_day"}]
     executor = _executor(tmp_path)
     executor.enter(_ready())
-    assert [call["order_type"] for call in venue.calls] == ["market", "stop_loss_limit", "limit"]
+    assert [call["order_type"] for call in venue.calls] == ["limit", "stop_loss_limit", "limit"]
+    assert [call["side"] for call in venue.calls] == ["buy", "sell", "sell"]
     assert executor.store.open_positions() == []
 
 
 def test_a_refused_stop_and_a_failed_exit_raise_for_a_halt(tmp_path, venue) -> None:
     venue.responses["stop_loss_limit"] = [{"status": "blocked", "reason": "mandate"}]
-    venue.responses["limit"] = [{"status": "error", "reasons": ["balance_insufficient"]}]
+    venue.responses["sell:limit"] = [{"status": "error", "reasons": ["balance_insufficient"]}]
     with pytest.raises(UnprotectedPosition):
         _executor(tmp_path).enter(_ready())
 
 
 def test_sync_reconciles_first_then_opens_a_pending_entry(tmp_path, venue) -> None:
-    venue.responses["market"] = [{"status": "unknown", "error": "timeout", "client_order_id": "cid"}]
+    venue.responses["buy:limit"] = [{"status": "unknown", "error": "timeout", "client_order_id": "cid"}]
     venue.journal_blocked = True
     executor = _executor(tmp_path)
     assert executor.enter(_ready())["decision"] == "pendente"
@@ -191,7 +196,7 @@ def test_flatten_sells_every_open_position(tmp_path, venue) -> None:
 def test_a_crash_after_the_entry_send_is_resolved_by_the_persisted_client_id(tmp_path, venue) -> None:
     from bot.exchange import service
 
-    venue.fail_market = ConnectionResetError("after send")
+    venue.fail_entry = ConnectionResetError("after send")
     executor = _executor(tmp_path)
     with pytest.raises(ConnectionResetError):
         executor.enter(_ready())
@@ -208,7 +213,7 @@ def test_a_crash_after_the_entry_send_is_resolved_by_the_persisted_client_id(tmp
 
 
 def test_an_unreadable_fill_keeps_the_entry_pending(tmp_path, venue) -> None:
-    venue.responses["market"] = [{"status": "ok", "idempotent_replay": True, "client_order_id": "cid"}]
+    venue.responses["buy:limit"] = [{"status": "ok", "idempotent_replay": True, "client_order_id": "cid"}]
     venue.orders["cid"] = {"status": "error", "error": "read_failed (Timeout)"}
     executor = _executor(tmp_path)
     assert executor.enter(_ready())["decision"] == "pendente"
@@ -258,8 +263,9 @@ def _opened(tmp_path, venue) -> tuple[Executor, dict[str, Any]]:
 
 def test_the_stop_follows_the_peak(tmp_path, venue) -> None:
     executor, position = _opened(tmp_path, venue)
-    # The entry's stop distance, measured from the fee-inclusive average price.
-    assert position["trail_pct"] == pytest.approx((position["avg_price"] - 98.0) / position["avg_price"])
+    # The plan's stop distance, set on the fee-inclusive average price.
+    assert position["trail_pct"] == pytest.approx(0.02)
+    assert position["stop_price"] == pytest.approx(position["avg_price"] * 0.98)
     venue.bid = Decimal("110")
     assert executor.trail(position["id"], Decimal("110"), reserve=2) == "movido"
     assert venue.cancelled == ["stop2"]
@@ -289,7 +295,8 @@ def test_no_move_when_the_budget_is_reserved(tmp_path, venue) -> None:
 def test_no_move_when_the_new_stop_would_sit_at_the_bid(tmp_path, venue) -> None:
     executor, position = _opened(tmp_path, venue)
     venue.bid = Decimal("100")
-    assert executor.trail(position["id"], Decimal("112"), reserve=2) == "novo stop perto demais do preço"
+    # Peak 112, new stop 109.76: the bid leaves no room under it (1% clearance, half the 2% trail).
+    assert executor.trail(position["id"], Decimal("112"), reserve=2) == "novo stop sem folga de 1.0% do preço"
     assert venue.cancelled == []
 
 
@@ -474,3 +481,32 @@ def test_a_position_keeps_the_hit_rate_it_was_entered_at(tmp_path, venue) -> Non
     rated = executor.enter(_ready(symbol="ETH/USDT", win_rate=0.66))
     assert executor.store.position(unrated["position_id"])["entry_win_rate"] is None
     assert executor.store.position(rated["position_id"])["entry_win_rate"] == pytest.approx(0.66)
+
+
+def test_each_cancel_and_replace_records_its_window(tmp_path, venue) -> None:
+    executor, position = _opened(tmp_path, venue)
+    venue.bid = Decimal("110")
+    assert executor.trail(position["id"], Decimal("110"), reserve=2) == "movido"
+    day_id = executor.store.open_pending("ETH/USDT", "intraday_momentum", stop_price=98.0, target_price=103.0, exit_policy="day")
+    assert day_id is not None
+    executor.store.update_position(day_id, status="open", qty=1.0, avg_price=100.0, stop_order_id="stop-day")
+    venue.bid = Decimal("103.5")
+    assert executor.take_profit(day_id, reserve=1) == "vendido"
+    assert executor.open_instance(1, "grid", "SOL/USDT", Decimal("20"), Decimal("90"))["status"] == "ok"
+    grid = next(row for row in executor.store.open_positions() if row["symbol"] == "SOL/USDT")
+    assert executor.scale_in(grid["id"], Decimal("10"), "grid-buy-1", Decimal("90"), reserve=2) == "comprado"
+    # An exit the IOC fills only in part puts the stop back on the rest.
+    venue.bid = Decimal("110")
+    venue.responses["sell:limit"] = [{"status": "ok", "filled": "0.5", "cost": "55", "fees": []}]
+    assert executor.exit_position(position["id"], "alvo atingido")["status"] == "error"
+    stats = executor.store.stop_window_stats("2000-01-01T00:00:00+00:00")
+    assert stats["count"] == 4
+    assert set(stats["by_kind"]) == {"trail", "tp1", "restop", "exit_remainder"}
+    assert all(item["count"] == 1 and item["max_ms"] >= 0 for item in stats["by_kind"].values())
+
+
+def test_no_window_is_recorded_when_the_stop_never_comes_back(tmp_path, venue) -> None:
+    executor, position = _opened(tmp_path, venue)
+    venue.bid = Decimal("105")
+    assert executor.exit_position(position["id"], "alvo atingido")["status"] == "ok"
+    assert executor.store.stop_window_stats("2000-01-01T00:00:00+00:00")["count"] == 0

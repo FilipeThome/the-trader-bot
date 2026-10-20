@@ -397,3 +397,17 @@ def test_a_broken_pool_never_stops_a_newer_one(monkeypatch) -> None:
     assert runner._POOL is current and not current.stopped
     runner.shutdown_pool(current)  # type: ignore[arg-type]
     assert runner._POOL is None and current.stopped
+
+
+def test_daily_sharpe_does_not_depend_on_the_order_of_the_trades() -> None:
+    from bot.backtest.runner import Trade, _daily_sharpe
+
+    start = pd.Timestamp("2026-01-01", tz="UTC")
+    trades = [
+        Trade(exit_time=start + pd.Timedelta(days=day, hours=3), net_return=ret)
+        for day, ret in [(1, 0.01), (2, -0.004), (4, 0.006), (4, 0.002), (7, -0.001)]
+    ]
+    end = start + pd.Timedelta(days=9)
+    ascending = _daily_sharpe(trades, start, end)
+    assert ascending != 0
+    assert _daily_sharpe(list(reversed(trades)), start, end) == pytest.approx(ascending)

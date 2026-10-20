@@ -479,8 +479,10 @@ def _daily_sharpe(trades: Sequence[Trade], start: pd.Timestamp, end: pd.Timestam
     days = pd.date_range(pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize(), freq="D")
     if not trades:
         return 0.0
-    exits = pd.DatetimeIndex([trade.exit_time for trade in trades]).normalize()
-    daily = pd.Series([trade.net_return for trade in trades], index=exits, dtype=float).groupby(level=0).sum()
+    # Sorted by exit so callers may pass trades in any order (store rows come newest first).
+    ordered = sorted(trades, key=lambda trade: pd.Timestamp(trade.exit_time))
+    exits = pd.DatetimeIndex([trade.exit_time for trade in ordered]).normalize()
+    daily = pd.Series([trade.net_return for trade in ordered], index=exits, dtype=float).groupby(level=0).sum()
     values = daily.reindex(days.union(daily.index), fill_value=0.0).to_numpy()
     if len(values) < 2:
         return 0.0

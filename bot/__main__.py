@@ -9,9 +9,9 @@ import time
 
 import uvicorn
 
-from bot.api.app import _runtime, app
+from bot.api.app import _runtime, app, revalidate_stale
 from bot.config import BotConfig
-from bot.runtime import MAX_FAILURES
+from bot.runtime import MAX_FAILURES, Runtime
 
 logger = logging.getLogger("bot")
 _DEFAULT_INTERVAL = 60
@@ -22,7 +22,8 @@ def run_once(failures: int) -> tuple[int, int]:
 
     The cycle counts and halts on its own failures. This step covers what
     happens outside it (reading ``bot.json``, building the runtime) and halts
-    after ``MAX_FAILURES`` failures in a row.
+    after ``MAX_FAILURES`` failures in a row. After the cycle, stale
+    validations are re-queued (``_revalidate``), outside that count.
     """
     interval = _DEFAULT_INTERVAL
     try:
@@ -31,6 +32,7 @@ def run_once(failures: int) -> tuple[int, int]:
         runtime = _runtime()
         if runtime.running:
             runtime.tick()
+        _revalidate(runtime)
         return 0, interval
     except Exception:
         failures += 1
@@ -41,6 +43,14 @@ def run_once(failures: int) -> tuple[int, int]:
             except Exception:
                 logger.exception("halt after loop failures failed")
         return failures, interval
+
+
+def _revalidate(runtime: Runtime) -> None:
+    """Queue the re-validation of stale strategies; a failure is a warning, never a loop failure."""
+    try:
+        revalidate_stale(runtime)
+    except Exception:  # noqa: BLE001 - trading goes on; the next step tries again
+        logger.warning("stale validation check failed", exc_info=True)
 
 
 def _loop() -> None:

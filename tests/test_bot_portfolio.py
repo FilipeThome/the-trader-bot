@@ -169,6 +169,48 @@ def test_a_row_below_the_minimum_expected_profit_is_refused() -> None:
     assert rows[1].status == "bloqueada" and "lucro esperado" in rows[1].reason
 
 
+def test_a_shrink_to_the_cash_reports_the_cash_as_the_binding_limit() -> None:
+    rows = [_opportunity("BTC/USDT", 2.0), _opportunity("ETH/USDT", 1.0)]
+    rows[1].size_limit, rows[1].size_caps = "safety", {"safety": 100.0}
+    _allocate(rows, cash=170.0, limits=RiskLimits(max_entries_per_cycle=5))
+    assert rows[0].size_limit is None and rows[0].size_usd == 100.0
+    assert rows[1].size_limit == "cash"
+    assert rows[1].size_caps == {"safety": 100.0, "cash": rows[1].size_usd}
+
+
+def test_a_size_below_the_pair_minimum_is_refused_and_an_unknown_minimum_is_not() -> None:
+    small = [_opportunity("BTC/USDT", 1.0, size=8.0)]
+    assert _allocate(small, cash=10_000, floor=10.0) == []
+    assert small[0].status == "bloqueada" and "abaixo do mínimo de US$ 10.00" in small[0].reason
+    unknown = [_opportunity("BTC/USDT", 1.0, size=8.0)]
+    assert len(_allocate(unknown, cash=10_000, floor=None)) == 1
+    calls: list[str] = []
+
+    def floor(symbol: str) -> float:
+        calls.append(symbol)
+        return 5.0
+
+    rows = [_opportunity("BTC/USDT", 2.0), _opportunity("ETH/USDT", 1.0)]
+    allocate(rows, cash=10_000, live=[], capital=1000.0, limits=RiskLimits(), min_notional=floor)
+    assert sorted(calls) == ["BTC/USDT", "ETH/USDT"]
+
+
+def test_the_cautious_level_opens_one_entry_per_cycle_and_reducing_none() -> None:
+    rows = [_opportunity("BTC/USDT", 2.0), _opportunity("ETH/USDT", 1.0)]
+    accepted = allocate(rows, cash=10_000, live=[], capital=1000.0, limits=RiskLimits(),
+                        min_notional=lambda _symbol: 5.0, max_entries=1)
+    assert [row.symbol for row in accepted] == ["BTC/USDT"]
+    assert rows[1].reason == "limite de 1 entrada por ciclo no modo cauteloso; volta no próximo"
+    none = [_opportunity("BTC/USDT", 1.0)]
+    assert allocate(none, cash=10_000, live=[], capital=1000.0, limits=RiskLimits(),
+                    min_notional=lambda _symbol: 5.0, max_entries=0) == []
+    assert "nenhuma entrada" in none[0].reason
+    # A max_entries above the configured cap does not raise it.
+    many = [_opportunity(symbol, score) for symbol, score in (("BTC/USDT", 3.0), ("ETH/USDT", 2.0), ("SOL/USDT", 1.0))]
+    assert len(allocate(many, cash=10_000, live=[], capital=1000.0, limits=RiskLimits(),
+                        min_notional=lambda _symbol: 5.0, max_entries=9)) == 2
+
+
 def test_an_unreadable_balance_blocks_every_entry() -> None:
     rows = [_opportunity("BTC/USDT", 1.0)]
     assert _allocate(rows, cash=None) == []

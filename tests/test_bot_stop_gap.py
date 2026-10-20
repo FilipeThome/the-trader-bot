@@ -34,7 +34,7 @@ def _ready() -> Opportunity:
         direction=1,
         cost=0.002,
         gross_return=0.04,
-        size_usd=100,
+        size_usd=100.1,
         stop_price=STOP,
         target_price=104.0,
     )
@@ -46,10 +46,17 @@ def _executor(tmp_path, events: list[tuple[str, dict[str, Any]]]) -> Executor:
     )
 
 
-def _entered(executor: Executor) -> dict[str, Any]:
-    """An open position of 0.998 BTC with its stop resting at 98 / 97.51."""
+def _entered(executor: Executor, venue) -> dict[str, Any]:
+    """An open position of 0.998 BTC with its stop resting at 98 / 97.51.
+
+    The entry IOC buys exactly 1 BTC at an ask of 99.9 (100.1 USD at a 100.09 limit), so
+    the average with the 0.001 BTC fee is 100 and the 2% stop of the plan sits at 98.
+    """
+    venue.ask = Decimal("99.9")
     executor.enter(_ready())
+    venue.ask = None
     position = executor.store.open_positions()[0]
+    assert position["avg_price"] == pytest.approx(100.0) and position["stop_price"] == pytest.approx(STOP)
     assert position["stop_client_order_id"] == STOP_CLIENT_ID and position["stop_order_id"] == STOP_ORDER_ID
     return position
 
@@ -66,7 +73,7 @@ def _stuck(venue, *, filled: str = "0", cost: str = "0", state: str = "open") ->
 
 
 def _sells(venue) -> list[dict[str, Any]]:
-    return [call for call in venue.calls if call["order_type"] == "limit"]
+    return [call for call in venue.calls if call["order_type"] == "limit" and call["side"] == "sell"]
 
 
 def _kinds(events: list[tuple[str, dict[str, Any]]]) -> list[str]:
@@ -76,7 +83,7 @@ def _kinds(events: list[tuple[str, dict[str, Any]]]) -> list[str]:
 def test_a_triggered_stop_left_below_its_limit_is_cancelled_and_sold_next_sync(tmp_path, venue) -> None:
     events: list[tuple[str, dict[str, Any]]] = []
     executor = _executor(tmp_path, events)
-    position = _entered(executor)
+    position = _entered(executor, venue)
     _stuck(venue)
     venue.bid = Decimal("95")
     executor.sync_positions()
@@ -108,7 +115,7 @@ def test_a_triggered_stop_left_below_its_limit_is_cancelled_and_sold_next_sync(t
 def test_a_partially_filled_stuck_stop_books_the_part_and_sells_the_rest(tmp_path, venue) -> None:
     events: list[tuple[str, dict[str, Any]]] = []
     executor = _executor(tmp_path, events)
-    position = _entered(executor)
+    position = _entered(executor, venue)
     _stuck(venue, filled="0.4", cost="39.004")
     venue.bid = Decimal("95")
     executor.sync_positions()
@@ -133,7 +140,7 @@ def test_a_partially_filled_stuck_stop_books_the_part_and_sells_the_rest(tmp_pat
 def test_an_open_stop_with_the_bid_above_its_limit_is_left_alone(tmp_path, venue, bid) -> None:
     events: list[tuple[str, dict[str, Any]]] = []
     executor = _executor(tmp_path, events)
-    position = _entered(executor)
+    position = _entered(executor, venue)
     _stuck(venue)
     sent = len(venue.calls)
     # Below the trigger, but not below the limit: the stop-limit can still fill.
@@ -148,7 +155,7 @@ def test_an_open_stop_with_the_bid_above_its_limit_is_left_alone(tmp_path, venue
 def test_a_failed_first_ioc_retries_2pct_below_then_halts_when_still_open(tmp_path, venue) -> None:
     events: list[tuple[str, dict[str, Any]]] = []
     executor = _executor(tmp_path, events)
-    position = _entered(executor)
+    position = _entered(executor, venue)
     _stuck(venue)
     venue.bid = Decimal("95")
     venue.responses["sell:limit"] = [dict(NO_FILL), dict(NO_FILL)]
@@ -158,7 +165,7 @@ def test_a_failed_first_ioc_retries_2pct_below_then_halts_when_still_open(tmp_pa
     assert first["limit_price"] == "94.52" and second["limit_price"] == "93.1"
     assert first["idempotency_key"] != second["idempotency_key"]
     # No market fallback, and no stop re-placed under a price already below it.
-    assert [call["order_type"] for call in venue.calls] == ["market", "stop_loss_limit", "limit", "limit"]
+    assert [call["order_type"] for call in venue.calls] == ["limit", "stop_loss_limit", "limit", "limit"]
     left = executor.store.position(position["id"])
     assert left is not None and left["status"] == "open" and left["qty"] == pytest.approx(0.998)
     assert not left["stop_order_id"] and not left["stop_client_order_id"]
@@ -168,7 +175,7 @@ def test_a_failed_first_ioc_retries_2pct_below_then_halts_when_still_open(tmp_pa
 def test_a_partial_first_ioc_sells_the_rest_2pct_below_the_bid(tmp_path, venue) -> None:
     events: list[tuple[str, dict[str, Any]]] = []
     executor = _executor(tmp_path, events)
-    position = _entered(executor)
+    position = _entered(executor, venue)
     _stuck(venue)
     venue.bid = Decimal("95")
     venue.responses["sell:limit"] = [{"status": "ok", "filled": "0.5", "cost": "47.26", "fees": []}]
@@ -187,7 +194,7 @@ def test_a_partial_first_ioc_sells_the_rest_2pct_below_the_bid(tmp_path, venue) 
 def test_a_write_blocker_leaves_the_stuck_stop_on_the_book(tmp_path, venue) -> None:
     events: list[tuple[str, dict[str, Any]]] = []
     executor = _executor(tmp_path, events)
-    position = _entered(executor)
+    position = _entered(executor, venue)
     _stuck(venue)
     sent = len(venue.calls)
     venue.bid = Decimal("95")
@@ -228,7 +235,7 @@ def test_an_instance_position_with_a_stuck_stop_is_closed_the_same_way(tmp_path,
 def test_a_stop_that_fills_before_the_cancel_closes_the_row_from_its_own_fill(tmp_path, venue) -> None:
     events: list[tuple[str, dict[str, Any]]] = []
     executor = _executor(tmp_path, events)
-    position = _entered(executor)
+    position = _entered(executor, venue)
     _stuck(venue)
     venue.bid = Decimal("95")
 
@@ -253,7 +260,7 @@ def test_a_stop_that_fills_before_the_cancel_closes_the_row_from_its_own_fill(tm
 def test_a_stuck_stop_that_cannot_be_cancelled_halts_without_selling(tmp_path, venue) -> None:
     events: list[tuple[str, dict[str, Any]]] = []
     executor = _executor(tmp_path, events)
-    position = _entered(executor)
+    position = _entered(executor, venue)
     _stuck(venue)
     venue.bid = Decimal("95")
     venue.on_cancel = lambda _id: {"status": "unknown", "error": "cancel outcome is unknown"}
@@ -269,7 +276,7 @@ def test_a_stuck_stop_that_cannot_be_cancelled_halts_without_selling(tmp_path, v
 def test_an_ioc_of_unknown_outcome_halts_without_a_second_sale(tmp_path, venue) -> None:
     events: list[tuple[str, dict[str, Any]]] = []
     executor = _executor(tmp_path, events)
-    position = _entered(executor)
+    position = _entered(executor, venue)
     _stuck(venue)
     venue.bid = Decimal("95")
     venue.responses["sell:limit"] = [{"status": "unknown", "error": "timeout"}]
@@ -291,7 +298,7 @@ def test_a_failing_default_ledger_never_stops_the_exit(tmp_path, venue, monkeypa
 
     monkeypatch.setattr("bot.executor.append_ledger", broken)
     executor = Executor(Store(tmp_path / "bot.sqlite"), PROFILE)
-    position = _entered(executor)
+    position = _entered(executor, venue)
     _stuck(venue)
     venue.bid = Decimal("95")
     executor.sync_positions()

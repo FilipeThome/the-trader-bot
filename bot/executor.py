@@ -2,7 +2,10 @@
 
 A position moves ``pending -> open -> closed`` or ``pending -> void``:
 
-* entry: a ``pending`` row reserves the slot, then a market buy sized in quote;
+* entry: a ``pending`` row reserves the slot, then a LIMIT IOC buy priced
+  ``ENTRY_LIMIT_GAP`` above the ask and sized in base. A partial fill opens with
+  the quantity filled, no fill voids the row, and the stop and target are set on
+  the average fill from the setup's distances;
 * protection: right after the fill a STOP_LOSS_LIMIT sell rests on Binance, so
   the position is protected even when this process is down;
 * exit: the stop is taken off the book and the quantity is sold with LIMIT IOC
@@ -25,6 +28,15 @@ an IOC below the bid, then one more 2% below it (``EMERGENCY_LIMIT_GAP``).
 
 When a position cannot be protected or closed, ``UnprotectedPosition`` is
 raised and the runtime halts.
+
+Every position records its execution quality: the quote its entry was priced on,
+the slippage of each leg, the stop and the risk in USD at the fill, the lowest and
+highest price while open (``mark``) and the result in R. Each time a stop is taken
+off and put back (trailing, first target, partial sale, re-stop, remainder of an
+exit), the time the position stood without it is stored (``stop_windows``).
+
+While the portfolio is in REDUCING (``bot_state.risk_state``), every buy is
+refused here: entries, instance inventory and scale-ins. Stops and exits go on.
 """
 
 from __future__ import annotations
@@ -32,6 +44,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -56,6 +69,12 @@ logger = logging.getLogger(__name__)
 STOP_LIMIT_GAP = Decimal("0.005")
 #: An exit IOC is priced this far below the bid so it crosses the book.
 EXIT_LIMIT_GAP = Decimal("0.005")
+#: An entry IOC is priced this far above the ask: it crosses the book, and the slippage
+#: of a strategy entry is bounded by it.
+ENTRY_LIMIT_GAP = Decimal("0.002")
+#: Most room a trailing stop must leave below ``min(bid, last)`` (D16). It is at most half
+#: the trail distance and never less than the stop-limit gap, so a small callback still moves.
+TRAIL_CLEARANCE = Decimal("0.01")
 #: The second and last IOC for a stop the price gapped through. No market sell follows:
 #: the Spot Testnet refuses market sells sized in base, so that path could never be tested.
 EMERGENCY_LIMIT_GAP = Decimal("0.02")
@@ -151,6 +170,23 @@ def _leg(position: dict[str, Any]) -> dict[str, Any] | None:
     return leg if isinstance(leg, dict) else None
 
 
+def _positive(value: Any) -> Decimal | None:
+    number = _dec(value)
+    return number if number is not None and number > 0 else None
+
+
+def _exit_slippage(price: Decimal, ref: Decimal | None) -> Decimal | None:
+    """Share an exit sold below ``ref`` (positive: worse than the reference)."""
+    return 1 - price / ref if ref is not None and ref > 0 and price > 0 else None
+
+
+def trail_clearance(peak: Decimal, candidate: Decimal) -> Decimal:
+    """Room a new trailing stop must leave below the price: half the trail distance,
+    between ``STOP_LIMIT_GAP`` and ``TRAIL_CLEARANCE``."""
+    half = (peak - candidate) / peak / 2 if peak > 0 else Decimal(0)
+    return max(STOP_LIMIT_GAP, min(TRAIL_CLEARANCE, half))
+
+
 def floor_price(value: Decimal, rules: MarketRules) -> Decimal:
     """Floor ``value`` onto every price tick Binance checks (0 when impossible)."""
     price = value
@@ -164,13 +200,21 @@ def floor_price(value: Decimal, rules: MarketRules) -> Decimal:
 
 class Executor:
     def __init__(
-        self, store: Store, profile_id: str, *, exit_policy: str = "trailing", ledger: Ledger | None = None
+        self,
+        store: Store,
+        profile_id: str,
+        *,
+        exit_policy: str = "trailing",
+        ledger: Ledger | None = None,
+        exit_hysteresis: bool = True,
     ) -> None:
         self.store = store
         self.profile_id = profile_id
         #: Recorded on every position, so the hit rate only mixes trades of one exit rule.
         self.exit_policy = exit_policy
         self.ledger: Ledger = ledger if ledger is not None else _append_ledger
+        #: Recorded on every strategy position: its exit rule keeps the hysteresis it entered with.
+        self.exit_hysteresis = exit_hysteresis
 
     # -- entries ---------------------------------------------------------
 
@@ -194,8 +238,12 @@ class Executor:
         manual: bool = False,
         allow_test: bool = False,
     ) -> dict[str, Any]:
-        """Open one position. A test row needs the Spot Testnet profile and a manual
-        order, or ``allow_test`` (automatic trading with the testnet test mode on)."""
+        """Open one position with a LIMIT IOC buy ``ENTRY_LIMIT_GAP`` above the ask.
+
+        The quantity is ``size_usd / limit`` floored to the lot, so the order never
+        spends more than its size. A test row needs the Spot Testnet profile and a
+        manual order, or ``allow_test`` (automatic trading with the testnet test mode on).
+        """
         position_id: int | None = None
 
         def decide(decision: str, reason: str, result: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -215,6 +263,9 @@ class Executor:
             return decide("bloqueado", "venda a descoberto não existe no spot")
         if opportunity.test_only and (not (manual or allow_test) or self.profile_id != TEST_PROFILE):
             return decide("bloqueado", "linha de teste: só no Spot Testnet, manual ou com o modo teste no automático")
+        reducing = self._reducing()
+        if reducing is not None:
+            return decide("bloqueado", reducing)
         if clock_blocked or weight_pressure():
             return decide("nao_operar", "peso da API ou relógio fora de 1s — só cancelamentos e saídas")
         if opportunity.size_usd <= 0:
@@ -224,8 +275,29 @@ class Executor:
         # Every open position keeps one order in reserve for its own re-stop or exit.
         if service.orders_remaining(self.profile_id) < round_trip + len(self.store.open_positions()):
             return decide("bloqueado", "o orçamento diário de ordens não cobre entrada, stop e saída")
+        symbol = opportunity.symbol
+        rules = service.market_rules(symbol, self.profile_id)
+        if rules is None:
+            return decide("bloqueado", "regras do mercado indisponíveis")
+        ask = self._ask(symbol)
+        if ask is None or ask <= 0:
+            # No market fallback: a market buy's slippage has no bound.
+            return decide("bloqueado", "cotação sem ask")
+        limit = floor_price(ask * (1 + ENTRY_LIMIT_GAP), rules)
+        if limit < ask:
+            return decide("bloqueado", "preço limite da entrada abaixo do ask")
+        # The gate values a buy limit at qty x max(quote, limit) <= size: the per-order headroom holds.
+        qty = floor_to_step(Decimal(f"{opportunity.size_usd:.2f}") / limit, rules.lot_step)
+        if (
+            qty <= 0
+            or (rules.min_qty is not None and qty < rules.min_qty)
+            or (rules.min_notional is not None and qty * limit < rules.min_notional)
+        ):
+            return decide("bloqueado", "entrada abaixo do mínimo da corretora")
+        plan_stop = _positive(opportunity.risk_pct)
+        plan_target = _positive(opportunity.plan_target_pct)
         position_id = self.store.open_pending(
-            opportunity.symbol,
+            symbol,
             opportunity.strategy,
             stop_price=opportunity.stop_price,
             target_price=opportunity.target_price,
@@ -234,39 +306,61 @@ class Executor:
             entry_win_rate=opportunity.win_rate,
             # Written with the reservation: an entry the sync resolves later keeps its time limit.
             exit_deadline=(_now() + DAY.max_hold).isoformat() if policy == "day" else None,
+            timeframe=opportunity.timeframe or None,
+            plan_stop_pct=float(plan_stop) if plan_stop is not None and plan_stop < 1 else None,
+            plan_target_pct=None if plan_target is None else float(plan_target),
+            exit_hysteresis=self.exit_hysteresis,
         )
         if position_id is None:
             return decide("bloqueado", "já existe posição viva neste par e estratégia")
         key = self._key(position_id, "entry", 0)
-        # Persisted before the write: a crash after the send still leaves a row the sync can resolve.
-        self.store.update_position(position_id, entry_client_order_id=service.client_order_id(self.profile_id, key))
+        # Persisted before the write: a crash after the send still leaves a row the sync can resolve,
+        # and the fill's slippage is measured against the quote the order was priced on.
+        self.store.update_position(
+            position_id,
+            entry_client_order_id=service.client_order_id(self.profile_id, key),
+            entry_ref_price=float(ask),
+        )
         result = service.submit_order(
-            opportunity.symbol,
+            symbol,
             self.profile_id,
             side="buy",
-            notional=f"{opportunity.size_usd:.2f}",
-            order_type="market",
+            order_type="limit",
+            quantity=decimal_text(qty),
+            limit_price=decimal_text(limit),
+            time_in_force="ioc",
             idempotency_key=key,
             session_id="bot",
             held=self._held(),
         )
         status = _status(result)
         if status == "ok":
-            opened = self._open_from_fill(position_id, result)
-            if opened is None:
+            fill = self._open_from_fill(position_id, result)
+            if fill is None:
                 return decide("pendente", "execução da entrada ainda não confirmada", result)
-            return decide("operar" if opened else "bloqueado", opportunity.reason if opened else "ordem sem execução", result)
+            if fill.qty <= 0:
+                return decide("bloqueado", "entrada IOC sem execução: o preço passou do limite", result)
+            reason = opportunity.reason
+            if fill.qty < qty:
+                reason = f"{reason} (entrada IOC executada em parte: {decimal_text(fill.qty)} de {decimal_text(qty)})"
+            return decide("operar", reason, result)
         if status == "unknown":
             return decide("pendente", f"resultado da entrada desconhecido: {_reason(result)}", result)
         self.store.void_position(position_id, _reason(result))
         return decide("bloqueado", _reason(result), result)
 
-    def _open_from_fill(self, position_id: int, result: dict[str, Any]) -> bool | None:
+    def _open_from_fill(self, position_id: int, result: dict[str, Any]) -> Fill | None:
         """Turn a filled entry into an open position and put its stop on the book.
 
-        ``None`` when the fill cannot be read yet: the row stays ``pending`` for the sync.
+        Returns the fill; an empty one voids the row (an IOC that found no ask under its
+        limit). ``None`` when the fill cannot be read yet, or the row is no longer
+        pending: it stays as it is for the sync. A partial fill opens with what filled.
         """
         position = self._position(position_id)
+        if position["status"] != "pending":
+            # Already opened or voided by another path: never book the same entry twice.
+            logger.warning("entry fill for position %s ignored: row is %s", position_id, position["status"])
+            return None
         symbol = position["symbol"]
         base = symbol.split("/", 1)[0]
         rules = service.market_rules(symbol, self.profile_id)
@@ -275,7 +369,7 @@ class Executor:
             return None
         if fill.qty <= 0:
             self.store.void_position(position_id, "ordem sem execução")
-            return False
+            return fill
         taker = rules.taker_fee if rules is not None else Decimal(str(SPOT_TAKER))
         net = fill.qty - fill.fee_base
         free = service.free_balance(base, self.profile_id)
@@ -289,12 +383,22 @@ class Executor:
         stop = _dec(position.get("stop_price")) or avg * (1 - DEFAULT_STOP_PCT)
         target = _dec(position.get("target_price"))
         fixed = parse_fixed(position.get("exit_policy"))
+        plan_stop = _positive(position.get("plan_stop_pct"))
         if fixed is not None and avg > 0:
             # The operator's percentages count from the real average fill, not the scoring price.
             stop = avg * (1 - Decimal(str(fixed.stop_loss_pct)))
             target = avg * (1 + Decimal(str(fixed.take_profit_pct)))
+        elif plan_stop is not None and plan_stop < 1 and avg > 0:
+            # So do the setup's own distances, for every other policy. Instance rows carry no
+            # plan: their stop is the level the robot planned.
+            stop = avg * (1 - plan_stop)
+            plan_target = _positive(position.get("plan_target_pct"))
+            if plan_target is not None:
+                target = avg * (1 + plan_target)
         entry_fee = fill.fee_quote + fill.fee_base * fill.average
         trail_pct = (avg - stop) / avg if avg > 0 and stop < avg else DEFAULT_STOP_PCT
+        risk_usd = qty * (avg - stop) if stop < avg else Decimal(0)
+        ref = _positive(position.get("entry_ref_price"))
         self.store.update_position(
             position_id,
             status="open",
@@ -305,10 +409,16 @@ class Executor:
             fees=float(entry_fee),
             peak_price=float(avg),
             trail_pct=float(trail_pct),
+            initial_stop=float(stop),
+            initial_risk_usd=float(risk_usd) if risk_usd > 0 else None,
+            mae_price=float(avg),
+            mfe_price=float(avg),
+            # Positive: paid above the quote the order was priced on (fees excluded).
+            entry_slippage=float(fill.average / ref - 1) if ref is not None and fill.average > 0 else None,
         )
         self.store.record_day(_day(), trades=1, fees=float(entry_fee))
         self.protect(position_id)
-        return True
+        return fill
 
     # -- DCA and grid inventory ----------------------------------------------
 
@@ -320,6 +430,9 @@ class Executor:
         The row is an ordinary position whose strategy and exit policy are the kind, so
         the sync, the halt, the risk checks and the panel treat it like any other.
         """
+        reducing = self._reducing()
+        if reducing is not None:
+            return {"status": "blocked", "error": reducing}
         if clock_blocked:
             return {"status": "blocked", "error": "relógio fora de 1s — só cancelamentos e saídas"}
         blocker = service.write_blocker()
@@ -351,7 +464,7 @@ class Executor:
             opened = self._open_from_fill(position_id, result)
             if opened is None:
                 return {"status": "pending", "position_id": position_id}
-            if not opened:
+            if opened.qty <= 0:
                 return {"status": "error", "error": "ordem sem execução", "position_id": position_id}
             self._decide(symbol, kind, "operar", f"robô {kind} comprou o estoque inicial", result=result, position_id=position_id)
             return {"status": "ok", "position_id": position_id}
@@ -376,6 +489,9 @@ class Executor:
             return "sem stop confirmado"
         if position.get("pending_leg") or position.get("keep_qty") is not None:
             return "outra ordem da posição em andamento"
+        reducing = self._reducing()
+        if reducing is not None:
+            return reducing
         if clock_blocked:
             return "relógio fora de 1s — só cancelamentos e saídas"
         blocker = service.write_blocker()
@@ -464,7 +580,9 @@ class Executor:
         """Put the stop of a position that grew on its whole quantity, at the level its leg recorded."""
         position = self._position(position_id)
         leg = _leg(position) or {}
+        started: float | None = None
         if position.get("stop_order_id") or position.get("stop_client_order_id"):
+            started = time.monotonic()
             settled = self._take_stop_off(position)
             if settled == "filled":
                 raise UnprotectedPosition(f"{position['symbol']}: o stop executou durante o aumento; a compra nova ficou sem stop")
@@ -478,6 +596,7 @@ class Executor:
             fields["stop_price"] = float(Decimal(str(leg["stop"])))
         self.store.update_position(position_id, **fields)
         self.protect(position_id)
+        self._stop_window("restop", position_id, started)
         return "comprado"
 
     def _settle_buy(self, position: dict[str, Any], leg: dict[str, Any]) -> None:
@@ -565,14 +684,31 @@ class Executor:
         self._decide(symbol, position["strategy"], "bloqueado", f"stop recusado: {_reason(result)}", result=result)
         return self._emergency_exit(position_id, f"stop recusado: {_reason(result)}")
 
+    def mark(self, position_id: int, last: Decimal) -> None:
+        """Track the lowest and highest price an open position saw (MAE and MFE). No order."""
+        position = self.store.position(position_id)
+        if position is None or position["status"] != "open" or last <= 0:
+            return
+        avg = _dec(position.get("avg_price")) or last
+        low = _dec(position.get("mae_price")) or avg
+        high = _dec(position.get("mfe_price")) or avg
+        fields: dict[str, Any] = {}
+        if last < low:
+            fields["mae_price"] = float(last)
+        if last > high:
+            fields["mfe_price"] = float(last)
+        if fields:
+            self.store.update_position(position_id, **fields)
+
     def trail(self, position_id: int, last_price: Decimal, *, reserve: int) -> str:
         """Raise the resting stop to follow the highest price. Returns what happened.
 
         The stop moves only when every check passes before it leaves the book:
         no halt or mandate problem, no API weight pressure, a confirmed resting
         stop, a new level at least ``TRAIL_STEP`` above the old one and below
-        the bid by the stop-limit gap, and ``reserve`` orders left today (one
-        per open position). Otherwise the current stop simply stays. A refused
+        ``min(bid, last_price)`` by ``trail_clearance`` (D16), and ``reserve``
+        orders left today (one per open position). Otherwise the current stop
+        simply stays. A refused
         replacement goes through ``protect``: exit at once, or a halt. A
         ``trailing_tp`` position keeps its entry stop until the activation gain.
         """
@@ -602,8 +738,11 @@ class Executor:
         if candidate < stop * (1 + TRAIL_STEP):
             return "stop já no nível"
         bid = self._bid(position["symbol"])
-        if bid is None or candidate >= bid * (1 - STOP_LIMIT_GAP):
-            return "novo stop perto demais do preço"
+        if bid is None or bid <= 0:
+            return "cotação indisponível"
+        clearance = trail_clearance(peak, candidate)
+        if candidate >= min(bid, last_price) * (1 - clearance):
+            return f"novo stop sem folga de {float(clearance):.1%} do preço"
         if service.orders_remaining(self.profile_id) < reserve:
             return "orçamento diário de ordens reservado"
         # The mandate gate values a sell by quantity at the quote's last price, the
@@ -618,6 +757,7 @@ class Executor:
             return "cotação indisponível"
         if Decimal(str(position["qty"])) * max(bid, mark) > cap * _CAP_HEADROOM:
             return "posição acima do teto por ordem: o stop atual fica"
+        started = time.monotonic()
         settled = self._take_stop_off(position)
         if settled == "filled":
             return "stop executado"
@@ -627,6 +767,7 @@ class Executor:
             return "posição fechada"
         self.store.update_position(position_id, stop_price=float(candidate))
         self.protect(position_id)
+        self._stop_window("trail", position_id, started)
         self._decide(position["symbol"], position["strategy"], "stop_movel", f"stop subiu para {candidate}")
         return "movido"
 
@@ -706,6 +847,7 @@ class Executor:
     def _finish_take_profit(self, position: dict[str, Any], breakeven: Decimal) -> str:
         """Mark the first target done and move the stop of what is held to break-even, without a sale."""
         position_id = int(position["id"])
+        started = time.monotonic()
         settled = self._take_stop_off(position)
         if settled == "filled":
             return "stop executado"
@@ -716,6 +858,7 @@ class Executor:
         self.store.update_position(position_id, stop_price=float(breakeven), tp1_done=1, keep_qty=None)
         self._decide(position["symbol"], position["strategy"], "saida_parcial", "primeiro alvo concluído; a sobra ficou abaixo do mínimo")
         self.protect(position_id)
+        self._stop_window("tp1", position_id, started)
         return "concluído"
 
     def exit_position(
@@ -728,6 +871,7 @@ class Executor:
         leg: str = "exit",
         next_stop: Decimal | None = None,
         gap: Decimal = EXIT_LIMIT_GAP,
+        exit_ref: Decimal | None = None,
     ) -> dict[str, Any]:
         """Take the stop off the book and sell the position with LIMIT IOC orders.
 
@@ -735,7 +879,8 @@ class Executor:
         target): the row never closes, the stop goes back on the rest at
         ``next_stop`` once the sale is complete, or at the old stop when it is not.
         ``leg`` keeps the order keys of a partial sale apart from a later full exit.
-        Each IOC is priced ``gap`` below the bid.
+        Each IOC is priced ``gap`` below the bid. A closing sale records its slippage
+        against ``exit_ref`` (the price that decided the exit), or the bid at the first chunk.
         """
         position = self.store.position(position_id)
         if position is None or position["status"] != "open":
@@ -757,7 +902,10 @@ class Executor:
             return {"status": "blocked", "error": f"{blocker}; o stop segue na corretora"}
         if service.orders_remaining(self.profile_id) < 1:
             return {"status": "blocked", "error": "orçamento diário de ordens esgotado; o stop segue na corretora"}
+        # Time without a resting stop, from the cancel to the re-protect that follows (D17 metric).
+        started: float | None = None
         if position.get("stop_order_id") or position.get("stop_client_order_id"):
+            started = time.monotonic()
             settled = self._take_stop_off(position)
             if settled == "filled":
                 return {"status": "ok", "closed_by": "stop"}
@@ -768,30 +916,33 @@ class Executor:
                 return {"status": "ok", "closed_by": "stop"}
         rules = service.market_rules(symbol, self.profile_id)
         if rules is None:
-            return self._after_exit(position_id, reason, "regras do mercado indisponíveis", protect_remainder)
+            return self._after_exit(position_id, reason, "regras do mercado indisponíveis", protect_remainder, started)
         partial = keep_qty is not None
-        if partial:
+        if keep_qty is not None:
             # The kept quantity and the leg are read back in the sync when the result is unknown
             # (``_settle_partial``), and a retry sells only down to the same quantity. A retry of
             # the same leg keeps the quantity the sale started from.
-            started = _leg(position) or {}
-            if started.get("kind") != "sell" or started.get("leg") != leg or started.get("qty_before") is None:
-                started = {"qty_before": float(position["qty"])}
+            sale_leg = _leg(position) or {}
+            if sale_leg.get("kind") != "sell" or sale_leg.get("leg") != leg or sale_leg.get("qty_before") is None:
+                sale_leg = {"qty_before": float(position["qty"])}
             self.store.update_position(
                 position_id,
                 keep_qty=float(keep_qty),
-                pending_leg=json.dumps({"kind": "sell", "leg": leg, "qty_before": started["qty_before"]}),
+                pending_leg=json.dumps({"kind": "sell", "leg": leg, "qty_before": sale_leg["qty_before"]}),
             )
         remaining = Decimal(str(position["qty"])) - (keep_qty or Decimal(0))
         cap = service.order_notional_cap(symbol, self.profile_id)
         sold = proceeds = Decimal(0)
         failure = ""
         unknown = False
+        ref = exit_ref if exit_ref is not None and exit_ref > 0 else None
         while remaining > 0:
             bid = self._bid(symbol)
             if bid is None or bid <= 0:
                 failure = "cotação indisponível"
                 break
+            if ref is None:
+                ref = bid
             limit = floor_price(bid * (1 - gap), rules)
             chunk = floor_to_step(remaining, rules.lot_step)
             if cap is not None:
@@ -842,16 +993,23 @@ class Executor:
                 failure = "IOC executada em parte"
                 break
         if partial:
-            return self._after_partial(position_id, reason, remaining, sold, failure, unknown, next_stop)
+            return self._after_partial(
+                position_id, reason, remaining, sold, failure, unknown, next_stop,
+                started=started, kind="tp1" if leg == "tp1" else "partial",
+            )
         if remaining <= 0 or failure == "sobra abaixo do mínimo da corretora":
-            self._close(position_id, proceeds / sold if sold > 0 else Decimal(str(position["avg_price"])))
+            if sold > 0:
+                exit_avg = proceeds / sold
+                self._close(position_id, exit_avg, exit_slippage=_exit_slippage(exit_avg, ref))
+            else:
+                self._close(position_id, Decimal(str(position["avg_price"])))
             self._decide(symbol, position["strategy"], "saida", reason)
             return {"status": "ok", "sold": float(sold)}
         self.store.update_position(position_id, qty=float(remaining))
         if unknown:
             # Reconciliation settles the order first; the next sync re-protects what is left.
             return {"status": "unknown", "error": failure, "sold": float(sold)}
-        return self._after_exit(position_id, reason, failure, protect_remainder)
+        return self._after_exit(position_id, reason, failure, protect_remainder, started)
 
     def _after_partial(
         self,
@@ -862,6 +1020,9 @@ class Executor:
         failure: str,
         unknown: bool,
         next_stop: Decimal | None,
+        *,
+        started: float | None = None,
+        kind: str = "partial",
     ) -> dict[str, Any]:
         """Re-protect the rest of a partial sale. The row stays open: it still holds ``keep_qty``."""
         if unknown:
@@ -877,6 +1038,7 @@ class Executor:
             # Otherwise an earlier attempt sold part of it: the kept quantity stays, so a retry
             # (a day trade's first target) sells only down to it, never more than planned.
             self.protect(position_id)
+            self._stop_window(kind, position_id, started)
             return {"status": "error", "error": failure or "nada vendido na venda parcial"}
         if remaining <= 0 or (sold > 0 and failure == "parte abaixo do mínimo da corretora"):
             # Sold down to the kept size, or to less than one sellable order above it: that dust stays held.
@@ -889,14 +1051,24 @@ class Executor:
             position = self._position(position_id)
             self._decide(position["symbol"], position["strategy"], "saida_parcial", reason)
             self.protect(position_id)
+            self._stop_window(kind, position_id, started)
             return {"status": "ok", "sold": float(sold), "partial": True}
-        return self._after_exit(position_id, reason, failure or "venda parcial incompleta", True)
+        return self._after_exit(position_id, reason, failure or "venda parcial incompleta", True, started, kind)
 
-    def _after_exit(self, position_id: int, reason: str, failure: str, protect_remainder: bool) -> dict[str, Any]:
+    def _after_exit(
+        self,
+        position_id: int,
+        reason: str,
+        failure: str,
+        protect_remainder: bool,
+        started: float | None = None,
+        kind: str = "exit_remainder",
+    ) -> dict[str, Any]:
         position = self._position(position_id)
         self._decide(position["symbol"], position["strategy"], "saida_parcial", f"{reason}: {failure}")
         if protect_remainder:
             self.protect(position_id)
+            self._stop_window(kind, position_id, started)
         return {"status": "error", "error": failure}
 
     def _take_stop_off(self, position: dict[str, Any]) -> str:
@@ -960,7 +1132,8 @@ class Executor:
             self._book_sale(position["id"], filled, proceeds, fee)
             remaining = Decimal(str(position["qty"])) - filled
             if remaining <= 0:
-                self._close(position["id"], proceeds / filled)
+                exit_avg = proceeds / filled
+                self._close(position["id"], exit_avg, exit_slippage=_exit_slippage(exit_avg, _dec(position.get("stop_price"))))
                 return "filled"
             self.store.update_position(position["id"], qty=float(remaining))
         return "cancelled"
@@ -975,7 +1148,9 @@ class Executor:
         proceeds = _dec(order.get("cost")) or filled * (_dec(order.get("average")) or Decimal(str(position["stop_price"])))
         fee = proceeds * Decimal(str(SPOT_TAKER))
         self._book_sale(position["id"], filled, proceeds, fee)
-        self._close(position["id"], proceeds / filled if filled > 0 else Decimal(str(position["stop_price"])))
+        stop = _dec(position.get("stop_price"))
+        exit_avg = proceeds / filled if filled > 0 else (stop or Decimal(0))
+        self._close(position["id"], exit_avg, exit_slippage=_exit_slippage(exit_avg, stop))
         self._decide(position["symbol"], position["strategy"], "saida", "stop executado na corretora")
 
     def _book_sale(self, position_id: int, sold: Decimal, proceeds: Decimal, fees: Decimal) -> None:
@@ -990,8 +1165,18 @@ class Executor:
         )
         self.store.record_day(_day(), net_pnl=float(net), gross_pnl=float(gross), fees=float(fees))
 
-    def _close(self, position_id: int, exit_price: Decimal) -> None:
+    def _close(self, position_id: int, exit_price: Decimal, *, exit_slippage: Decimal | None = None) -> None:
+        """Close the row, with the closing sale's slippage and the result in R (net PnL over the
+        risk at the fill; left empty for a row without one)."""
         position = self._position(position_id)
+        fields: dict[str, Any] = {}
+        if exit_slippage is not None:
+            fields["exit_slippage"] = float(exit_slippage)
+        risk = _positive(position.get("initial_risk_usd"))
+        if risk is not None:
+            fields["r_multiple"] = float(Decimal(str(position["realized_pnl"])) / risk)
+        if fields:
+            self.store.update_position(position_id, **fields)
         self.store.close_position(
             position_id,
             exit_price=float(exit_price),
@@ -1158,7 +1343,7 @@ class Executor:
         result: dict[str, Any] = {}
         for gap in (EXIT_LIMIT_GAP, EMERGENCY_LIMIT_GAP):
             attempts += 1
-            result = self.exit_position(position_id, _STOP_GAPPED_REASON, protect_remainder=False, gap=gap)
+            result = self.exit_position(position_id, _STOP_GAPPED_REASON, protect_remainder=False, gap=gap, exit_ref=stop)
             current = self._position(position_id)
             if current["status"] != "open":
                 break
@@ -1177,6 +1362,10 @@ class Executor:
         sold = qty_before - Decimal(str(current["qty"]))
         gross = Decimal(str(current["realized_pnl"])) + Decimal(str(current["fees"])) - booked_before
         exit_avg = (gross + avg * sold) / sold if sold > 0 else Decimal(str(current["exit_price"]))
+        slippage = _exit_slippage(exit_avg, stop)
+        if slippage is not None:
+            # Over every sale since the stop was found stuck (its own part fill, both IOCs), not the last one.
+            self.store.update_position(position_id, exit_slippage=float(slippage))
         self._record(
             "stop_gapped_exit",
             {
@@ -1265,6 +1454,38 @@ class Executor:
 
     def _bid(self, symbol: str) -> Decimal | None:
         return self._quote_field(symbol, "bid")
+
+    def _ask(self, symbol: str) -> Decimal | None:
+        return self._quote_field(symbol, "ask")
+
+    def _reducing(self) -> str | None:
+        """Why a buy is refused: the portfolio is in REDUCING (``bot_state.risk_state``), else None."""
+        state = self.store.get_state("risk_state")
+        if not isinstance(state, dict) or state.get("level") != "reducing":
+            return None
+        drawdown = state.get("drawdown")
+        if isinstance(drawdown, (int, float)) and not isinstance(drawdown, bool):
+            return f"modo só reduzir: drawdown de {drawdown:.1%}"
+        return "modo só reduzir"
+
+    def _stop_window(self, kind: str, position_id: int, started: float | None) -> None:
+        """Store how long the position stood without a stop, once the new one is on the book.
+
+        Nothing is stored when no stop was taken off (``started`` None) or none rests now
+        (the row closed, or the next sync re-protects it). A failed write never stops an order.
+        """
+        if started is None:
+            return
+        elapsed_ms = (time.monotonic() - started) * 1000
+        try:
+            position = self.store.position(position_id)
+            if position is None or position["status"] != "open":
+                return
+            if not (position.get("stop_order_id") or position.get("stop_client_order_id")):
+                return
+            self.store.record_stop_window(kind, position["symbol"], position_id, elapsed_ms)
+        except Exception:  # noqa: BLE001 - a metric must not interrupt the order flow
+            logger.exception("stop window of position %s not recorded", position_id)
 
     def _mark(self, symbol: str) -> Decimal | None:
         """Last trade price, the one the mandate gate values a sell by quantity at."""
