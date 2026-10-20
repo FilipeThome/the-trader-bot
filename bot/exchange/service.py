@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import replace
+from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -393,12 +393,25 @@ def trading_fees(symbol: str, profile_id: str) -> tuple[Decimal, Decimal] | None
     return fees
 
 
+@dataclass(frozen=True)
+class AccountMarketRules(MarketRules):
+    """Market rules whose ``taker_fee`` is the account's own fee.
+
+    ``gate_taker_fee`` keeps the market's default fee: the order gate checks a
+    sell's free balance against it (``free >= qty x (1 + fee)``), so a sell's
+    margin must cover the larger of the two.
+    """
+
+    gate_taker_fee: Decimal | None = None
+
+
 def market_rules(symbol: str, profile_id: str) -> MarketRules | None:
     """Exchange filters (tick, lot, minimum notional, taker fee) for ``symbol``.
 
     The taker fee is the account's own when ``trading_fees`` has read it; this
     call never reads it, so it adds no signed request. Otherwise it is the
-    market's default from the exchange catalog.
+    market's default from the exchange catalog. With the account's fee, the
+    market's default stays in ``gate_taker_fee`` (``AccountMarketRules``).
     """
     profile = profile_by_id(profile_id)
     try:
@@ -415,7 +428,8 @@ def market_rules(symbol: str, profile_id: str) -> MarketRules | None:
         return None
     fees = _known_fees(symbol, profile.id)
     if fees is not None:
-        rules = replace(rules, taker_fee=fees[1])
+        values = {item.name: getattr(rules, item.name) for item in fields(MarketRules)}
+        rules = AccountMarketRules(**{**values, "taker_fee": fees[1]}, gate_taker_fee=rules.taker_fee)
     return rules
 
 

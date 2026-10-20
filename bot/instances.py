@@ -20,6 +20,15 @@ because a spot stop locks the base asset a resting sell limit would need: round
 trips inside one minute are missed, and each leg pays the taker fee and the
 spread. The profit floor per grid accounts for both.
 
+With ``resting_buys`` (opt-in, off by default) the next buy rests on the book
+instead: one LIMIT GTC buy per instance, at the next DCA safety price or at the
+grid level under the lowest one held (``levels[k-1]``). A resting buy locks
+USDT, not the base the stop locks, so both stay on the book together. It fills
+at its level, with no spread and no missed touch inside the minute; Spot VIP0
+pays the same 0.1% as a maker, so the gain is the price, not the fee. Each one
+reserves ``ORDERS_PER_RESTING_LEG`` orders of the day: the buy, its cancel and
+the stop re-placed over the grown position.
+
 A new round waits ``cooldown_minutes`` after the previous one closed, as
 Binance waits 60 s: a DCA repeat after its take-profit, and a grid restart from
 an empty inventory after a full sell-out (``cooldown_ends``).
@@ -45,6 +54,8 @@ MIN_NOTIONAL_HEADROOM = 1.05
 DCA_FIXED_ORDERS = 3
 #: Each safety buy or grid leg costs the order plus the re-placed stop.
 ORDERS_PER_LEG = 2
+#: A resting buy costs its placement, its cancel and the stop re-placed after its fill.
+ORDERS_PER_RESTING_LEG = 3
 #: Minutes a new round waits after the previous one closed (Binance's 60 s).
 DEFAULT_COOLDOWN_MINUTES = 1
 
@@ -68,6 +79,8 @@ class DcaParams(BaseModel):
     max_orders_per_day: int = Field(default=20, ge=4, le=200)
     #: Pause between a take-profit and the next round's base buy. Absent from older stored params.
     cooldown_minutes: int = Field(default=DEFAULT_COOLDOWN_MINUTES, ge=0, le=1440)
+    #: Rest the next safety order on the book as a LIMIT GTC buy. Absent from older stored params.
+    resting_buys: bool = False
 
     @model_validator(mode="after")
     def _ladder_above_zero(self) -> "DcaParams":
@@ -91,6 +104,8 @@ class GridParams(BaseModel):
     max_orders_per_day: int = Field(default=20, ge=4, le=200)
     #: Pause between a full sell-out and the restart from an empty inventory. Absent from older stored params.
     cooldown_minutes: int = Field(default=DEFAULT_COOLDOWN_MINUTES, ge=0, le=1440)
+    #: Rest the buy of the next level down on the book as a LIMIT GTC buy. Absent from older stored params.
+    resting_buys: bool = False
 
     @model_validator(mode="after")
     def _ordered(self) -> "GridParams":
@@ -139,8 +154,16 @@ def dca_plan(params: DcaParams, base_price: float, *, taker: float) -> dict[str,
         "total_usd": total,
         "loss_at_stop_usd": loss,
         "take_profit_from_base": base_price * (1 + params.take_profit_pct),
-        "orders_per_round": DCA_FIXED_ORDERS + ORDERS_PER_LEG * params.so_count,
+        "orders_per_round": DCA_FIXED_ORDERS
+        + (ORDERS_PER_RESTING_LEG if params.resting_buys else ORDERS_PER_LEG) * params.so_count,
     }
+
+
+def dca_rest_target(params: DcaParams, base_price: float, filled: int) -> dict[str, float] | None:
+    """The safety order a resting buy waits at: the next one after ``filled``, or None when all filled."""
+    if filled >= params.so_count:
+        return None
+    return dca_ladder(params, base_price)[filled + 1]
 
 
 def dca_next(params: DcaParams, base_price: float, filled: int, price: float, avg: float) -> tuple[str, int] | None:
@@ -193,6 +216,14 @@ def grid_next(levels: list[float], k: int, price: float) -> tuple[str, int] | No
     if sell_to > k:
         return ("sell", sell_to)
     return None
+
+
+def grid_rest_target(levels: list[float], qtys: list[float], k: int) -> tuple[int, float, float] | None:
+    """``(level, price, qty)`` of the buy a resting order waits for: the level under the lowest
+    one held (``k``), or None when every level is held."""
+    if k <= 0 or k > len(qtys):
+        return None
+    return k - 1, levels[k - 1], qtys[k - 1]
 
 
 def grid_plan(params: GridParams, price: float, *, taker: float, spread: float) -> dict[str, Any]:

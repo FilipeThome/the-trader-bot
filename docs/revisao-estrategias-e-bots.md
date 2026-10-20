@@ -1,6 +1,6 @@
 # Revisão do sistema frente à prática profissional, à pesquisa acadêmica e aos bots de mercado
 
-Data: 2026-10-20. Branch: `feat/auto-trade-tp-sl`. Documento de análise e proposta. Nada aqui foi implementado.
+Data: 2026-10-20. Branch: `feat/auto-trade-tp-sl`. Documento de análise e proposta, escrito antes da implementação. A seção 11 registra o que foi implementado.
 
 Três frentes de pesquisa alimentaram o documento, cada uma feita por um agente independente:
 
@@ -417,3 +417,68 @@ Bots e frameworks
 - QuantConnect risk models: https://www.quantconnect.com/docs/v2/writing-algorithms/algorithm-framework/risk-management/supported-models
 - NautilusTrader risk: https://nautilustrader.io/docs/latest/api_reference/risk
 - vectorbt Portfolio: https://vectorbt.dev/api/portfolio/base/
+
+---
+
+## 11. Status da implementação
+
+Data: 2026-10-20. O plano da seção 8 foi implementado em quatro ondas, depois do desenho aprovado pelo architect, que fixou as decisões D1 a D27. Onda 1: `0078587`. Onda 2: `a794831`. Onda 3: `14e9047`. Onda 4: compras paradas no livro dos robôs (6.10), as correções da revisão das ondas 1 a 3 e esta documentação. O README descreve o comportamento atual.
+
+| Item | Passo | Onda | Status | Decisões |
+|---|---|---|---|---|
+| 6.1 Sizing | 4 | 1, 2, 3 | implementado com mudança | D1, D2, D3 |
+| 6.2 Stop acionado e não executado | 1 | 1 | versão mínima | D15 |
+| 6.3 Folga do trailing e métrica da janela | 2 | 2, 3 | implementado com mudança | D16 |
+| 6.3 OCO no TP1 do day trade | 15 | 4 (decisão documentada) | versão mínima | D17 |
+| 6.4 Entrada LIMIT IOC e slippage | 5 | 1, 2, 3 | implementado com mudança | D4 |
+| 6.5 Validação (walk-forward, hold-out, DSR, Monte Carlo, 30 trades, timeframes, pares) | 7 | 1, 2, 3 | implementado com mudança | D6, D7, D8, D9, D10, D11, D12 |
+| 6.5 PBO | 7 | 1 | versão mínima | D9 |
+| 6.6 Fidelidade entre ao vivo e histórico | 6 | 1, 2, 3 | implementado com mudança | D24, D25, D26 |
+| 6.7 Degraus de drawdown, perda diária, throttle, filtro de mercado | 8 | 1, 2, 3 | implementado com mudança | D5, D13, D20 |
+| 6.8 Correlação no mesmo ciclo e cluster do BTC | 9 | 2, 3 | implementado | — |
+| 6.9 Histerese | 12 | 1, 3 | implementado | D14 |
+| 6.10 Ordens maker no grid e no DCA | 13 | 4 | implementado com mudança | D18 |
+| 6.11 Instâncias DCA e grid | 10 | 1, 2, 3 | implementado | D27 |
+| 6.12 Promoção e decaimento | 11 | 2, 3 | implementado com mudança | D22, D26 |
+| 6.13 Idade do sinal e calendário macro | 14 | 1, 3 | implementado | D21 |
+| 6.14 Rótulo do funding e taxa real da conta | 3 | 1, 3 | implementado | D19 |
+| 6.14 `flatten_on_halt` no mandato e painel (R, MAE, MFE, validação) | 3 | 2, 3 | implementado | D23 |
+
+O que mudou em relação à proposta, item a item:
+
+- **6.1.** O teto por volatilidade usa o ATR14 diário com `vol_cap_pct` de 1%, não os 0,2-0,3% citados: com os stops deste robô (1,5 a 2,5 ATR), 0,2% traria de volta o notional fixo pequeno que o item critica. O alvo de volatilidade só limita entradas novas; nada é vendido para rebalancear. O teto por ordem de 25% vale só para instalações novas: o teto entra no mandato, e um `bot.json` gravado mantém o seu até o operador mudar e reconfirmar.
+- **6.3.** A folga do trailing é metade da distância do stop, entre 0,5% e 1%, não 1% fixo: com 1% fixo, um `trailing_tp` de distância curta não andaria mais, e o ao vivo divergiria do replay.
+- **6.4.** O slippage estimado continua pelo topo do livro, agora com o notional da própria ordem; caminhar pelos níveis exigiria ler `/depth`. O gap de 0,2% do IOC limita o custo real. Os robôs DCA e grid continuam comprando a mercado.
+- **6.5.** A validação é amarrada ao conjunto de pares, não a uma tabela estratégia × par: cada par teria poucos trades para o mínimo de 30. O walk-forward corta o período em 4 janelas iguais mais 20% de hold-out, sem reajuste, porque nada é parametrizado. O Monte Carlo em R é gravado na validação e conferido no ciclo contra os limites atuais (`p95 × risk_per_trade_pct < max_drawdown_pct`), então mudar limites não exige validar de novo. Os dias por timeframe são 120 (15m e day), 240 (1h) e 480 (4h); todas as estratégias em todos os timeframes, com 15 pares, levaram cerca de 3 minutos em dados sintéticos.
+- **6.6.** O slippage do swing é o mesmo 0,03% por perna do day, não o medido por par: a validação não deve depender do histórico ao vivo. O modelo de gap do stop já existia (executa na abertura) e ganhou teste. Os indicadores ficam em média simples, por decisão.
+- **6.7.** O filtro de mercado é o BTC acima da EMA de 240 velas de 4 h (cerca de 40 dias): a coleta de 300 velas não aquece uma EMA 50 diária, e o percentil de volatilidade precisaria de um ano de BTC diário ao vivo. Fica desligado por padrão e entra na chave da validação. O throttle compara 7 dias com as velas de 4 h lidas (cerca de 50 dias), não com 90 dias.
+- **6.10.** Sem `LIMIT_MAKER`, que seria um tipo de ordem novo no pacote de execução portado. No máximo uma compra parada por robô, por opção. Na faixa VIP0 maker e taker custam 0,1%, então o ganho é o preço, não a taxa.
+- **6.12.** O contador `limit_violations`, que nada gravava, foi trocado pela contagem de violações quantitativas no ledger de auditoria do testnet em 30 dias. O decaimento compara o Sharpe diário ao vivo com dias zero contra o Sharpe diário do backtest, também com dias zero.
+
+### Versões mínimas
+
+**PBO não calculado (6.5).** O CSCV de Bailey e López de Prado mede a chance de a melhor configuração de uma família otimizada ser só sorte. O robô não otimiza parâmetros: as estratégias rodam com constantes fixas, então não há família de configurações. Calcular PBO sobre as tentativas gravadas misturaria períodos e conjuntos de pares diferentes, e o número não significaria nada. A correção para múltiplos testes é o Sharpe deflacionado com N igual às combinações testadas desde a última aprovação. O painel diz "PBO não calculado: sem otimização de parâmetros". Se um dia o robô passar a otimizar parâmetros, o PBO volta a fazer sentido.
+
+**OCO no TP1 não construída (passo 15).** Uma OCO é uma lista de ordens que o journal, a chave de idempotência, a avaliação do gate e a reconciliação não modelam. A perna limitada dela executaria num pavio, enquanto o TP1 validado vende no fechamento de 15 min: o ao vivo divergiria do histórico. O stop teria de virar duas ordens. O ganho é uma janela de poucos segundos sem stop em metade da posição; o limite de 5 ordens algorítmicas da Binance não é o problema (seriam 2). A versão mínima mede a janela sem stop de cada troca (trailing, TP1, venda parcial, recolocação, resto de saída), com média, p95 e máximo em Desempenho. Gatilho para rever: p95 da janela do TP1 acima de 2 s em 30 dias, ou qualquer `stop_gapped` durante um TP1.
+
+**Sem MARKET no stop atravessado (6.2).** O stop preso é detectado pelo preço: ordem ainda aberta e bid abaixo de `stop × (1 − 0,5%)`. O robô cancela o stop e vende com um IOC 0,5% abaixo do bid, depois com um IOC 2% abaixo, e entra em halt se ainda sobrar posição. Se o cancelamento do stop falha, o stop fica no livro e o robô tenta de novo no ciclo seguinte; o halt vem no terceiro ciclo seguido. A proposta previa MARKET em produção como último recurso; ficou de fora porque seria um caminho só de produção, que o Spot Testnet não exercita e os testes não cobrem. Um IOC limitado a 2% é o que o `stoploss_on_exchange_limit_ratio` do Freqtrade faz. Um IOC de resultado desconhecido também leva ao halt, para não vender duas vezes.
+
+### Desvios combinados na integração
+
+- **`bot.json` antigo com drawdown de 50% ou mais.** A derivação do desenho (`halt = min(50%, max(15%, 1,5 × limite))`) poria o halt abaixo do limite, e o arquivo deixaria de carregar. Nesse caso o halt fica em 1,5 vez o limite, no máximo 100%; o degrau de cautela continua na metade do limite.
+- **Mudar só `max_drawdown_pct` pela API recalcula os degraus.** `PUT /bot/config` mescla os limites gravados com os enviados. Mantidos, os degraus antigos podiam ficar fora de ordem e recusar a mudança (422). Quando o limite muda sem os degraus no corpo, os gravados saem e são derivados de novo; um degrau de cautela em 0 continua desligado.
+- **Um halt retomado fica em só reduzir.** O degrau de halt é gravado em `bot_state.risk_state` como `reducing`. Depois de `POST /bot/resume`, nenhuma compra sai até o drawdown cair abaixo de `dd_reduce_pct` (ou de `max_drawdown_pct`, com a cautela desligada). Stops e saídas continuam.
+- **O filtro de mercado falha fechado sem dado do BTC.** Ligado, um ciclo em que o BTC/USDT não foi lido bloqueia toda entrada ("BTC sem leitura neste ciclo"). Com menos de 240 velas de 4 h fechadas, ele deixa passar, como no desenho.
+- **O nível de risco é calculado antes dos robôs.** O desenho punha o cálculo depois das saídas e dos robôs. Na integração ele foi para depois das saídas e antes dos robôs, uma vez por ciclo: robôs e estratégias obedecem ao mesmo nível no mesmo ciclo. Só reduzir, halt e pausa diária bloqueiam as compras dos robôs; a cautela não as reduz.
+
+### Correções da revisão das ondas 1 a 3
+
+O reviewer aceitou as ondas 1 a 3 com cinco correções, todas aplicadas na onda 4 com testes (`tests/test_bot_review_fixes.py`, `tests/test_bot_resting_buys.py`):
+
+- **Margem de taxa contra o gate (alta).** `market_rules` troca a taxa taker pela da conta, mas o order gate confere o saldo com a taxa padrão do mercado. Com taxa de conta menor, o stop pedia mais moeda do que o gate aceita, era recusado e o robô parava com a posição sem stop. As quantidades de stop e de venda agora usam a maior das duas taxas, também quando o stop é ajustado ao saldo livre. A taxa da conta continua sendo a contabilizada e a do score.
+- **Pausa diária só bloqueia compras (alta).** Antes ela desligava o ciclo inteiro, inclusive o stop atravessado, o stop móvel e as saídas, até o operador reiniciar depois de 00:00 UTC. Com a perda diária sobre o patrimônio e ordens maiores, ela ficaria frequente. Agora toda compra é recusada até o dia seguinte, e o resto do ciclo continua.
+- **Cancelamento do stop atravessado (média).** Uma falha passageira ao cancelar levava ao halt com o stop ainda no livro. Agora o robô tenta de novo nos ciclos seguintes e só entra em halt no terceiro seguido.
+- **Monte Carlo ausente (baixa).** Uma validação sem drawdown p95 legível deixava a linha operar; agora ela fica só como sinal até validar de novo.
+- **Leitura da taxa da conta (baixa).** A leitura roda numa thread própria e o ciclo espera no máximo 2 s, usando o que já estiver em cache.
+
+Uma segunda revisão, sobre a onda 4, aceitou com quatro correções, também aplicadas com testes: Pausar o ciclo é recusado enquanto uma compra parada não se confirma cancelada ou a parte comprada não tem stop; só um bloqueio de escrita deixa de contar para o halt do stop atravessado; uma compra parada já confirmada pela Binance não é esquecida numa única leitura "não encontrada"; e uma recolocação de stop pendente não esconde mais a checagem do stop atravessado.

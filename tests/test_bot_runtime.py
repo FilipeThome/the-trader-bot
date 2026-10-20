@@ -30,7 +30,7 @@ def _validated(
         **validation_params(
             strategy_id,
             policy,
-            timeframes={timeframe: {"passed": True, **outcomes}},
+            timeframes={timeframe: {"passed": True, "mc_p95_dd_r": 0.0, **outcomes}},
             symbols=symbols or ["BTC/USDT"],
             market_filter="off",
             hysteresis=True,
@@ -190,7 +190,8 @@ def test_a_real_daily_loss_pauses_until_the_next_utc_day(tmp_path, monkeypatch) 
     runtime.store.record_day(today, net_pnl=-40.0)
     runtime.store.set_state("running", True)
     runtime.tick()
-    assert runtime.store.get_state("running") is False
+    # The pause refuses buys only: the cycle keeps syncing stops and running exits (review F2).
+    assert runtime.store.get_state("running") is True
     assert runtime.store.get_state("paused_until")
 
 

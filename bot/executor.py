@@ -22,6 +22,16 @@ the stop over the whole, and partial IOC sales reuse ``exit_position``. The
 order in flight is recorded in ``pending_leg`` before it is sent, so the sync
 reads it back by its key.
 
+An instance with ``resting_buys`` rests at most one LIMIT GTC buy under the
+price instead (``rest_buy``, leg ``rest_buy``). Every sync reconciles it before
+the stop: a fill is merged and the stop re-placed over the whole, a partial fill
+is cancelled and merged, a dead order is forgotten. An exit, the halt and every
+buy block cancel it first and book what it bought, and after a cancel the order
+is always read again: it may have filled between the read and the cancel. No
+sale and no stop close ever runs over a resting buy whose result is unknown. A
+stop that sold while a resting buy filled leaves the row open with the coins
+the buy added, under a new stop (``_carry_after_stop``).
+
 A stop that triggered but rests unfilled because the price gapped below its
 limit is found by price in the sync: it is cancelled and the position sold with
 an IOC below the bid, then one more 2% below it (``EMERGENCY_LIMIT_GAP``).
@@ -35,8 +45,9 @@ highest price while open (``mark``) and the result in R. Each time a stop is tak
 off and put back (trailing, first target, partial sale, re-stop, remainder of an
 exit), the time the position stood without it is stored (``stop_windows``).
 
-While the portfolio is in REDUCING (``bot_state.risk_state``), every buy is
-refused here: entries, instance inventory and scale-ins. Stops and exits go on.
+While the portfolio is in REDUCING (``bot_state.risk_state``) or the daily-loss
+pause runs (``bot_state.paused_until``), every buy is refused here: entries,
+instance inventory, scale-ins and resting buys. Stops, exits and the sync go on.
 """
 
 from __future__ import annotations
@@ -56,6 +67,7 @@ from bot.evaluator import SPOT_TAKER, Opportunity
 from bot.exchange import service
 from bot.exchange.execution.rules import MarketRules, decimal_text, floor_to_step
 from bot.exchange.weight import weight_pressure
+from bot.instances import ORDERS_PER_RESTING_LEG
 from bot.reports import append_ledger
 from bot.store import Store
 from bot.strategies import exit_policy_for
@@ -80,6 +92,21 @@ TRAIL_CLEARANCE = Decimal("0.01")
 EMERGENCY_LIMIT_GAP = Decimal("0.02")
 #: Reason recorded when a stuck stop is replaced by an IOC sale.
 _STOP_GAPPED_REASON = "stop acionado sem execução (gap)"
+#: ``_restop`` when the old stop did not come off: the part the buy added waits for the next sync.
+RESTOP_OLD_STOP_PENDING = "o stop antigo não saiu da corretora; a parte nova espera o próximo ciclo"
+#: End of ``_restop``'s answer under a write blocker: the old stop stays until the gate allows writes.
+RESTOP_BLOCKED_SUFFIX = "; o stop antigo fica até a liberação"
+#: Syncs in a row a stuck stop may fail to come off before the runtime halts.
+STUCK_STOP_MAX_RETRIES = 3
+_STUCK_RETRIES_KEY = "stop_gapped_retries"
+#: ``cancel_rest`` when the resting buy's cancel or final state could not be confirmed.
+REST_CANCEL_PENDING = "cancelamento da compra limitada pendente"
+#: ``cancel_rest`` when the buy filled before the cancel but its re-stop did not finish: the coins it
+#: added have no stop yet (a write blocker, or the old stop still on the book).
+REST_RESTOP_PENDING = "compra limitada executada; o stop da parte nova ainda não foi refeito"
+#: ``rest_buy`` outcomes for a buy that went to the book, or whose send has an unknown result.
+REST_PLACED = "compra limitada no livro"
+REST_PENDING = "compra limitada pendente"
 #: Entry, stop and exit. An entry is refused unless the day still allows all three.
 ORDERS_PER_ROUND_TRIP = 3
 #: A day trade also sells its first target and re-places the stop at break-even.
@@ -168,6 +195,33 @@ def _leg(position: dict[str, Any]) -> dict[str, Any] | None:
     except ValueError:
         return None
     return leg if isinstance(leg, dict) else None
+
+
+def _gate_margin(rules: MarketRules | None) -> Decimal:
+    """Fee margin an order keeps: the larger of the account's taker fee and the market's default.
+
+    The order gate checks free balances against the market's default fee (``qty x (1 + fee)``),
+    so a stop sized on a lower account fee would be refused. The account's own fee stays the one
+    booked (``_fill``) and scored.
+    """
+    if rules is None:
+        return Decimal(str(SPOT_TAKER))
+    gate = getattr(rules, "gate_taker_fee", None)
+    return max(rules.taker_fee, gate) if isinstance(gate, Decimal) else rules.taker_fee
+
+
+def _order_not_found(result: dict[str, Any]) -> bool:
+    """A cancel Binance definitely refused because it knows no such order (ccxt ``OrderNotFound``,
+    Binance's "Unknown order sent.")."""
+    if _status(result) != "error":
+        return False
+    text = _reason(result).lower()
+    return "ordernotfound" in text or "unknown order" in text
+
+
+def _carried(leg: dict[str, Any] | None) -> bool:
+    """A re-stop leg of a resting buy's fill: it records the coins the old stop does not cover."""
+    return leg is not None and leg.get("kind") == "restop" and leg.get("added") is not None
 
 
 def _positive(value: Any) -> Decimal | None:
@@ -263,7 +317,7 @@ class Executor:
             return decide("bloqueado", "venda a descoberto não existe no spot")
         if opportunity.test_only and (not (manual or allow_test) or self.profile_id != TEST_PROFILE):
             return decide("bloqueado", "linha de teste: só no Spot Testnet, manual ou com o modo teste no automático")
-        reducing = self._reducing()
+        reducing = self._buy_block()
         if reducing is not None:
             return decide("bloqueado", reducing)
         if clock_blocked or weight_pressure():
@@ -370,7 +424,7 @@ class Executor:
         if fill.qty <= 0:
             self.store.void_position(position_id, "ordem sem execução")
             return fill
-        taker = rules.taker_fee if rules is not None else Decimal(str(SPOT_TAKER))
+        taker = _gate_margin(rules)
         net = fill.qty - fill.fee_base
         free = service.free_balance(base, self.profile_id)
         held = min(net, free) if free is not None else net
@@ -430,7 +484,7 @@ class Executor:
         The row is an ordinary position whose strategy and exit policy are the kind, so
         the sync, the halt, the risk checks and the panel treat it like any other.
         """
-        reducing = self._reducing()
+        reducing = self._buy_block()
         if reducing is not None:
             return {"status": "blocked", "error": reducing}
         if clock_blocked:
@@ -489,7 +543,7 @@ class Executor:
             return "sem stop confirmado"
         if position.get("pending_leg") or position.get("keep_qty") is not None:
             return "outra ordem da posição em andamento"
-        reducing = self._reducing()
+        reducing = self._buy_block()
         if reducing is not None:
             return reducing
         if clock_blocked:
@@ -518,7 +572,7 @@ class Executor:
         if notional > cap * _CAP_HEADROOM or after > cap * _CAP_HEADROOM:
             return "posição depois da compra acima do teto por ordem: o stop atual fica"
         free = service.free_balance(symbol.split("/", 1)[1], self.profile_id)
-        if free is None or free < notional * (1 + rules.taker_fee):
+        if free is None or free < notional * (1 + _gate_margin(rules)):
             return "saldo em USDT insuficiente"
         key = self._key(position_id, leg, 0)
         client_id = service.client_order_id(self.profile_id, key)
@@ -548,36 +602,66 @@ class Executor:
             return "compra pendente"
         return self._merge_buy(position_id, fill, next_stop, rules)
 
-    def _merge_buy(self, position_id: int, fill: Fill, next_stop: Decimal, rules: MarketRules | None) -> str:
-        """Add a filled buy to the position, then re-place the stop at ``next_stop`` for the whole."""
+    def _merge_buy(
+        self,
+        position_id: int,
+        fill: Fill,
+        next_stop: Decimal,
+        rules: MarketRules | None,
+        *,
+        restop: bool = True,
+        carry: bool = False,
+    ) -> str:
+        """Add a filled buy to the position, then re-place the stop at ``next_stop`` for the whole.
+
+        With ``carry`` (a resting buy) the re-stop leg also records what the old stop does not
+        cover: should that stop sell before it comes off, the row keeps the coins the buy added
+        (``_carry_after_stop``). With ``restop`` False the caller re-places the stop (an exit, or
+        a stop that already sold); the leg stays, so a sync re-stops the whole if the caller
+        stops short.
+        """
         position = self._position(position_id)
         if fill.qty <= 0:
             self.store.update_position(position_id, pending_leg=None)
             return "compra sem execução"
-        taker = rules.taker_fee if rules is not None else Decimal(str(SPOT_TAKER))
+        taker = _gate_margin(rules)
         # The same sell margin as an entry: a sell needs free base >= qty x (1 + taker).
         added = (fill.qty - fill.fee_base) / (1 + taker)
         if rules is not None:
             added = floor_to_step(added, rules.lot_step)
         held = Decimal(str(position["qty"]))
         qty = held + added
-        avg = Decimal(str(position["avg_price"]))
+        avg_before = Decimal(str(position["avg_price"]))
+        avg = avg_before
         if qty > 0:
             avg = (avg * held + fill.cost + fill.fee_quote) / qty
         fee = fill.fee_quote + fill.fee_base * fill.average
+        leg: dict[str, Any] = {"kind": "restop", "stop": str(next_stop)}
+        if carry:
+            leg.update(added=str(added), qty_before=str(held), avg_before=str(avg_before))
         self.store.update_position(
             position_id,
             qty=float(qty),
             avg_price=float(avg),
             fees=float(Decimal(str(position["fees"])) + fee),
-            pending_leg=json.dumps({"kind": "restop", "stop": str(next_stop)}),
+            pending_leg=json.dumps(leg),
         )
         self.store.record_day(_day(), fees=float(fee))
         self._decide(position["symbol"], position["strategy"], "aumento", f"comprou {added} a {fill.average:.8g}", position_id=position_id)
+        if not restop:
+            return "comprado"
         return self._restop(position_id)
 
     def _restop(self, position_id: int) -> str:
-        """Put the stop of a position that grew on its whole quantity, at the level its leg recorded."""
+        """Put the stop of a position that grew on its whole quantity, at the level its leg recorded.
+
+        While the gate refuses every order the old stop stays: taking it off could not be
+        followed by a new one. A stop that sold all it covered while a resting buy added coins
+        leaves the row open with them (``_carry_after_stop``); they get the new stop here.
+        """
+        blocker = service.write_blocker()
+        if blocker is not None:
+            return f"{blocker}{RESTOP_BLOCKED_SUFFIX}"
         position = self._position(position_id)
         leg = _leg(position) or {}
         started: float | None = None
@@ -587,7 +671,7 @@ class Executor:
             if settled == "filled":
                 raise UnprotectedPosition(f"{position['symbol']}: o stop executou durante o aumento; a compra nova ficou sem stop")
             if settled == "pending":
-                return "o stop antigo não saiu da corretora; a parte nova espera o próximo ciclo"
+                return RESTOP_OLD_STOP_PENDING
             position = self._position(position_id)
             if position["status"] != "open":
                 raise UnprotectedPosition(f"{position['symbol']}: posição fechada durante o aumento; a compra nova ficou sem stop")
@@ -624,6 +708,298 @@ class Executor:
         if fill is not None:
             self._merge_buy(int(position["id"]), fill, Decimal(str(leg.get("stop") or position["stop_price"])), rules)
 
+    # -- resting buys (``resting_buys``, D18) -----------------------------------
+
+    def rest_buy(
+        self,
+        position_id: int,
+        price: Decimal,
+        qty: Decimal,
+        leg: str,
+        next_stop: Decimal,
+        *,
+        level: int,
+        reserve: int,
+        clock_blocked: bool = False,
+    ) -> str:
+        """Rest one LIMIT GTC buy of ``qty`` at ``price`` under an open DCA or grid position.
+
+        Every check of ``scale_in`` runs before the send, for the fill: the position after it
+        must fit one stop under the per-order cap, the stop ``next_stop`` must sit under the
+        level, and the day must still hold ``ORDERS_PER_RESTING_LEG`` orders plus ``reserve``
+        (the buy, its cancel and the re-placed stop). The price must be under the bid, so the
+        order rests instead of crossing the book. The leg is recorded before the send, with a
+        key from ``leg`` (new for each level and attempt), so an unknown result is read back
+        by its key. ``level`` is the instance's level index, to tell when it is no longer next.
+        """
+        position = self._position(position_id)
+        if position["status"] != "open" or not position.get("stop_order_id"):
+            return "sem stop confirmado"
+        if position.get("pending_leg") or position.get("keep_qty") is not None:
+            return "outra ordem da posição em andamento"
+        reducing = self._buy_block()
+        if reducing is not None:
+            return reducing
+        if clock_blocked:
+            return "relógio fora de 1s — só cancelamentos e saídas"
+        blocker = service.write_blocker()
+        if blocker is not None:
+            return blocker
+        if weight_pressure():
+            return "peso da API alto"
+        if service.orders_remaining(self.profile_id) < ORDERS_PER_RESTING_LEG + reserve:
+            return "orçamento diário de ordens"
+        symbol = position["symbol"]
+        rules = service.market_rules(symbol, self.profile_id)
+        bid = self._bid(symbol)
+        mark = self._mark(symbol)
+        if rules is None or bid is None or bid <= 0 or mark is None:
+            return "cotação ou regras indisponíveis"
+        limit = floor_price(price, rules)
+        amount = floor_to_step(qty, rules.lot_step)
+        if limit <= 0 or amount <= 0:
+            return "compra limitada sem preço ou tamanho válido"
+        notional = limit * amount
+        if rules.min_notional is not None and notional < rules.min_notional:
+            return "compra abaixo do mínimo da corretora"
+        if limit >= bid:
+            return "o preço já está no nível: a compra não ficaria no livro"
+        if next_stop >= limit * (1 - STOP_LIMIT_GAP):
+            return "novo stop perto demais do nível"
+        cap = service.order_notional_cap(symbol, self.profile_id)
+        if cap is None:
+            return "teto por ordem indisponível"
+        after = (Decimal(str(position["qty"])) + amount) * max(bid, mark)
+        if notional > cap * _CAP_HEADROOM or after > cap * _CAP_HEADROOM:
+            return "posição depois da compra acima do teto por ordem: a compra limitada não vai ao livro"
+        free = service.free_balance(symbol.split("/", 1)[1], self.profile_id)
+        if free is None or free < notional * (1 + _gate_margin(rules)):
+            return "saldo em USDT insuficiente"
+        key = self._key(position_id, leg, 0)
+        record: dict[str, Any] = {
+            "kind": "rest_buy",
+            "leg": leg,
+            "client_order_id": service.client_order_id(self.profile_id, key),
+            "price": decimal_text(limit),
+            "qty": decimal_text(amount),
+            "stop": str(next_stop),
+            "level": level,
+            "placed_at": _now().isoformat(),
+        }
+        self.store.update_position(position_id, pending_leg=json.dumps(record))
+        result = service.submit_order(
+            symbol,
+            self.profile_id,
+            side="buy",
+            order_type="limit",
+            quantity=decimal_text(amount),
+            limit_price=decimal_text(limit),
+            time_in_force="gtc",
+            idempotency_key=key,
+            session_id="bot",
+            held=self._held(),
+        )
+        status = _status(result)
+        if status == "unknown":
+            self._rest_event("unknown", position, record, error=_reason(result))
+            return REST_PENDING
+        if status != "ok":
+            self.store.update_position(position_id, pending_leg=None)
+            self._decide(symbol, position["strategy"], "bloqueado", f"compra limitada recusada: {_reason(result)}", result=result)
+            return _reason(result)
+        if result.get("order_id"):
+            record["order_id"] = str(result["order_id"])
+            self.store.update_position(position_id, pending_leg=json.dumps(record))
+        self._rest_event("placed", position, record)
+        self._decide(
+            symbol, position["strategy"], "ordem_limitada", f"compra limitada de {amount} a {limit} no livro",
+            result=result, position_id=position_id,
+        )
+        if (_dec(result.get("filled")) or Decimal(0)) > 0:
+            # Filled on arrival (the book moved since the quote): merged now, not a cycle later.
+            settled = self._settle_rest(self._position(position_id), record, cancel=False)
+            return "comprado" if settled == "settled" else REST_PLACED
+        return REST_PLACED
+
+    def cancel_rest(self, position_id: int) -> str:
+        """Take the resting buy of a position off the book and merge what it bought (re-stopped)."""
+        position = self._position(position_id)
+        leg = _leg(position)
+        if position["status"] != "open" or leg is None or leg.get("kind") != "rest_buy":
+            return "sem compra limitada"
+        held = Decimal(str(position["qty"]))
+        if self._settle_rest(position, leg, cancel=True) != "settled":
+            return REST_CANCEL_PENDING
+        after = self._position(position_id)
+        if after["status"] == "open" and _leg(after) is not None:
+            # What it bought is merged, but its re-stop stopped short: the sync must finish it.
+            return REST_RESTOP_PENDING
+        if Decimal(str(after["qty"])) > held:
+            return "compra limitada executada antes do cancelamento"
+        return "compra limitada cancelada"
+
+    def cancel_resting_buys(self) -> list[dict[str, Any]]:
+        """Cancel every resting buy and merge what each bought, re-placing its stop (the halt, a stop
+        of the cycle). One failure never stops the rest. A row is ``ok`` only when the buy is off the
+        book and what it bought rests under a stop; ``unprotected`` marks a position that may be
+        open without a stop."""
+        results: list[dict[str, Any]] = []
+        for position in self.store.live_positions():
+            leg = _leg(position)
+            if position["status"] != "open" or leg is None or leg.get("kind") != "rest_buy":
+                continue
+            row: dict[str, Any] = {"position_id": position["id"], "symbol": position["symbol"]}
+            try:
+                outcome = self.cancel_rest(int(position["id"]))
+            except UnprotectedPosition as exc:
+                logger.error("resting buy of position %s: %s", position["id"], exc)
+                results.append({**row, "status": "error", "error": str(exc), "unprotected": True})
+                continue
+            except Exception as exc:  # noqa: BLE001 - one position must not stop the rest
+                logger.exception("cancel of the resting buy of position %s failed", position["id"])
+                results.append({**row, "status": "error", "error": f"{type(exc).__name__}: {exc}"})
+                continue
+            failed = outcome in (REST_CANCEL_PENDING, REST_RESTOP_PENDING)
+            results.append({**row, "status": "error" if failed else "ok", "outcome": outcome})
+        return results
+
+    def _settle_rest(self, position: dict[str, Any], leg: dict[str, Any], *, cancel: bool, restop: bool = True) -> str:
+        """Reconcile a resting buy. Returns ``resting`` (on the book with nothing bought, left there),
+        ``settled`` (off the book; what it bought is merged into the row) or ``unknown`` (the leg stays).
+
+        A partial fill on an open order is cancelled and merged: one buy per level, never a rest
+        waiting under a stop sized for less. With ``cancel`` the order always comes off. After a
+        cancel the order is read again, whatever the cancel answered: it may have filled between
+        the read and the cancel, or the cancel may not have landed. A fill is merged and re-stopped
+        (``restop``), or left to the caller with the re-stop leg recorded.
+        """
+        position_id = int(position["id"])
+        symbol = position["symbol"]
+        client_id = str(leg.get("client_order_id") or "")
+        found, order = self._rest_order(symbol, client_id)
+        if found == "not_found":
+            return self._rest_not_found(position, leg)
+        if order is None:
+            return "unknown"
+        state = str(order.get("status") or "").lower()
+        if state not in _FILLED and state not in _DEAD:
+            if not cancel and (_dec(order.get("filled")) or Decimal(0)) <= 0:
+                return "resting"
+            order_id = str(leg.get("order_id") or order.get("order_id") or "")
+            if not order_id:
+                return "unknown"
+            cancelled = service.cancel_order(order_id, self.profile_id, symbol=symbol)
+            _found, read = self._rest_order(symbol, client_id)
+            state = str((read or {}).get("status") or "").lower()
+            if read is None or (state not in _FILLED and state not in _DEAD):
+                self._rest_event("cancel_unconfirmed", position, leg, cancel=_status(cancelled), error=_reason(cancelled))
+                return "unknown"
+            order = read
+        filled = _dec(order.get("filled")) or Decimal(0)
+        if filled <= 0:
+            self.store.update_position(position_id, pending_leg=None)
+            self._rest_event(state, position, leg)
+            return "settled"
+        rules = service.market_rules(symbol, self.profile_id)
+        fill = self._fill(symbol, {"status": "ok", **order, "client_order_id": client_id}, rules)
+        if fill is None or fill.qty <= 0:
+            return "unknown"
+        self._rest_event("filled" if state in _FILLED else "partial", position, leg, filled=decimal_text(fill.qty))
+        stop = Decimal(str(leg.get("stop") or position["stop_price"]))
+        self._merge_buy(position_id, fill, stop, rules, restop=restop, carry=True)
+        return "settled"
+
+    def _rest_order(self, symbol: str, client_id: str) -> tuple[str, dict[str, Any] | None]:
+        """``(lookup status, order)`` of a resting buy, read by its client id."""
+        if not client_id:
+            return "error", None
+        lookup = service.order_status(symbol, self.profile_id, client_id)
+        status = str(lookup.get("status") or "error")
+        order = lookup.get("order") if status == "ok" else None
+        return status, order if isinstance(order, dict) else None
+
+    def _rest_not_found(self, position: dict[str, Any], leg: dict[str, Any]) -> str:
+        """A resting buy Binance does not know: unknown inside the acceptance window (it may still be
+        on its way), forgotten after it when it was never acknowledged (it never reached the book).
+
+        One acknowledged by Binance (the leg has its ``order_id``) is never forgotten on a read alone:
+        it may still rest, and a new buy next to it could fill twice. It is cancelled by its id, and
+        forgotten only when the cancel answers that Binance knows no such order either; any other
+        answer leaves it unknown, which blocks sales and new resting buys until a read settles it.
+        """
+        try:
+            placed = datetime.fromisoformat(str(leg.get("placed_at") or position["updated_at"]))
+        except ValueError:
+            return "unknown"
+        if placed.tzinfo is None:
+            placed = placed.replace(tzinfo=timezone.utc)
+        if (_now() - placed).total_seconds() <= _ACCEPTANCE_WINDOW_SECONDS:
+            return "unknown"
+        order_id = str(leg.get("order_id") or "")
+        if order_id:
+            cancelled = service.cancel_order(order_id, self.profile_id, symbol=position["symbol"])
+            if not _order_not_found(cancelled):
+                self._rest_event("not_found_unconfirmed", position, leg, cancel=_status(cancelled), error=_reason(cancelled))
+                return "unknown"
+        self.store.update_position(int(position["id"]), pending_leg=None)
+        self._rest_event("not_found", position, leg)
+        return "settled"
+
+    def _settle_rest_first(self, position: dict[str, Any]) -> dict[str, Any]:
+        """Settle a resting buy before a stop's sale is booked, so the row never closes with coins
+        outside it; returns the row as it is now. Raises ``UnprotectedPosition`` when the buy's
+        result cannot be read: it may have bought coins no row and no stop hold."""
+        leg = _leg(position)
+        if leg is not None and leg.get("kind") == "rest_buy":
+            if self._settle_rest(position, leg, cancel=True, restop=False) != "settled":
+                raise UnprotectedPosition(
+                    f"{position['symbol']}: o stop executou e a compra limitada não pôde ser lida; "
+                    "ela pode ter comprado fora da posição"
+                )
+        return self._position(int(position["id"]))
+
+    def _carry_after_stop(
+        self, position: dict[str, Any], leg: dict[str, Any], sold: Decimal, proceeds: Decimal, fee: Decimal
+    ) -> None:
+        """The stop sold what it covered after a resting buy added coins it did not cover: book the
+        stop's sale at the average before the buy, keep the rest open at what it cost, with no
+        stop. The caller re-protects it at the leg's level (a price under it exits at once)."""
+        position_id = int(position["id"])
+        held = Decimal(str(position["qty"]))
+        avg = Decimal(str(position["avg_price"]))
+        basis = _dec(leg.get("avg_before")) or avg
+        remaining = held - sold
+        cost_left = avg * held - basis * sold
+        avg_left = cost_left / remaining if remaining > 0 and cost_left > 0 else avg
+        self._book_sale(position_id, sold, proceeds, fee, basis=basis)
+        current = self._position(position_id)
+        if current.get("stop_order_id") or current.get("stop_client_order_id"):
+            self._clear_stop(position_id)
+        fields: dict[str, Any] = {"qty": float(remaining), "avg_price": float(avg_left), "pending_leg": None}
+        if leg.get("stop"):
+            fields["stop_price"] = float(Decimal(str(leg["stop"])))
+        self.store.update_position(position_id, **fields)
+        self._rest_event("stop_filled_carry", position, leg, sold=decimal_text(sold), kept=decimal_text(remaining))
+        self._decide(
+            position["symbol"], position["strategy"], "saida_parcial",
+            f"stop executado na corretora; a compra limitada de {remaining} segue na posição", position_id=position_id,
+        )
+
+    def _rest_event(self, event: str, position: dict[str, Any], leg: dict[str, Any], **extra: Any) -> None:
+        self._record(
+            "resting_buy",
+            {
+                "event": event,
+                "position_id": position["id"],
+                "symbol": position["symbol"],
+                "leg": leg.get("leg"),
+                "client_order_id": leg.get("client_order_id"),
+                "price": leg.get("price"),
+                "qty": leg.get("qty"),
+                **extra,
+            },
+        )
+
     # -- protection --------------------------------------------------------
 
     def protect(self, position_id: int) -> bool:
@@ -641,8 +1017,10 @@ class Executor:
             # The store counts a sale whose fill was never read (or coins left the account): the
             # stop never asks for more than is held, and the store follows the balance, so a later
             # exit or first target is sized on what is really there.
-            held = free
-            self.store.update_position(position_id, qty=float(free))
+            # Sized like a fill: the gate wants ``qty x (1 + fee)`` free, so the whole free balance
+            # would be refused and leave the position with no stop.
+            held = free / (1 + _gate_margin(rules))
+            self.store.update_position(position_id, qty=float(held))
             self._decide(symbol, position["strategy"], "saida_parcial", f"quantidade ajustada ao saldo livre: {free}")
         qty = floor_to_step(held, rules.lot_step)
         stop = floor_price(Decimal(str(position["stop_price"])), rules)
@@ -895,6 +1273,12 @@ class Executor:
                 return {"status": "ok", "closed_by": "stop"}
             if (_leg(position) or {}).get("kind") == "buy":
                 return {"status": "blocked", "error": "compra adicional com resultado pendente; o stop segue na corretora"}
+        if inflight is not None and inflight.get("kind") == "rest_buy":
+            # A resting buy comes off the book first, and what it bought joins the sale: never a
+            # sale over a buy that may still fill. While its result is unknown, the stop stays.
+            if self._settle_rest(position, inflight, cancel=True, restop=False) != "settled":
+                return {"status": "blocked", "error": "compra limitada com resultado pendente; o stop segue na corretora"}
+            position = self._position(position_id)
         symbol = position["symbol"]
         blocker = service.write_blocker()
         if blocker is not None:
@@ -914,6 +1298,15 @@ class Executor:
             position = self._position(position_id)
             if position["status"] != "open":
                 return {"status": "ok", "closed_by": "stop"}
+        restop = _leg(position)
+        if restop is not None and restop.get("kind") == "restop":
+            # A buy merged just before this exit: with the stop off, the re-stop it waited for is
+            # the remainder's stop, at the level the buy recorded.
+            fields: dict[str, Any] = {"pending_leg": None}
+            if restop.get("stop"):
+                fields["stop_price"] = float(Decimal(str(restop["stop"])))
+            self.store.update_position(position_id, **fields)
+            position = self._position(position_id)
         rules = service.market_rules(symbol, self.profile_id)
         if rules is None:
             return self._after_exit(position_id, reason, "regras do mercado indisponíveis", protect_remainder, started)
@@ -1105,7 +1498,8 @@ class Executor:
         state = str(order.get("status") or "").lower()
         if state in _FILLED:
             self._close_from_stop(position, order)
-            return "filled"
+            # A resting buy's coins carried past the stop keep the row open, with no stop.
+            return "filled" if self._position(position["id"])["status"] != "open" else "cancelled"
         if state in _DEAD:
             return self._settle_cancelled_stop(position, order)
         if not order_id and order.get("order_id"):
@@ -1125,10 +1519,17 @@ class Executor:
                 # a resume reads the cancelled order, books it and re-protects the rest.
                 return "cancelled_unknown"
         filled = _dec((order or {}).get("filled")) or Decimal(0)
+        if filled > 0 and order is not None and filled >= Decimal(str(position["qty"])):
+            # The stop sold all it covered: a resting buy is settled before the row may close.
+            position = self._settle_rest_first(position)
         self._clear_stop(position["id"])
         if filled > 0 and order is not None:
             proceeds = _dec(order.get("cost")) or filled * (_dec(order.get("average")) or Decimal(0))
             fee = proceeds * Decimal(str(SPOT_TAKER))
+            leg = _leg(position)
+            if _carried(leg) and leg is not None and Decimal(str(position["qty"])) - filled > 0:
+                self._carry_after_stop(position, leg, filled, proceeds, fee)
+                return "cancelled"
             self._book_sale(position["id"], filled, proceeds, fee)
             remaining = Decimal(str(position["qty"])) - filled
             if remaining <= 0:
@@ -1144,18 +1545,31 @@ class Executor:
         self.store.update_position(position_id, stop_order_id=None, stop_client_order_id=None, stop_attempts=attempts + 1)
 
     def _close_from_stop(self, position: dict[str, Any], order: dict[str, Any]) -> None:
-        filled = _dec(order.get("filled")) or Decimal(str(position["qty"]))
+        """Book the stop's sale and close the row. A resting buy is settled first: when it bought,
+        the row stays open with those coins and no stop (``_carry_after_stop``)."""
+        position = self._settle_rest_first(position)
+        leg = _leg(position)
+        carry = _carried(leg)
+        held = Decimal(str(position["qty"]))
+        covered = (_dec(leg.get("qty_before")) if carry and leg is not None else None) or held
+        filled = _dec(order.get("filled")) or covered
         proceeds = _dec(order.get("cost")) or filled * (_dec(order.get("average")) or Decimal(str(position["stop_price"])))
         fee = proceeds * Decimal(str(SPOT_TAKER))
+        if carry and leg is not None and held - filled > 0:
+            self._carry_after_stop(position, leg, filled, proceeds, fee)
+            return
         self._book_sale(position["id"], filled, proceeds, fee)
         stop = _dec(position.get("stop_price"))
         exit_avg = proceeds / filled if filled > 0 else (stop or Decimal(0))
         self._close(position["id"], exit_avg, exit_slippage=_exit_slippage(exit_avg, stop))
         self._decide(position["symbol"], position["strategy"], "saida", "stop executado na corretora")
 
-    def _book_sale(self, position_id: int, sold: Decimal, proceeds: Decimal, fees: Decimal) -> None:
+    def _book_sale(
+        self, position_id: int, sold: Decimal, proceeds: Decimal, fees: Decimal, *, basis: Decimal | None = None
+    ) -> None:
+        """Book a sale against the row's average, or against ``basis`` when given."""
         position = self._position(position_id)
-        avg = Decimal(str(position["avg_price"]))
+        avg = basis if basis is not None else Decimal(str(position["avg_price"]))
         gross = proceeds - avg * sold
         net = gross - fees
         self.store.update_position(
@@ -1258,6 +1672,15 @@ class Executor:
 
     def _check_stop(self, position: dict[str, Any]) -> None:
         leg = _leg(position)
+        if leg is not None and leg.get("kind") == "rest_buy":
+            # A resting buy is reconciled before the stop: a fill is merged and the stop re-placed
+            # over the whole. While it rests with nothing bought, the stop is checked as usual.
+            held = Decimal(str(position["qty"]))
+            self._settle_rest(position, leg, cancel=False)
+            position = self._position(position["id"])
+            if position["status"] != "open" or Decimal(str(position["qty"])) != held:
+                return
+            leg = _leg(position)
         if leg is not None and leg.get("kind") == "buy":
             # A scale-in buy with an unknown result: merge what it bought before the stop is checked.
             self._settle_buy(position, leg)
@@ -1266,8 +1689,18 @@ class Executor:
                 return
             leg = _leg(position)
         if leg is not None and leg.get("kind") == "restop":
-            self._restop(int(position["id"]))
-            return
+            outcome = self._restop(int(position["id"]))
+            if outcome == RESTOP_OLD_STOP_PENDING:
+                # The old stop is still on the book: count it, then check it like any stop below, so a
+                # stop the price gapped through is still found and sold.
+                self._restop_left(position, outcome)
+            elif not outcome.endswith(RESTOP_BLOCKED_SUFFIX):
+                if outcome == "comprado":
+                    self._clear_stuck_retries(int(position["id"]), kind="restop")
+                return
+            position = self._position(position["id"])
+            if position["status"] != "open":
+                return
         if (
             position.get("keep_qty") is not None
             and not position.get("tp1_done")
@@ -1297,6 +1730,9 @@ class Executor:
             self.store.update_position(position["id"], stop_order_id=str(order["order_id"]))
         if state in _FILLED:
             self._close_from_stop(position, order)
+            if self._position(position["id"])["status"] == "open":
+                # Coins a resting buy added after the stop was placed: a new stop, or an exit at once.
+                self.protect(position["id"])
         elif state in _DEAD:
             self._settle_cancelled_stop(position, order)
             if self._position(position["id"])["status"] == "open":
@@ -1307,6 +1743,9 @@ class Executor:
             bid = self._bid(position["symbol"])
             if stop is not None and bid is not None and 0 < bid < stop * (1 - STOP_LIMIT_GAP):
                 self._stop_gapped(self._position(position["id"]), order, bid)
+            else:
+                # Not stuck any more: a later stuck stop counts its failed cancels from zero.
+                self._clear_stuck_retries(int(position["id"]))
 
     def _stop_gapped(self, position: dict[str, Any], order: dict[str, Any], bid: Decimal) -> None:
         """Replace a stop the price gapped through: cancel it, then sell with IOC orders.
@@ -1348,15 +1787,17 @@ class Executor:
             if current["status"] != "open":
                 break
             resting = bool(current.get("stop_order_id") or current.get("stop_client_order_id"))
-            if resting and result.get("status") == "blocked":
-                # Nothing was sent and the stop still rests: it stays, the next sync tries again.
-                logger.warning("stuck stop of position %s left on the book: %s", position_id, result.get("error"))
+            if resting:
+                # The stop still rests (a write blocker, or a cancel that did not land): no sale went
+                # over it and the coins stay locked under it. The next sync tries again.
+                self._stuck_stop_left(position_id, symbol, result)
                 return
             if result.get("status") == "unknown":
                 break
         current = self._position(position_id)
         if current["status"] == "open":
             raise UnprotectedPosition(f"{symbol}: {_STOP_GAPPED_REASON}; saída falhou: {_reason(result)}")
+        self._clear_stuck_retries(position_id)
         # Every sale is booked on the row (gross = proceeds - avg x sold), stop fills included. A row
         # the stop itself closed keeps its quantity: its exit price is the stop's average fill.
         sold = qty_before - Decimal(str(current["qty"]))
@@ -1375,6 +1816,51 @@ class Executor:
                 "attempts": attempts,
             },
         )
+
+    def _stuck_stop_left(self, position_id: int, symbol: str, result: dict[str, Any]) -> None:
+        """A stuck stop that could not come off stays on the book until the next sync.
+
+        Only a write blocker (the gate refuses every order) waits for as long as it lasts. Every other
+        reason counts: a cancel that failed, a resting buy whose result is unknown, a spent order
+        budget. After ``STUCK_STOP_MAX_RETRIES`` syncs in a row the position cannot be sold below
+        its gapped stop, so ``UnprotectedPosition`` halts the runtime.
+        """
+        logger.warning("stuck stop of position %s left on the book: %s", position_id, result.get("error"))
+        if service.write_blocker() is not None:
+            return
+        retries = self._count_stuck(str(position_id))
+        self._record("stop_gapped_retry", {"position_id": position_id, "symbol": symbol, "error": _reason(result), "retries": retries})
+        if retries >= STUCK_STOP_MAX_RETRIES:
+            self._clear_stuck_retries(position_id)
+            raise UnprotectedPosition(
+                f"{symbol}: {_STOP_GAPPED_REASON}; o stop não saiu da corretora em {retries} ciclos seguidos: {_reason(result)}"
+            )
+
+    def _restop_left(self, position: dict[str, Any], outcome: str) -> None:
+        """A re-stop whose old stop did not come off: the coins the buy added have no stop. It counts
+        like a stuck stop; after ``STUCK_STOP_MAX_RETRIES`` syncs in a row ``UnprotectedPosition`` halts."""
+        position_id = int(position["id"])
+        retries = self._count_stuck(f"{position_id}:restop")
+        self._record("restop_retry", {"position_id": position_id, "symbol": position["symbol"], "error": outcome, "retries": retries})
+        if retries >= STUCK_STOP_MAX_RETRIES:
+            self._clear_stuck_retries(position_id, kind="restop")
+            raise UnprotectedPosition(
+                f"{position['symbol']}: o stop antigo não saiu da corretora em {retries} ciclos seguidos; a compra nova está sem stop"
+            )
+
+    def _count_stuck(self, key: str) -> int:
+        counts = self.store.get_state(_STUCK_RETRIES_KEY)
+        counts = dict(counts) if isinstance(counts, dict) else {}
+        retries = int(counts.get(key) or 0) + 1
+        counts[key] = retries
+        self.store.set_state(_STUCK_RETRIES_KEY, counts)
+        return retries
+
+    def _clear_stuck_retries(self, position_id: int, *, kind: str = "gap") -> None:
+        key = str(position_id) if kind == "gap" else f"{position_id}:{kind}"
+        counts = self.store.get_state(_STUCK_RETRIES_KEY)
+        if isinstance(counts, dict) and key in counts:
+            self.store.set_state(_STUCK_RETRIES_KEY, {name: value for name, value in counts.items() if name != key})
 
     def _record(self, kind: str, payload: dict[str, Any]) -> None:
         try:
@@ -1457,6 +1943,18 @@ class Executor:
 
     def _ask(self, symbol: str) -> Decimal | None:
         return self._quote_field(symbol, "ask")
+
+    def _buy_block(self) -> str | None:
+        """Why every buy is refused now: REDUCING, or the daily-loss pause (``paused_until``), else None.
+        Stops, exits and the sync go on under both."""
+        return self._reducing() or self._paused()
+
+    def _paused(self) -> str | None:
+        """The daily-loss pause: buys wait for the next UTC day (``bot_state.paused_until``)."""
+        until = self.store.get_state("paused_until")
+        if isinstance(until, str) and until > _now().isoformat():
+            return "pausado até o próximo dia UTC"
+        return None
 
     def _reducing(self) -> str | None:
         """Why a buy is refused: the portfolio is in REDUCING (``bot_state.risk_state``), else None."""

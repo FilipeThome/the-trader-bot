@@ -21,7 +21,8 @@ Each cycle reads the account's risk level once, after the exits (``_risk_state``
 a drawdown past ``dd_reduce_pct`` halves the risk and allows one entry, past
 ``max_drawdown_pct`` only exits run (REDUCING, which the executor enforces from
 ``bot_state.risk_state``), and ``halt_drawdown_pct`` halts. The daily loss is
-measured on equity, open positions included, and pauses the day. A row trades
+measured on equity, open positions included, and pauses the day's buys (the
+cycle, its stops and its exits keep running until the next UTC day). A row trades
 only when the strategy passed validation on the row's timeframe and pair set,
 its Monte Carlo drawdown fits the limit, and the pair is neither demoted nor over
 its slippage budget; the market filter, the macro calendar and the signal age
@@ -35,7 +36,7 @@ import logging
 import threading
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -49,10 +50,11 @@ from bot.decay import pair_demoted, pair_slippage_blocked, review_strategy
 from bot.evaluator import SPOT_TAKER, Opportunity, classify, estimate_win_rate
 from bot.exchange import service
 from bot.exchange.weight import weight_pressure
-from bot.executor import Executor, UnprotectedPosition
+from bot.executor import REST_PENDING, REST_PLACED, Executor, UnprotectedPosition
 from bot.indicators import atr_pct_daily, btc_trend_ok, ema
 from bot.instances import (
     ORDERS_PER_LEG,
+    ORDERS_PER_RESTING_LEG,
     DcaParams,
     GridParams,
     cooldown_ends,
@@ -60,12 +62,14 @@ from bot.instances import (
     dca_ladder,
     dca_next,
     dca_plan,
+    dca_rest_target,
     dca_stop,
     grid_k_from_qty,
     grid_levels,
     grid_next,
     grid_plan,
     grid_qty,
+    grid_rest_target,
     instance_budget,
     worst_case_loss,
 )
@@ -131,6 +135,10 @@ AUTO_SELECT_SECONDS = 3600
 MARKET_SYMBOL = CLUSTER_ANCHOR
 #: Exit frames of positions opened before the entry timeframe was recorded.
 LEGACY_EXIT_TIMEFRAMES = {"trend": "1h", "mean_reversion": "15m", "momentum": "4h"}
+#: ``stop()`` refused: a resting buy is not resolved, so the cycle goes on until it is.
+STOP_REFUSED_RESTING = "compra limitada ainda no livro: o ciclo continua para resolver"
+#: Most seconds one cycle waits for the account-fee reads; the rest finish in the background.
+FEE_WARMUP_BUDGET_SECONDS = 2.0
 #: Refusal of a strategy with no current validation, or one demoted to signal only.
 SIGNAL_ONLY = "estratégia em somente sinal: sem validação no histórico ou rebaixada"
 
@@ -188,6 +196,11 @@ class Runtime:
         #: Last (status, reason) recorded per (symbol, strategy): a setup re-read every cycle from the
         #: same closed bar is recorded once, when its decision changes, not 240 times per 4h bar.
         self._decided: dict[tuple[str, str], tuple[str, str]] = {}
+        #: Account-fee reads run on one background thread (``_account_takers``): a slow commission
+        #: endpoint never holds a cycle longer than ``FEE_WARMUP_BUDGET_SECONDS``.
+        self._fee_lock = threading.Lock()
+        self._fee_worker: threading.Thread | None = None
+        self._fee_takers: dict[str, float] = {}
         self.executor = Executor(
             store,
             profile_for(config),
@@ -211,9 +224,7 @@ class Runtime:
         with self.lock:
             if self.halted:
                 return {"status": "error", "error": "halt ativo — retomada manual exigida"}
-            paused = self.store.get_state("paused_until")
-            if paused and paused > datetime.now(timezone.utc).isoformat():
-                return {"status": "error", "error": "pausado até o próximo dia UTC"}
+            # The daily-loss pause refuses buys only (``paused_until``): the cycle may run under it.
             self.store.set_state("running", True)
             # "Three failed cycles in a row" counts from this start, not from before a halt.
             self.failures = 0
@@ -221,7 +232,24 @@ class Runtime:
             return {"status": "ok", "running": True}
 
     def stop(self) -> dict[str, Any]:
+        """Stop the cycle. Nothing reconciles a resting buy while the cycle is stopped, so each comes
+        off the book first and what one bought joins its position under a new stop. While one is not
+        resolved (its cancel unconfirmed, or the stop over what it bought not re-placed), the cycle
+        keeps running to resolve it and the stop is refused; a position left without a stop halts."""
         with self.lock:
+            resting = self._cancel_resting_buys("stop")
+            unprotected = [item for item in resting if item.get("unprotected")]
+            if unprotected:
+                self.store.set_state("running", False)
+                self._ledger("stop", {"resting_failed": len(unprotected)})
+                reason = f"posição sem proteção: {unprotected[0].get('error')}"
+                self.halt(reason, flatten=False)
+                return {"status": "error", "error": f"{reason}; halt acionado", "running": False, "resting": resting}
+            unresolved = [item for item in resting if item.get("status") != "ok"]
+            if unresolved:
+                self.store.set_state("running", True)
+                self._ledger("stop_refused", {"cause": "resting_buy", "results": unresolved})
+                return {"status": "error", "error": STOP_REFUSED_RESTING, "running": True, "resting": unresolved}
             self.store.set_state("running", False)
             self._ledger("stop", {})
             return {"status": "ok", "running": False}
@@ -234,6 +262,9 @@ class Runtime:
         """
         with self.lock:
             self.store.set_state("running", False)
+            # Resting buys come off the book before the flag, while the gate still lets the stop
+            # over what they bought be re-placed. A failure is recorded; the halt goes on.
+            resting = self._cancel_resting_buys("halt")
             flattened: list[dict[str, Any]] = []
             if flatten if flatten is not None else self._flatten_on_halt():
                 try:
@@ -250,9 +281,30 @@ class Runtime:
                     int(instance["id"]), status="stopped", stopped_at=datetime.now(timezone.utc).isoformat(), reason=f"halt: {reason}"
                 )
             failed = [item for item in flattened if item.get("status") != "ok"]
-            self._ledger("halt", {"reason": reason, "flattened": len(flattened), "flatten_failed": len(failed)})
+            self._ledger(
+                "halt",
+                {
+                    "reason": reason,
+                    "flattened": len(flattened),
+                    "flatten_failed": len(failed),
+                    "resting_buys": len(resting),
+                    "resting_failed": sum(1 for item in resting if item.get("status") != "ok"),
+                },
+            )
             self.publish({"type": "halt", "reason": reason})
             return {"status": "ok", "halted": True, "reason": reason, "flatten": flattened}
+
+    def _cancel_resting_buys(self, cause: str) -> list[dict[str, Any]]:
+        """Cancel every resting buy of the robots (``Executor.cancel_resting_buys``); never raises."""
+        try:
+            results = self.executor.cancel_resting_buys()
+        except Exception as exc:  # noqa: BLE001 - the stop or the halt must go on
+            logger.exception("cancel of the resting buys failed")
+            results = [{"status": "error", "error": f"{type(exc).__name__}: {exc}"}]
+        if results:
+            failed = [item for item in results if item.get("status") != "ok"]
+            self._ledger("resting_buy", {"event": "cancel_all", "cause": cause, "results": results, "failed": len(failed)})
+        return results
 
     def _flatten_on_halt(self) -> bool:
         mandate = load_mandate("binance")
@@ -297,8 +349,8 @@ class Runtime:
         """Open one position from the panel.
 
         In manual mode the cycle opens nothing by itself, so a position opened
-        here starts the cycle (``start``: halt and daily pause still refuse it)
-        to keep its stop moving and its exits watched.
+        here starts the cycle (``start``: the halt still refuses it; the daily
+        pause refuses the buy itself) to keep its stop moving and its exits watched.
         """
         with self.lock:
             return self._enter_manual(opportunity)
@@ -576,9 +628,9 @@ class Runtime:
         self, snapshot: MarketSnapshot, moment: datetime, *, clock_blocked: bool = False, state: RiskState | None = None
     ) -> None:
         """One step of every live instance. A blocked clock never lets them buy, only sell and stop.
-        The daily-loss limit refuses this cycle's buys and pauses the cycle until the next UTC day
-        (the broker stops keep protecting what they hold); REDUCING refuses their buys while their
-        sales and stops go on; the halt step stops them all. ``state`` is the cycle's risk state."""
+        The daily-loss pause refuses their buys until the next UTC day while their sales and
+        stops go on; so does REDUCING; the halt step stops them all. Every buy block also takes
+        a resting buy off the book. ``state`` is the cycle's risk state."""
         instances = self.store.instances(live_only=True)
         if not instances:
             return
@@ -614,8 +666,7 @@ class Runtime:
         """
         if clock_blocked:
             return "relógio fora de 1s — só cancelamentos e saídas"
-        paused = self.store.get_state("paused_until")
-        paused = bool(paused and paused > moment.isoformat())
+        paused = self._paused(moment) is not None
         if state is None and not paused:
             state = self._risk_state(snapshot, moment)
         if state is not None and (state.level in ("halt", "reducing") or state.pause_day):
@@ -652,8 +703,13 @@ class Runtime:
             params = DcaParams.model_validate(instance["params"])
         else:
             params = GridParams.model_validate(instance["params"])
-        if int(state["orders_today"]) + ORDERS_PER_LEG > params.max_orders_per_day:
-            outcome: str | None = "limite diário de ordens do robô; volta amanhã"
+        outcome: str | None
+        if position is not None and buy_block is not None and _inflight(position) == "rest_buy":
+            # Every buy block (clock, daily pause, REDUCING, halt step) takes the resting buy off the
+            # book; its cancel was paid for when it was placed.
+            outcome = self._cancel_rest(position, buy_block)
+        elif int(state["orders_today"]) + ORDERS_PER_LEG > params.max_orders_per_day:
+            outcome = "limite diário de ordens do robô; volta amanhã"
         elif isinstance(params, DcaParams):
             outcome = self._step_dca(instance_id, str(instance["symbol"]), params, state, position, price, moment, buy_block)
         else:
@@ -726,11 +782,28 @@ class Runtime:
                 state["pending_so"] = None
             else:
                 return None
-        if position.get("pending_leg"):
+        resting = state.get("rest_so")
+        if resting:
+            if float(position["qty"]) > float(resting["qty_before"]) * 1.000001:
+                # The resting safety order bought (all of it, or the part before its cancel): it is filled.
+                state["filled"], state["rest_so"] = max(int(state["filled"]), int(resting["index"])), None
+            elif _inflight(position) != "rest_buy":
+                state["rest_so"] = None
+        inflight = _inflight(position)
+        if position.get("pending_leg") and inflight != "rest_buy":
             return None
         base = float(state["base_price"])
         action = dca_next(params, base, int(state["filled"]), price, float(position["avg_price"]))
+        if inflight == "rest_buy" and (action is None or action[0] != "take_profit"):
+            # A take-profit sells over it: the exit cancels it first and sells what it bought too.
+            if action is not None:
+                return self._cancel_rest(position, f"o preço chegou à ordem de segurança {action[1]}")
+            if _rest_level(position) != int(state["filled"]) + 1:
+                return self._cancel_rest(position, "a ordem de segurança seguinte mudou")
+            return None
         if action is None:
+            if params.resting_buys and buy_block is None:
+                return self._rest_dca(instance_id, params, state, position, base)
             return None
         if action[0] == "take_profit":
             state["exit"] = "take_profit"
@@ -760,6 +833,74 @@ class Runtime:
             return f"ordem de segurança {index}: {outcome}"
         state["orders_today"] = int(state["orders_today"]) + ORDERS_PER_LEG
         return f"ordem de segurança {index}: {outcome}"
+
+    def _rest_dca(
+        self, instance_id: int, params: DcaParams, state: dict[str, Any], position: dict[str, Any], base: float
+    ) -> str | None:
+        """Rest the next safety order on the book (``resting_buys``)."""
+        target = dca_rest_target(params, base, int(state["filled"]))
+        if target is None:
+            return None
+        index = int(target["index"])
+        if int(state["orders_today"]) + ORDERS_PER_RESTING_LEG > params.max_orders_per_day:
+            return f"ordem de segurança {index} fora do livro: limite diário de ordens do robô"
+        state["legs"] = int(state.get("legs") or 0) + 1
+        state["rest_so"] = {"index": index, "qty_before": float(position["qty"])}
+        # Saved before the send: after a crash the next attempt gets a new key, never a replay booked twice.
+        self.store.update_instance(instance_id, state=state)
+        outcome = self.executor.rest_buy(
+            int(position["id"]),
+            Decimal(str(target["price"])),
+            Decimal(str(target["usd"] / target["price"])),
+            f"dca-rest-{state['round']}-{index}-{state['legs']}",
+            Decimal(str(dca_stop(params, base))),
+            level=index,
+            reserve=1 + len(self.store.open_positions()),
+        )
+        if outcome not in (REST_PLACED, REST_PENDING, "comprado"):
+            state["rest_so"] = None
+            return f"ordem de segurança {index} fora do livro: {outcome}"
+        state["orders_today"] = int(state["orders_today"]) + ORDERS_PER_RESTING_LEG
+        if outcome == "comprado":
+            state["filled"], state["rest_so"] = index, None
+        return f"ordem de segurança {index} a {target['price']:.8g}: {outcome}"
+
+    def _rest_grid(
+        self,
+        instance_id: int,
+        params: GridParams,
+        state: dict[str, Any],
+        position: dict[str, Any],
+        k: int,
+        stop: Decimal,
+    ) -> str | None:
+        """Rest the buy of the level under the lowest one held on the book (``resting_buys``)."""
+        target = grid_rest_target(grid_levels(params), grid_qty(params), k)
+        if target is None:
+            return None
+        level, level_price, qty = target
+        if int(state["orders_today"]) + ORDERS_PER_RESTING_LEG > params.max_orders_per_day:
+            return f"grid: compra do nível {level} fora do livro: limite diário de ordens do robô"
+        state["legs"] = int(state.get("legs") or 0) + 1
+        self.store.update_instance(instance_id, state=state)
+        outcome = self.executor.rest_buy(
+            int(position["id"]),
+            Decimal(str(level_price)),
+            Decimal(str(qty)),
+            f"grid-rest-{level}-{state['legs']}",
+            stop,
+            level=level,
+            reserve=1 + len(self.store.open_positions()),
+        )
+        if outcome not in (REST_PLACED, REST_PENDING, "comprado"):
+            return f"grid: compra do nível {level} fora do livro: {outcome}"
+        state["orders_today"] = int(state["orders_today"]) + ORDERS_PER_RESTING_LEG
+        return f"grid: compra do nível {level} a {level_price:.8g}: {outcome}"
+
+    def _cancel_rest(self, position: dict[str, Any], why: str) -> str:
+        """Cancel a robot's resting buy (what it bought is merged and re-stopped); the next cycle
+        places the buy that is next by then."""
+        return f"{self.executor.cancel_rest(int(position['id']))} ({why})"
 
     def _step_grid(
         self,
@@ -791,7 +932,18 @@ class Runtime:
         if position is not None:
             state["position_id"] = int(position["id"])
             raw = position.get("pending_leg")
-            if raw or position.get("keep_qty") is not None:
+            if _inflight(position) == "rest_buy":
+                k = grid_k_from_qty(qtys, float(position["qty"]))
+                step = grid_next(levels, k, price)
+                # A sale goes ahead: the exit cancels the resting buy first and sells what it bought too.
+                if step is None or step[0] == "buy":
+                    if step is not None:
+                        return self._cancel_rest(position, "o preço chegou ao nível")
+                    target = grid_rest_target(levels, qtys, k)
+                    if target is None or _rest_level(position) != target[0]:
+                        return self._cancel_rest(position, "o nível seguinte mudou")
+                    return None
+            elif raw or position.get("keep_qty") is not None:
                 leg = json.loads(str(raw)) if raw else {}
                 resting = leg.get("kind") == "sell" and position.get("keep_qty") is not None and position.get("stop_order_id")
                 if not resting:
@@ -813,6 +965,14 @@ class Runtime:
         k = grid_k_from_qty(qtys, held)
         step = grid_next(levels, k, price)
         if step is None:
+            if (
+                position is not None
+                and params.resting_buys
+                and buy_block is None
+                and not position.get("pending_leg")
+                and position.get("keep_qty") is None
+            ):
+                return self._rest_grid(instance_id, params, state, position, k, stop)
             return None
         side, new_k = step
         if side == "buy":
@@ -916,21 +1076,39 @@ class Runtime:
         A pair is read from Binance at most once a day (once an hour after a failure);
         the cache it fills is what ``service.market_rules`` books fees with. Under API
         weight pressure nothing is read; a failed read leaves the pair out, so scoring
-        keeps ``SPOT_TAKER``.
+        keeps ``SPOT_TAKER``. The reads run on one background thread and the cycle waits
+        for them at most ``FEE_WARMUP_BUDGET_SECONDS``: a pair not read by then counts with
+        its last known fee, or none, and its read goes on for the next cycle. While a read
+        hangs, no second thread starts.
         """
         if self.retired or weight_pressure():
             return {}
         profile = profile_for(self.config)
-        takers: dict[str, float] = {}
+        with self._fee_lock:
+            worker = self._fee_worker
+            if worker is None or not worker.is_alive():
+                worker = threading.Thread(
+                    target=self._read_fees, args=(list(symbols), profile), name="bot-fee-warmup", daemon=True
+                )
+                self._fee_worker = worker
+                worker.start()
+        worker.join(FEE_WARMUP_BUDGET_SECONDS)
+        with self._fee_lock:
+            return {symbol: self._fee_takers[symbol] for symbol in symbols if symbol in self._fee_takers}
+
+    def _read_fees(self, symbols: list[str], profile: str) -> None:
+        """The fee warm-up thread: one ``service.trading_fees`` read per pair (most are cached)."""
         for symbol in symbols:
+            if self.retired or weight_pressure():
+                return
             try:
                 fees = service.trading_fees(symbol, profile)
             except Exception:  # noqa: BLE001 - a fee read never fails the cycle
                 logger.exception("account fee read failed for %s", symbol)
                 continue
             if fees is not None and _finite(fees[1]):
-                takers[symbol] = float(fees[1])
-        return takers
+                with self._fee_lock:
+                    self._fee_takers[symbol] = float(fees[1])
 
     def _positions(self) -> frozenset[tuple[int, str, str, float]]:
         return frozenset(
@@ -1450,7 +1628,7 @@ class Runtime:
 
         The validation must hold for the current rules, the setup's own timeframe must have
         passed, the pair must belong to the validated set, the Monte Carlo drawdown at the
-        risk per trade (``mc_p95_dd_r × risk_per_trade_pct``) must stay under
+        risk per trade (``mc_p95_dd_r × risk_per_trade_pct``) must be readable and stay under
         ``max_drawdown_pct``, and the strategy must not be demoted on this pair.
         """
         if stats is None or bool(stats.get("signal_only")) or not keyed:
@@ -1460,7 +1638,10 @@ class Runtime:
         if symbol not in ((stats.get("params") or {}).get("symbols") or ()):
             return f"somente sinal: {symbol} fora do conjunto de pares validado"
         mc = result.get("mc_p95_dd_r")
-        drawdown = float(mc or 0) * limits.risk_per_trade_pct if _finite(mc) else 0.0
+        if isinstance(mc, bool) or not _finite(mc):
+            # A record without a readable Monte Carlo drawdown proves nothing about the limit.
+            return "somente sinal — Monte Carlo: drawdown p95 ausente ou ilegível na validação; valide de novo"
+        drawdown = float(mc or 0) * limits.risk_per_trade_pct
         if drawdown >= limits.max_drawdown_pct:
             return (
                 f"somente sinal — Monte Carlo: drawdown p95 de {_pct(drawdown)} passa do limite "
@@ -1565,12 +1746,16 @@ class Runtime:
         state = RiskManager(self._limits(), capital, capital).portfolio_state(
             day_change=day_change, peak_equity=peak, equity=equity, previous=previous
         )
+        paused = self._paused(moment)
+        if paused is not None and not state.pause_day:
+            # A pause started earlier today holds until the next UTC day, even if the equity recovers.
+            state = replace(state, pause_day=True, reason="; ".join(part for part in (state.reason, paused) if part))
         self._save_risk_state(state, previous, moment)
         if state.level == "halt":
             if not self.halted:
                 self.halt(state.reason)
             return state
-        if state.pause_day:
+        if state.pause_day and paused is None:
             if self.config.flatten_day_on_daily_loss and self.running and not self.halted:
                 self._flatten_day_trades()
             self._pause_day(moment)
@@ -1621,10 +1806,21 @@ class Runtime:
         self._ledger("daily_loss_flatten", {"positions": len(positions), "results": results})
 
     def _pause_day(self, moment: datetime) -> None:
-        """Stop the cycle until the next UTC day: the daily-loss limit."""
+        """Refuse every buy until the next UTC day: the daily-loss limit (``paused_until``).
+
+        The cycle keeps running, so the sync (stuck stops), trailing, first targets, time
+        exits and robot sales go on; the executor refuses each buy while the pause lasts.
+        """
         tomorrow = (moment + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         self.store.set_state("paused_until", tomorrow.isoformat())
-        self.store.set_state("running", False)
+        self._ledger("daily_pause", {"until": tomorrow.isoformat()})
+
+    def _paused(self, moment: datetime) -> str | None:
+        """The daily-loss pause still running at ``moment``, as its reason, or None."""
+        until = self.store.get_state("paused_until")
+        if isinstance(until, str) and until > moment.isoformat():
+            return "pausado até o próximo dia UTC"
+        return None
 
     def _ledger(self, kind: str, payload: dict[str, Any]) -> None:
         try:
@@ -1643,6 +1839,17 @@ def _inflight(position: dict[str, Any]) -> str | None:
     except ValueError:
         return None
     return str(leg.get("kind")) if isinstance(leg, dict) else None
+
+
+def _rest_level(position: dict[str, Any]) -> int | None:
+    """Level index a robot's resting buy waits at (``pending_leg.level``), or None."""
+    raw = position.get("pending_leg")
+    try:
+        leg = json.loads(str(raw)) if raw else None
+    except ValueError:
+        return None
+    level = leg.get("level") if isinstance(leg, dict) else None
+    return level if isinstance(level, int) and not isinstance(level, bool) else None
 
 
 def _target_reason(position: dict[str, Any], snapshot: MarketSnapshot) -> str | None:

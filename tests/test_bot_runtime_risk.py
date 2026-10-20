@@ -152,7 +152,8 @@ def test_daily_loss_counts_unrealized_and_pauses(tmp_path, monkeypatch) -> None:
     _price(runtime, ["BTC/USDT"], 60.0)
     runtime.tick()
     assert all(float(day["net_pnl"]) == 0 for day in runtime.store.pnl_days())
-    assert runtime.store.get_state("paused_until") and runtime.running is False
+    # The pause refuses buys only; the cycle keeps running (review F2).
+    assert runtime.store.get_state("paused_until") and runtime.running is True
     assert runtime.store.get_state("risk_state")["level"] == "normal"
     assert "perda diária" in runtime.store.get_state("risk_state")["reason"]
 
@@ -173,7 +174,7 @@ def test_daily_loss_flattens_only_day_trades_when_enabled(tmp_path, monkeypatch,
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     runtime.store.record_day(today, net_pnl=-40.0)
     runtime.tick()
-    assert runtime.store.get_state("paused_until") and runtime.running is False
+    assert runtime.store.get_state("paused_until") and runtime.running is True
     assert (f"exit:{day_id}" in executor.events) is enabled
     assert f"exit:{swing_id}" not in executor.events
     flattened = _kinds(events, "daily_loss_flatten")
@@ -202,8 +203,8 @@ FALLING = _trend(-0.004)
 def _filtered(tmp_path, monkeypatch, market_filter: str, closes: list[float]) -> tuple[Runtime, FakeExecutor]:
     runtime, executor = _ready_cycle(tmp_path, monkeypatch, entry_mode="auto", min_win_rate=0.70, market_filter=market_filter)
     params = validation_params(
-        "trend", "trailing", timeframes={"1h": {"passed": True, "wins": 30, "trades": 40}}, symbols=["BTC/USDT"],
-        market_filter=market_filter, hysteresis=True,
+        "trend", "trailing", timeframes={"1h": {"passed": True, "wins": 30, "trades": 40, "mc_p95_dd_r": 0.0}},
+        symbols=["BTC/USDT"], market_filter=market_filter, hysteresis=True,
     )
     runtime.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": {**params, "wins": 30, "trades": 40}})
     runtime.collector.snapshot.candles[("BTC/USDT", "4h")] = _btc_4h(closes)  # type: ignore[attr-defined]

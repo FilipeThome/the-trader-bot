@@ -6,7 +6,7 @@ import { formatPct } from "../App";
 import { Help } from "../Help";
 import { strategyName } from "../labels";
 import { useBot } from "../store";
-import type { BotInstance, InstanceKind, InstancePreview, ReplayWindow } from "../types";
+import type { BotInstance, InstanceKind, InstanceOptions, InstancePreview, ReplayWindow } from "../types";
 
 /** [param, label, default, help, percent]: a percent field is typed in % and sent as a fraction. */
 type Field = [string, string, string, string, boolean?];
@@ -39,7 +39,7 @@ function initial(kind: InstanceKind): Record<string, string> {
   return Object.fromEntries(fields[kind].map(([name, , value]) => [name, value]));
 }
 
-function payload(kind: InstanceKind, values: Record<string, string>, extra: Record<string, unknown>): Record<string, unknown> {
+function payload(kind: InstanceKind, values: Record<string, string>, extra: InstanceOptions): Record<string, unknown> {
   const params: Record<string, unknown> = { ...extra };
   for (const [name, , , , percent] of fields[kind]) {
     const raw = values[name]?.trim() ?? "";
@@ -63,6 +63,7 @@ export function Bots() {
   const [symbol, setSymbol] = useState("");
   const [values, setValues] = useState<Record<InstanceKind, Record<string, string>>>({ dca: initial("dca"), grid: initial("grid") });
   const [repeat, setRepeat] = useState(false);
+  const [restingBuys, setRestingBuys] = useState(false);
   const [mode, setMode] = useState<"arithmetic" | "geometric">("arithmetic");
   const [preview, setPreview] = useState<InstancePreview | null>(null);
   const [previewKey, setPreviewKey] = useState("");
@@ -72,7 +73,7 @@ export function Bots() {
   const [maxInput, setMaxInput] = useState("");
 
   const pair = symbol || status?.symbols[0] || "";
-  const extra = kind === "dca" ? { repeat } : { mode };
+  const extra: InstanceOptions = kind === "dca" ? { repeat, resting_buys: restingBuys } : { mode, resting_buys: restingBuys };
   const params = payload(kind, values[kind], extra);
   const key = JSON.stringify([kind, pair, params]);
 
@@ -189,6 +190,11 @@ export function Bots() {
               </select>
             </label>
           )}
+          <label className="inline-flex items-center">
+            <input type="checkbox" checked={restingBuys} onChange={(event) => setRestingBuys(event.target.checked)} />
+            &nbsp;compra limitada no livro
+            <Help text="Em vez de comprar a mercado quando o preço chega, o robô deixa uma ordem limitada (GTC) no livro: no DCA, na próxima ordem de segurança; no grid, no nível abaixo do mais baixo que ele tem. Só uma por robô. Ela executa no preço do nível, sem spread e sem perder um toque dentro do minuto; a taxa é a mesma (0,1%). A ordem trava USDT, não a moeda, então convive com o stop. Cada uma reserva 3 ordens do dia (a compra, o cancelamento e o stop refeito). Ela sai do livro antes de qualquer venda, no halt, ao parar o ciclo e em qualquer bloqueio de compra (pausa diária, modo só reduzir, relógio)." />
+          </label>
         </div>
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
           {fields[kind].map(([name, label, , help]) => (

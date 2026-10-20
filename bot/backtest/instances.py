@@ -10,7 +10,12 @@ any backtest it does not promise the future. It trades as the live cycle:
 * the stop rests at the broker, so it fills on the bar's low, at the stop or
   at the open when the bar gaps through it, and it is checked first;
 * DCA rounds repeat after each take-profit, so the replay shows several
-  rounds; the stop ends the replay, as it ends the live instance.
+  rounds; the stop ends the replay, as it ends the live instance;
+* with ``resting_buys`` the safety orders and grid buys rest on the book: after
+  the stop check, each fills at its own price when the bar's low reaches it,
+  paying the fee and no spread (Spot VIP0 maker = taker). The live cycle rests
+  one buy at a time and places the next a minute after a fill, so a bar whose
+  low crosses several levels fills each of them.
 
 The preview replays the last 30, 90 and 180 days of 1h bars (``replay_windows``)
 and says how long a grid's close stayed outside its range: a grid only earns
@@ -76,16 +81,24 @@ def replay_dca(params: DcaParams, frame: pd.DataFrame, *, taker: float, spread: 
             held, ended = 0.0, "stop"
             equity.append(cash)
             break
-        elif held and close >= spent / held * (1 + params.take_profit_pct):
-            cash += held * close * (1 - cost)
-            wins += 1
-            held, in_round = 0.0, False
-        elif filled < params.so_count and close <= ladder[filled + 1]["price"]:
-            filled += 1
-            usd = ladder[filled]["usd"]
-            held += usd * (1 - cost) / close
-            spent += usd
-            cash -= usd
+        else:
+            while params.resting_buys and filled < params.so_count and low <= ladder[filled + 1]["price"]:
+                # The resting safety order fills at its own price.
+                filled += 1
+                usd = ladder[filled]["usd"]
+                held += usd * (1 - taker) / ladder[filled]["price"]
+                spent += usd
+                cash -= usd
+            if held and close >= spent / held * (1 + params.take_profit_pct):
+                cash += held * close * (1 - cost)
+                wins += 1
+                held, in_round = 0.0, False
+            elif not params.resting_buys and filled < params.so_count and close <= ladder[filled + 1]["price"]:
+                filled += 1
+                usd = ladder[filled]["usd"]
+                held += usd * (1 - cost) / close
+                spent += usd
+                cash -= usd
         equity.append(cash + held * close)
     last = float(frame["close"].iloc[-1]) if len(frame) else 0.0
     final = cash + held * last
@@ -138,6 +151,11 @@ def replay_grid(params: GridParams, frame: pd.DataFrame, *, taker: float, spread
             paid, ended = {}, "take_profit"
             equity.append(cash)
             break
+        while params.resting_buys and k > 0 and low <= levels[k - 1]:
+            # The resting buy of the level under the lowest held fills at the level.
+            k -= 1
+            paid[k] = qtys[k] * levels[k] * (1 + taker)
+            cash -= paid[k]
         step = grid_next(levels, k, close)
         if step is not None:
             side, new_k = step

@@ -264,11 +264,17 @@ def test_a_stuck_stop_that_cannot_be_cancelled_halts_without_selling(tmp_path, v
     _stuck(venue)
     venue.bid = Decimal("95")
     venue.on_cancel = lambda _id: {"status": "unknown", "error": "cancel outcome is unknown"}
-    with pytest.raises(UnprotectedPosition):
+    # The stop still rests after a failed cancel: no 2% IOC follows, the next sync retries (review F3)...
+    for _ in range(2):
+        executor.sync_positions()
+    assert venue.cancelled == [STOP_ORDER_ID, STOP_ORDER_ID]
+    assert [payload["retries"] for kind, payload in events if kind == "stop_gapped_retry"] == [1, 2]
+    # ...and the third sync in a row that cannot take it off halts.
+    with pytest.raises(UnprotectedPosition, match="3 ciclos"):
         executor.sync_positions()
     # The base is still locked by the stop: no sale is sent over it.
     assert _sells(venue) == []
-    assert venue.cancelled == [STOP_ORDER_ID, STOP_ORDER_ID]
+    assert venue.cancelled == [STOP_ORDER_ID] * 3
     still = executor.store.position(position["id"])
     assert still is not None and still["status"] == "open" and still["stop_order_id"] == STOP_ORDER_ID
 

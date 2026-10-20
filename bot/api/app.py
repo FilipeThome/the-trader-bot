@@ -549,7 +549,11 @@ def start() -> dict[str, Any]:
 
 @app.post("/bot/stop")
 def stop() -> dict[str, Any]:
-    return _runtime().stop()
+    result = _runtime().stop()
+    if result.get("status") != "ok":
+        # A resting buy not yet resolved keeps the cycle running, or a position without a stop halted.
+        raise HTTPException(status_code=409, detail=result["error"])
+    return result
 
 
 @app.post("/bot/halt")

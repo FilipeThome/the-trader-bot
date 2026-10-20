@@ -342,6 +342,16 @@ export type ArmedEntry = {
 
 export type InstanceKind = "dca" | "grid";
 
+/** The non-numeric options of a robot (``bot.instances`` DcaParams / GridParams), sent with its fields. */
+export type InstanceOptions = {
+  /** One LIMIT GTC buy rests on the book at the next safety order or grid level (off by default). */
+  resting_buys: boolean;
+  /** DCA only: start a new round after the take-profit. */
+  repeat?: boolean;
+  /** Grid only: level spacing. */
+  mode?: "arithmetic" | "geometric";
+};
+
 export type BotInstance = {
   id: number;
   kind: InstanceKind;

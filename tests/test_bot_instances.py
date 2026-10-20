@@ -418,7 +418,8 @@ def test_a_daily_loss_pauses_the_day_and_stops_robot_buys(tmp_path, monkeypatch,
     _step(runtime)
     assert runtime.store.open_positions()[0]["qty"] == held
     assert "perda diária" in runtime.store.instances()[0]["reason"]
-    assert runtime.store.get_state("paused_until") and not runtime.running
+    # The pause refuses buys only: the cycle keeps running (review F2).
+    assert runtime.store.get_state("paused_until") and runtime.running
     assert runtime.create_instance("dca", "ETH/USDT", DCA)["error"].startswith("pausado")
 
 

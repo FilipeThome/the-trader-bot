@@ -109,7 +109,7 @@ def _scored(tmp_path, monkeypatch, params: dict[str, Any], **overrides: Any) -> 
     return runtime, executor
 
 
-PASSED = {"passed": True, "wins": 30, "trades": 40}
+PASSED = {"passed": True, "wins": 30, "trades": 40, "mc_p95_dd_r": 0.0}
 
 
 def test_a_setup_on_an_unvalidated_timeframe_is_signal_only(tmp_path, monkeypatch) -> None:
@@ -145,15 +145,18 @@ def test_a_pair_outside_the_validated_set_is_signal_only(tmp_path, monkeypatch) 
     assert rows["BTC/USDT"]["status"] == "pronta" and "act:1" in executor.events
 
 
-@pytest.mark.parametrize(("mc", "blocked"), [(12.0, True), (10.0, True), (5.0, False), (None, False)])
+@pytest.mark.parametrize(("mc", "blocked"), [(12.0, True), (10.0, True), (5.0, False), (None, True), (float("nan"), True)])
 def test_mc_drawdown_over_the_limit_makes_rows_signal_only(tmp_path, monkeypatch, mc: float | None, blocked: bool) -> None:
     # 12 R of p95 drawdown at 1% risk per trade is 12%, past the 10% limit.
     runtime, executor = _scored(tmp_path, monkeypatch, _params({"1h": {**PASSED, "mc_p95_dd_r": mc}}))
     runtime.tick()
     row = runtime.store.opportunities()[0]
     assert (row["status"] == "bloqueada") is blocked
-    if blocked:
+    if blocked and mc is not None and mc == mc:
         assert "Monte Carlo: drawdown p95 de" in row["reason"] and "passa do limite de 10%" in row["reason"]
+    elif blocked:
+        # A record without a readable Monte Carlo drawdown never trades (review F4).
+        assert "Monte Carlo: drawdown p95 ausente ou ilegível" in row["reason"]
     assert ("act:0" if blocked else "act:1") in executor.events
 
 
