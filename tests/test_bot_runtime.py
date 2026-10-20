@@ -14,10 +14,20 @@ from bot.exchange import service
 from bot.executor import UnprotectedPosition
 from bot.live.halt import halt_flag_set
 from bot.paths import get_runtime_root, pin_mode_root
-from bot.strategies import STRATEGIES
+from bot.strategies import STRATEGIES, validation_params
 from bot.runtime import Runtime, mode_root
 from bot.store import Store
 from bot.strategies.base import Setup
+
+
+def _validated(strategy_id: str, policy: str, timeframe: str = "1h", **outcomes: Any) -> dict[str, Any]:
+    """A current (gate v2) validation that passed on ``timeframe``, with the default market filter and hysteresis."""
+    return {
+        **validation_params(
+            strategy_id, policy, timeframes={timeframe: {"passed": True}}, symbols=["BTC/USDT"], market_filter="off", hysteresis=True
+        ),
+        **outcomes,
+    }
 
 
 def _snapshot(symbols: list[str]) -> MarketSnapshot:
@@ -132,7 +142,7 @@ def test_the_cycle_syncs_the_clock_and_settles_positions_before_entries(tmp_path
 def test_a_drawdown_halts_once_per_cycle(tmp_path, monkeypatch) -> None:
     runtime, _collector, _executor = _runtime(tmp_path, monkeypatch, ["BTC/USDT", "ETH/USDT", "SOL/USDT"])
     monkeypatch.setattr("bot.runtime._setup", _setup)
-    runtime.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": {"exit_policy": "trailing"}})
+    runtime.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": _validated("trend", "trailing")})
     runtime.store.record_day("2026-01-01", net_pnl=-200.0)
     halts: list[str] = []
     monkeypatch.setattr(runtime, "halt", lambda reason, **_kwargs: halts.append(reason))
@@ -158,7 +168,7 @@ def test_a_lower_capital_is_not_a_drawdown(tmp_path, monkeypatch) -> None:
 def test_a_real_daily_loss_pauses_until_the_next_utc_day(tmp_path, monkeypatch) -> None:
     runtime, _collector, _executor = _runtime(tmp_path, monkeypatch)
     monkeypatch.setattr("bot.runtime._setup", _setup)
-    runtime.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": {"exit_policy": "trailing"}})
+    runtime.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": _validated("trend", "trailing")})
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     runtime.store.record_day(today, net_pnl=-40.0)
     runtime.store.set_state("running", True)
@@ -260,7 +270,7 @@ def _ready_cycle(tmp_path, monkeypatch, **overrides: Any) -> tuple[Runtime, Fake
     runtime, _collector, executor = _runtime(tmp_path, monkeypatch, **overrides)
     monkeypatch.setattr("bot.runtime._setup", _setup)
     runtime.store.save_strategy(
-        {"strategy_id": "trend", "signal_only": False, "params": {"wins": 30, "trades": 40, "exit_policy": "trailing"}}
+        {"strategy_id": "trend", "signal_only": False, "params": _validated("trend", "trailing", wins=30, trades=40)}
     )
     runtime.store.set_state("running", True)
     return runtime, executor
@@ -343,7 +353,7 @@ def test_trailing_skips_the_fixed_target_and_reserves_one_order_per_position(tmp
 def test_a_strategy_validated_under_another_exit_rule_is_signal_only(tmp_path, monkeypatch) -> None:
     runtime, executor = _ready_cycle(tmp_path, monkeypatch, entry_mode="auto")
     runtime.store.save_strategy(
-        {"strategy_id": "trend", "signal_only": False, "params": {"wins": 30, "trades": 40, "exit_policy": "target"}}
+        {"strategy_id": "trend", "signal_only": False, "params": _validated("trend", "target", wins=30, trades=40)}
     )
     runtime.tick()
     row = runtime.store.opportunities()[0]
@@ -817,8 +827,6 @@ def test_a_leftover_row_of_a_pair_no_longer_analysed_is_refused(tmp_path, monkey
 
 
 def _day_ready(tmp_path, monkeypatch, wins: int) -> tuple[Runtime, FakeExecutor]:
-    from bot.strategies.day import DAY
-
     runtime, collector, executor = _runtime(tmp_path, monkeypatch, entry_mode="auto", min_win_rate=0.95, min_reward_risk=1.2)
     runtime.config.strategies.update(trend=False, intraday_momentum=True)
     # Fresh 15m bars: a day row prices and checks staleness on them.
@@ -838,7 +846,7 @@ def _day_ready(tmp_path, monkeypatch, wins: int) -> tuple[Runtime, FakeExecutor]
         {
             "strategy_id": "intraday_momentum",
             "signal_only": False,
-            "params": {"wins": wins, "trades": 69, "exit_policy": "day", "day": DAY.params},
+            "params": _validated("intraday_momentum", "day", "15m", wins=wins, trades=69),
         }
     )
     runtime.store.set_state("running", True)

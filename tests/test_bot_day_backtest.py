@@ -135,12 +135,19 @@ def test_a_day_strategy_always_validates_with_the_day_exits() -> None:
 
 
 def test_a_day_validation_holds_only_for_the_rules_it_replayed() -> None:
-    from bot.strategies import exit_policy_for, validated_for
+    from bot.strategies import exit_policy_for, validated_for, validation_params
+
+    def key(strategy_id: str, policy: str, timeframe: str) -> dict:
+        return validation_params(
+            strategy_id, policy, timeframes={timeframe: {"passed": True}}, symbols=["BTC/USDT"], market_filter="off", hysteresis=True
+        )
 
     assert exit_policy_for("intraday_momentum", "trailing") == "day"
     assert exit_policy_for("trend", "trailing") == "trailing"
-    assert validated_for({"exit_policy": "day", "day": DAY.params}, "intraday_momentum", "trailing")
+    day = key("intraday_momentum", "trailing", "15m")
+    assert day["exit_policy"] == "day" and day["day"] == DAY.params
+    assert validated_for(day, "intraday_momentum", "trailing")
     other = {**DAY.params, "max_hold_minutes": 240}
-    assert not validated_for({"exit_policy": "day", "day": other}, "intraday_momentum", "trailing")
-    assert not validated_for({"exit_policy": "trailing"}, "intraday_momentum", "trailing")
-    assert validated_for({"exit_policy": "trailing"}, "trend", "trailing")
+    assert not validated_for({**day, "day": other}, "intraday_momentum", "trailing")
+    assert not validated_for({**day, "exit_policy": "trailing"}, "intraday_momentum", "trailing")
+    assert validated_for(key("trend", "trailing", "1h"), "trend", "trailing")

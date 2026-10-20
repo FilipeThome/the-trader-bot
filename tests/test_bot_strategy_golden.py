@@ -74,13 +74,25 @@ def trades_digest(strategy_id: str, timeframe: str, freq: str, policy: str) -> t
     return len(trades), hashlib.sha256(repr([(t.exit_time, t.net_return) for t in trades]).encode()).hexdigest()
 
 
+# Every swing replay changed with the replay-fidelity step (6.6): each leg now pays LEG_SLIPPAGE
+# (0.03%), so every return moves even where the trades do not. The "target" keys also sell a reached
+# target at the close of the bar that closes at or above it, not on the wick: momentum and trend
+# each lose one trade (12 of 13, 15 of 16) because a wick-only target no longer ends a position.
+# Exit hysteresis (6.9) then changed one key: momentum "trailing" (same 7 trades, later EMA exits).
+# Its 6.6-only digest was d10ab8625c9f62440f234d8c8055a51f1a7f08610a2a3e41a8bd4a606112b18a.
 TRADES_GOLDEN = {
-    ("mean_reversion", "target"): (14, "eac8bd6df4e9b4237d2a436df469cc1eab570a61030ad7254fe54f223d3a72cb"),
-    ("mean_reversion", "trailing"): (16, "78e792d4ce1489e51200cc5e56ef9c96e0cf262007473c374c7f52edf4084bd1"),
-    ("momentum", "target"): (16, "18e5da71cbdf4711a1d92ddb1467a3dafd41c846b16be8ab80b167cacc928121"),
-    ("momentum", "trailing"): (7, "a3557ba41f16bda0cdb113acce3cc69749698cf35e77e6672c3da4bf9c293f0f"),
-    ("trend", "target"): (13, "e8715555ac0876c58cf488e8faf9844c2f9fd6c153148235c8f12be0efa22b28"),
-    ("trend", "trailing"): (8, "c404e774bf4450954d4dfabf8ab171b4fdbe51d58b850b1f52abda4bde8a2bec"),
+    # 6.6: slippage on both legs; target filled at the close.
+    ("mean_reversion", "target"): (14, "63df5e9ccff6af0344abfca9fa3f6af7b6e36999b6674d1a9d34288c86aafb80"),
+    # 6.6: slippage on both legs.
+    ("mean_reversion", "trailing"): (16, "b2849a26a7e0703a75f2ed1c19906848b9d118be9dec609a9c7d6e2136eabf49"),
+    # 6.6: slippage on both legs; target filled at the close (16 -> 15 trades).
+    ("momentum", "target"): (15, "b2689770cacbe15e91095f606656943d8b3c09ad6fe853e2eb640e403647c2eb"),
+    # 6.6: slippage on both legs; 6.9: hysteresis on the EMA 20/50 exit.
+    ("momentum", "trailing"): (7, "5e72d9f1a532bc74ed9ef11eab88fef0868815b9c189e620238ab8a6c1ae0d13"),
+    # 6.6: slippage on both legs; target filled at the close (13 -> 12 trades).
+    ("trend", "target"): (12, "f484f644f2d51e580830301f27a96b18900e25c712b96b07baadb7bcabde4237"),
+    # 6.6: slippage on both legs (hysteresis leaves these trades unchanged).
+    ("trend", "trailing"): (8, "65460032927286b4bddb6842fa14af482ae0e8b750ab955830e800c0eab1a5b2"),
 }
 
 

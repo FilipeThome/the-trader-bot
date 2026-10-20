@@ -11,15 +11,36 @@ any backtest it does not promise the future. It trades as the live cycle:
   at the open when the bar gaps through it, and it is checked first;
 * DCA rounds repeat after each take-profit, so the replay shows several
   rounds; the stop ends the replay, as it ends the live instance.
+
+The preview replays the last 30, 90 and 180 days of 1h bars (``replay_windows``)
+and says how long a grid's close stayed outside its range: a grid only earns
+while the price moves sideways inside it. On 1h bars a new round starts on the
+next bar, so a ``cooldown_minutes`` above 60 is not modelled.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import pandas as pd
 
-from bot.instances import DcaParams, GridParams, dca_ladder, dca_stop, grid_levels, grid_next, grid_qty, grid_start_k
+from bot.instances import (
+    DcaParams,
+    GridParams,
+    Kind,
+    dca_ladder,
+    dca_stop,
+    grid_levels,
+    grid_next,
+    grid_qty,
+    grid_start_k,
+)
+
+#: The preview's windows, in days of 1h bars.
+REPLAY_WINDOW_DAYS: tuple[int, ...] = (30, 90, 180)
+#: A grid whose close spent more than this share of the window outside its range gets a warning.
+OUT_OF_RANGE_WARN = 0.30
 
 
 def _drawdown(equity: list[float]) -> float:
@@ -144,3 +165,54 @@ def replay_grid(params: GridParams, frame: pd.DataFrame, *, taker: float, spread
         "pnl_pct": (final - params.invest_usd) / params.invest_usd,
         "max_drawdown_pct": _drawdown(equity),
     }
+
+
+def out_of_range_share(params: DcaParams | GridParams, frame: pd.DataFrame) -> float:
+    """Share of the bars whose close is outside the grid's ``[lower, upper]``; 0.0 for DCA or no bars."""
+    if not isinstance(params, GridParams) or frame.empty:
+        return 0.0
+    closes = frame["close"].astype(float)
+    outside = (closes < params.lower) | (closes > params.upper)
+    return float(outside.mean())
+
+
+def replay_windows(
+    kind: Kind,
+    params: DcaParams | GridParams,
+    frame_1h: pd.DataFrame,
+    *,
+    taker: float,
+    spread: float,
+    days: Sequence[int] = REPLAY_WINDOW_DAYS,
+) -> list[dict[str, Any]]:
+    """The plan replayed on the last ``days`` of ``frame_1h``, one row per window, in the order given.
+
+    Each window is the bars after ``last bar - N days``, so a pair younger than
+    the window replays its whole history (``bars`` tells). ``warn`` is set for a
+    grid out of range more than ``OUT_OF_RANGE_WARN`` of the window.
+    """
+    expected = DcaParams if kind == "dca" else GridParams
+    if not isinstance(params, expected):
+        raise TypeError(f"{kind} replay needs {expected.__name__}, got {type(params).__name__}")
+    if not isinstance(frame_1h.index, pd.DatetimeIndex):
+        raise TypeError("frame_1h needs a DatetimeIndex")
+    if any(n <= 0 for n in days):
+        raise ValueError("every window needs a positive number of days")
+    end = frame_1h.index[-1] if len(frame_1h) else None
+    rows: list[dict[str, Any]] = []
+    for n in days:
+        window = frame_1h if end is None else frame_1h[frame_1h.index > end - pd.Timedelta(days=n)]
+        if isinstance(params, DcaParams):
+            result = replay_dca(params, window, taker=taker, spread=spread)
+        else:
+            result = replay_grid(params, window, taker=taker, spread=spread)
+        share = out_of_range_share(params, window)
+        rows.append(
+            {
+                "days": n,
+                **result,
+                "out_of_range_share": share,
+                "warn": kind == "grid" and share > OUT_OF_RANGE_WARN,
+            }
+        )
+    return rows

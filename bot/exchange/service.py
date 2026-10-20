@@ -8,6 +8,9 @@ execution package. That package journals the order before the exchange write.
 from __future__ import annotations
 
 import logging
+import threading
+import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -316,8 +319,87 @@ def order_status(symbol: str, profile_id: str, client_order_id: str) -> dict[str
         return {"status": "error", "error": f"read_failed ({type(exc).__name__})"}
 
 
+#: Seconds an account fee read is reused, and seconds before a failed read is retried.
+FEES_TTL_SECONDS = 24 * 3600.0
+FEES_RETRY_SECONDS = 3600.0
+#: (profile id, symbol) -> (monotonic time of the next read, last known (maker, taker) or None).
+_FEES: dict[tuple[str, str], tuple[float, tuple[Decimal, Decimal] | None]] = {}
+_FEES_LOCK = threading.Lock()
+_monotonic = time.monotonic
+
+
+def reset_fee_cache() -> None:
+    """Forget every cached account fee. Tests call it."""
+    with _FEES_LOCK:
+        _FEES.clear()
+
+
+def _fee_key(symbol: str, profile_id: str) -> tuple[str, str]:
+    return profile_id, str(symbol).strip().upper()
+
+
+def _known_fees(symbol: str, profile_id: str) -> tuple[Decimal, Decimal] | None:
+    """The last account fees read for ``symbol``, without any exchange call."""
+    with _FEES_LOCK:
+        entry = _FEES.get(_fee_key(symbol, profile_id))
+    return None if entry is None else entry[1]
+
+
+def _read_fees(symbol: str, profile: TradingProfile) -> tuple[Decimal, Decimal] | None:
+    try:
+        config = sdk.build_config(dict(profile.config))
+        payload = sdk.get_account_commission(symbol, config=config)
+    except Exception as exc:  # noqa: BLE001 - the market's taker fee stays in use
+        logger.warning("account fees for %s failed: %s", symbol, type(exc).__name__)
+        return None
+    if payload.get("status") != "ok":
+        logger.warning("account fees for %s unavailable: %s", symbol, payload.get("error"))
+        return None
+    try:
+        maker, taker = Decimal(str(payload["maker"])), Decimal(str(payload["taker"]))
+    except (KeyError, InvalidOperation):
+        return None
+    if not (maker.is_finite() and taker.is_finite()) or maker < 0 or taker < 0:
+        return None
+    return maker, taker
+
+
+def trading_fees(symbol: str, profile_id: str) -> tuple[Decimal, Decimal] | None:
+    """The account's ``(maker, taker)`` fee for ``symbol``, read at most once a day.
+
+    A successful read is reused for ``FEES_TTL_SECONDS``. A failed read is
+    retried after ``FEES_RETRY_SECONDS``; until then the last known fees stay
+    in use, or ``None`` when the account was never read, so callers keep the
+    market's taker fee. The exchange call runs outside the lock: two threads
+    racing on a cold key may both read, and the later answer wins.
+    """
+    profile = _profile(profile_id)
+    if profile is None:
+        return None
+    key = _fee_key(symbol, profile.id)
+    now = _monotonic()
+    with _FEES_LOCK:
+        entry = _FEES.get(key)
+    if entry is not None and now < entry[0]:
+        return entry[1]
+    fees = _read_fees(symbol, profile)
+    with _FEES_LOCK:
+        if fees is not None:
+            _FEES[key] = (now + FEES_TTL_SECONDS, fees)
+        else:
+            previous = _FEES.get(key)
+            fees = None if previous is None else previous[1]
+            _FEES[key] = (now + FEES_RETRY_SECONDS, fees)
+    return fees
+
+
 def market_rules(symbol: str, profile_id: str) -> MarketRules | None:
-    """Exchange filters (tick, lot, minimum notional, taker fee) for ``symbol``."""
+    """Exchange filters (tick, lot, minimum notional, taker fee) for ``symbol``.
+
+    The taker fee is the account's own when ``trading_fees`` has read it; this
+    call never reads it, so it adds no signed request. Otherwise it is the
+    market's default from the exchange catalog.
+    """
     profile = profile_by_id(profile_id)
     try:
         config = sdk.build_config(dict(profile.config))
@@ -329,6 +411,11 @@ def market_rules(symbol: str, profile_id: str) -> MarketRules | None:
     if not isinstance(market, dict):
         return None
     rules, _reasons = parse_market(market)
+    if rules is None:
+        return None
+    fees = _known_fees(symbol, profile.id)
+    if fees is not None:
+        rules = replace(rules, taker_fee=fees[1])
     return rules
 
 

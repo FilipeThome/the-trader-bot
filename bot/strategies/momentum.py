@@ -6,7 +6,8 @@ A buy needs a positive return over the last 120 bars (about 20 days), EMA 20
 above EMA 50, the close above EMA 50 and ADX of at least 20. The confidence is
 that return divided by the volatility over the same bars, so a steady rise
 counts more than a jump. The stop is 2.5 ATR; the position leaves on the
-trailing stop or when EMA 20 falls under EMA 50.
+trailing stop or when EMA 20 falls under EMA 50, with the same hysteresis as
+the trend exit (``bot.strategies.trend.ema_crossed``).
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import pandas as pd
 
 from bot.indicators import adx, atr, ema, regime
 from bot.strategies.base import Setup
+from bot.strategies.trend import ema_crossed
 
 #: Bars of the momentum return: 120 bars of 4h are 20 days.
 LOOKBACK = 120
@@ -84,9 +86,9 @@ class Momentum:
             alphas={"momentum": round(momentum, 4), "vol_adjusted": round(strength_ratio, 2)},
         )
 
-    def exit_reason(self, frame: pd.DataFrame, side: str) -> str | None:
+    def exit_reason(self, frame: pd.DataFrame, side: str, *, hysteresis: bool = True) -> str | None:
         if side != "buy" or len(frame) < 50:
             return None
-        if float(ema(frame["close"], 20).iloc[-1]) < float(ema(frame["close"], 50).iloc[-1]):
+        if ema_crossed(frame["close"], side, hysteresis=hysteresis):
             return "momento virou: EMA 20 abaixo da 50"
         return None

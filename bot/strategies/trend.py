@@ -1,4 +1,10 @@
-"""Breakout: close above the 20-bar high, volume above average, ADX above 25."""
+"""Breakout: close above the 20-bar high, volume above average, ADX above 25.
+
+The position leaves when EMA 20 crosses back under EMA 50. With hysteresis (the
+default, ``exit_hysteresis`` in the config) one bar under the slow EMA is not
+enough: the fast EMA must sit ``EXIT_BAND`` below it, or under it on the last
+``EXIT_CONFIRM_BARS`` closed bars, so a flat market does not churn exits.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +13,34 @@ import pandas as pd
 from bot.alphas import agreement
 from bot.indicators import adx, atr, ema, regime
 from bot.strategies.base import Setup
+
+#: How far EMA 20 must fall under EMA 50 for an exit on a single bar.
+EXIT_BAND = 0.005
+#: Closed bars in a row with EMA 20 under EMA 50 that exit without the band.
+EXIT_CONFIRM_BARS = 2
+
+
+def ema_crossed(close: pd.Series, side: str, *, hysteresis: bool = True) -> bool:
+    """Whether EMA 20 crossed EMA 50 against a ``side`` position on the last closed bar.
+
+    Without hysteresis any bar on the wrong side exits. With it, the cross needs
+    the ``EXIT_BAND`` margin or ``EXIT_CONFIRM_BARS`` bars in a row.
+    """
+    fast = ema(close, 20)
+    slow = ema(close, 50)
+    if len(close) == 0 or pd.isna(fast.iloc[-1]) or pd.isna(slow.iloc[-1]):
+        return False
+    sign = 1.0 if side == "buy" else -1.0
+    # Positive when the fast EMA sits on the losing side of the slow one.
+    against = sign * (slow - fast)
+    if float(against.iloc[-1]) <= 0:
+        return False
+    if not hysteresis:
+        return True
+    if float(against.iloc[-1]) > EXIT_BAND * float(slow.iloc[-1]):
+        return True
+    recent = against.iloc[-EXIT_CONFIRM_BARS:]
+    return len(recent) == EXIT_CONFIRM_BARS and bool((recent > 0).all())
 
 
 class TrendBreakout:
@@ -65,13 +99,9 @@ class TrendBreakout:
             alphas=votes,
         )
 
-    def exit_reason(self, frame: pd.DataFrame, side: str) -> str | None:
-        fast = ema(frame["close"], 20)
-        slow = ema(frame["close"], 50)
-        if pd.isna(fast.iloc[-1]) or pd.isna(slow.iloc[-1]):
+    def exit_reason(self, frame: pd.DataFrame, side: str, *, hysteresis: bool = True) -> str | None:
+        if side not in ("buy", "sell"):
             return None
-        if side == "buy" and float(fast.iloc[-1]) < float(slow.iloc[-1]):
-            return "cruzamento contrário da EMA 20/50"
-        if side == "sell" and float(fast.iloc[-1]) > float(slow.iloc[-1]):
+        if ema_crossed(frame["close"], side, hysteresis=hysteresis):
             return "cruzamento contrário da EMA 20/50"
         return None

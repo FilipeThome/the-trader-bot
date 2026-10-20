@@ -107,6 +107,18 @@ def test_target_exit_takes_the_stop_off_then_sells_with_ioc(tmp_path, venue) -> 
     assert day["net_pnl"] > 0
 
 
+def test_an_exit_prices_its_ioc_the_given_gap_below_the_bid(tmp_path, venue) -> None:
+    executor = _executor(tmp_path)
+    executor.enter(_ready())
+    position = executor.store.open_positions()[0]
+    venue.bid = Decimal("105")
+    result = executor.exit_position(position["id"], "stop acionado sem execução (gap)", gap=Decimal("0.02"))
+    assert result["status"] == "ok"
+    sell = venue.calls[-1]
+    assert sell["order_type"] == "limit" and sell["time_in_force"] == "ioc"
+    assert sell["limit_price"] == "102.9"
+
+
 def test_a_partial_ioc_re_places_the_stop_on_the_remainder(tmp_path, venue) -> None:
     executor = _executor(tmp_path)
     executor.enter(_ready())

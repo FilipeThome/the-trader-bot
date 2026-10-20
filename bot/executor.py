@@ -19,6 +19,10 @@ the stop over the whole, and partial IOC sales reuse ``exit_position``. The
 order in flight is recorded in ``pending_leg`` before it is sent, so the sync
 reads it back by its key.
 
+A stop that triggered but rests unfilled because the price gapped below its
+limit is found by price in the sync: it is cancelled and the position sold with
+an IOC below the bid, then one more 2% below it (``EMERGENCY_LIMIT_GAP``).
+
 When a position cannot be protected or closed, ``UnprotectedPosition`` is
 raised and the runtime halts.
 """
@@ -29,6 +33,7 @@ import hashlib
 import json
 import logging
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -38,6 +43,7 @@ from bot.evaluator import SPOT_TAKER, Opportunity
 from bot.exchange import service
 from bot.exchange.execution.rules import MarketRules, decimal_text, floor_to_step
 from bot.exchange.weight import weight_pressure
+from bot.reports import append_ledger
 from bot.store import Store
 from bot.strategies import exit_policy_for
 from bot.strategies.day import DAY
@@ -50,6 +56,11 @@ logger = logging.getLogger(__name__)
 STOP_LIMIT_GAP = Decimal("0.005")
 #: An exit IOC is priced this far below the bid so it crosses the book.
 EXIT_LIMIT_GAP = Decimal("0.005")
+#: The second and last IOC for a stop the price gapped through. No market sell follows:
+#: the Spot Testnet refuses market sells sized in base, so that path could never be tested.
+EMERGENCY_LIMIT_GAP = Decimal("0.02")
+#: Reason recorded when a stuck stop is replaced by an IOC sale.
+_STOP_GAPPED_REASON = "stop acionado sem execução (gap)"
 #: Entry, stop and exit. An entry is refused unless the day still allows all three.
 ORDERS_PER_ROUND_TRIP = 3
 #: A day trade also sells its first target and re-places the stop at break-even.
@@ -82,6 +93,18 @@ class Fill:
     @property
     def average(self) -> Decimal:
         return self.cost / self.qty if self.qty > 0 else Decimal(0)
+
+
+#: Writes one ledger record: ``(kind, payload)``.
+Ledger = Callable[[str, dict[str, Any]], None]
+
+
+def _append_ledger(kind: str, payload: dict[str, Any]) -> None:
+    """Default ledger. A ledger failure must not send, block or interrupt an order."""
+    try:
+        append_ledger({"kind": kind, **payload})
+    except Exception:  # noqa: BLE001 - visible in the log; the exit goes on
+        logger.exception("ledger append failed (%s)", kind)
 
 
 def _now() -> datetime:
@@ -140,11 +163,14 @@ def floor_price(value: Decimal, rules: MarketRules) -> Decimal:
 
 
 class Executor:
-    def __init__(self, store: Store, profile_id: str, *, exit_policy: str = "trailing") -> None:
+    def __init__(
+        self, store: Store, profile_id: str, *, exit_policy: str = "trailing", ledger: Ledger | None = None
+    ) -> None:
         self.store = store
         self.profile_id = profile_id
         #: Recorded on every position, so the hit rate only mixes trades of one exit rule.
         self.exit_policy = exit_policy
+        self.ledger: Ledger = ledger if ledger is not None else _append_ledger
 
     # -- entries ---------------------------------------------------------
 
@@ -701,6 +727,7 @@ class Executor:
         keep_qty: Decimal | None = None,
         leg: str = "exit",
         next_stop: Decimal | None = None,
+        gap: Decimal = EXIT_LIMIT_GAP,
     ) -> dict[str, Any]:
         """Take the stop off the book and sell the position with LIMIT IOC orders.
 
@@ -708,6 +735,7 @@ class Executor:
         target): the row never closes, the stop goes back on the rest at
         ``next_stop`` once the sale is complete, or at the old stop when it is not.
         ``leg`` keeps the order keys of a partial sale apart from a later full exit.
+        Each IOC is priced ``gap`` below the bid.
         """
         position = self.store.position(position_id)
         if position is None or position["status"] != "open":
@@ -764,7 +792,7 @@ class Executor:
             if bid is None or bid <= 0:
                 failure = "cotação indisponível"
                 break
-            limit = floor_price(bid * (1 - EXIT_LIMIT_GAP), rules)
+            limit = floor_price(bid * (1 - gap), rules)
             chunk = floor_to_step(remaining, rules.lot_step)
             if cap is not None:
                 chunk = min(chunk, floor_to_step(cap * _CAP_HEADROOM / bid, rules.lot_step))
@@ -1088,6 +1116,82 @@ class Executor:
             self._settle_cancelled_stop(position, order)
             if self._position(position["id"])["status"] == "open":
                 self.protect(position["id"])
+        else:
+            # Resting (new, open or partly filled): a stop the price gapped through never fills.
+            stop = _dec(position.get("stop_price"))
+            bid = self._bid(position["symbol"])
+            if stop is not None and bid is not None and 0 < bid < stop * (1 - STOP_LIMIT_GAP):
+                self._stop_gapped(self._position(position["id"]), order, bid)
+
+    def _stop_gapped(self, position: dict[str, Any], order: dict[str, Any], bid: Decimal) -> None:
+        """Replace a stop the price gapped through: cancel it, then sell with IOC orders.
+
+        The first IOC goes ``EXIT_LIMIT_GAP`` below the bid, the second
+        ``EMERGENCY_LIMIT_GAP`` below it. Each order key comes from the exit attempt
+        counter, which moves on after every final outcome, so the second IOC never
+        replays the first. The cancel books any part the stop sold; a stop that
+        filled before the cancel closes the row. While a write blocker or a pending
+        scale-in buy keeps the stop on the book, it stays there and the next sync
+        tries again. A position still open after the IOCs raises
+        ``UnprotectedPosition``, and so does an IOC of unknown outcome (another
+        sale could sell twice): the runtime halts.
+        """
+        position_id = int(position["id"])
+        symbol = position["symbol"]
+        stop = Decimal(str(position["stop_price"]))
+        limit = _dec(order.get("price")) or stop * (1 - STOP_LIMIT_GAP)
+        self._record(
+            "stop_gapped",
+            {
+                "position_id": position_id,
+                "symbol": symbol,
+                "stop": decimal_text(stop),
+                "limit": decimal_text(limit),
+                "bid": decimal_text(bid),
+                "order_state": str(order.get("status") or "").lower(),
+            },
+        )
+        avg = Decimal(str(position["avg_price"]))
+        qty_before = Decimal(str(position["qty"]))
+        booked_before = Decimal(str(position["realized_pnl"])) + Decimal(str(position["fees"]))
+        attempts = 0
+        result: dict[str, Any] = {}
+        for gap in (EXIT_LIMIT_GAP, EMERGENCY_LIMIT_GAP):
+            attempts += 1
+            result = self.exit_position(position_id, _STOP_GAPPED_REASON, protect_remainder=False, gap=gap)
+            current = self._position(position_id)
+            if current["status"] != "open":
+                break
+            resting = bool(current.get("stop_order_id") or current.get("stop_client_order_id"))
+            if resting and result.get("status") == "blocked":
+                # Nothing was sent and the stop still rests: it stays, the next sync tries again.
+                logger.warning("stuck stop of position %s left on the book: %s", position_id, result.get("error"))
+                return
+            if result.get("status") == "unknown":
+                break
+        current = self._position(position_id)
+        if current["status"] == "open":
+            raise UnprotectedPosition(f"{symbol}: {_STOP_GAPPED_REASON}; saída falhou: {_reason(result)}")
+        # Every sale is booked on the row (gross = proceeds - avg x sold), stop fills included. A row
+        # the stop itself closed keeps its quantity: its exit price is the stop's average fill.
+        sold = qty_before - Decimal(str(current["qty"]))
+        gross = Decimal(str(current["realized_pnl"])) + Decimal(str(current["fees"])) - booked_before
+        exit_avg = (gross + avg * sold) / sold if sold > 0 else Decimal(str(current["exit_price"]))
+        self._record(
+            "stop_gapped_exit",
+            {
+                "position_id": position_id,
+                "exit_avg": float(exit_avg),
+                "slippage_vs_stop": float(exit_avg / stop - 1) if stop > 0 else None,
+                "attempts": attempts,
+            },
+        )
+
+    def _record(self, kind: str, payload: dict[str, Any]) -> None:
+        try:
+            self.ledger(kind, payload)
+        except Exception:  # noqa: BLE001 - a ledger failure must not stop an exit
+            logger.exception("ledger append failed (%s)", kind)
 
     def _settle_partial(self, position: dict[str, Any], leg: str) -> None:
         """Read the partial sell of ``leg`` at the current attempt by its key and book its fill."""

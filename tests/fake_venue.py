@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
@@ -33,10 +34,16 @@ def _rules() -> MarketRules:
 
 
 class Venue:
-    """The slice of ``bot.exchange.service`` the executor uses, scripted per order type."""
+    """The slice of ``bot.exchange.service`` the executor uses, scripted per order type.
+
+    ``responses`` queues results by ``"{side}:{order_type}"`` (``"sell:limit"``) or,
+    for either side, by the order type alone (``"limit"``); the side key wins.
+    """
 
     def __init__(self) -> None:
         self.bid = Decimal("100")
+        #: Best ask when it differs from the bid.
+        self.ask: Decimal | None = None
         self.budget = 100
         self.calls: list[dict[str, Any]] = []
         self.events: list[str] = []
@@ -54,6 +61,9 @@ class Venue:
         #: Raised on the n-th limit sell (1-based), to break a chunked exit midway.
         self.fail_limit_at: int | None = None
         self.limit_calls = 0
+        #: Called with the order id on a cancel; its result (None means ok) is returned.
+        #: It may move ``orders`` on, as Binance does when a stop fills before the cancel lands.
+        self.on_cancel: Callable[[str], dict[str, Any] | None] | None = None
 
     def submit_order(self, symbol: str, profile_id: str, *, held: Any = None, **kwargs: Any) -> dict[str, Any]:
         self.events.append(f"submit:{kwargs['order_type']}")
@@ -66,7 +76,9 @@ class Venue:
             self.limit_calls += 1
             if self.limit_calls == self.fail_limit_at:
                 raise RuntimeError("binance.json unreadable")
-        queue = self.responses.get(kwargs["order_type"])
+        queue = self.responses.get(f"{kwargs.get('side', 'buy')}:{kwargs['order_type']}") or self.responses.get(
+            kwargs["order_type"]
+        )
         if queue:
             result = dict(queue.pop(0))
         elif kwargs["order_type"] == "market":
@@ -101,11 +113,13 @@ class Venue:
     def cancel_order(self, order_id: str, profile_id: str, **kwargs: Any) -> dict[str, Any]:
         self.events.append(f"cancel:{order_id}")
         self.cancelled.append(order_id)
-        return {"status": "ok"}
+        result = self.on_cancel(order_id) if self.on_cancel is not None else None
+        return result if result is not None else {"status": "ok"}
 
     def get_quote(self, symbol: str, profile_id: str) -> dict[str, Any]:
         last = self.last if self.last is not None else self.bid
-        return {"status": "ok", "quote": {"bid": str(self.bid), "last": str(last)}}
+        ask = self.ask if self.ask is not None else self.bid
+        return {"status": "ok", "quote": {"bid": str(self.bid), "ask": str(ask), "last": str(last)}}
 
     def reconcile(self, profile_id: str) -> dict[str, Any]:
         self.events.append("reconcile")

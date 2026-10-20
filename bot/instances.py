@@ -19,11 +19,16 @@ The live cycle runs every minute and trades with market buys and IOC sells,
 because a spot stop locks the base asset a resting sell limit would need: round
 trips inside one minute are missed, and each leg pays the taker fee and the
 spread. The profit floor per grid accounts for both.
+
+A new round waits ``cooldown_minutes`` after the previous one closed, as
+Binance waits 60 s: a DCA repeat after its take-profit, and a grid restart from
+an empty inventory after a full sell-out (``cooldown_ends``).
 """
 
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -40,6 +45,8 @@ MIN_NOTIONAL_HEADROOM = 1.05
 DCA_FIXED_ORDERS = 3
 #: Each safety buy or grid leg costs the order plus the re-placed stop.
 ORDERS_PER_LEG = 2
+#: Minutes a new round waits after the previous one closed (Binance's 60 s).
+DEFAULT_COOLDOWN_MINUTES = 1
 
 
 class DcaParams(BaseModel):
@@ -59,6 +66,8 @@ class DcaParams(BaseModel):
     #: Start a new round after a take-profit.
     repeat: bool = False
     max_orders_per_day: int = Field(default=20, ge=4, le=200)
+    #: Pause between a take-profit and the next round's base buy. Absent from older stored params.
+    cooldown_minutes: int = Field(default=DEFAULT_COOLDOWN_MINUTES, ge=0, le=1440)
 
     @model_validator(mode="after")
     def _ladder_above_zero(self) -> "DcaParams":
@@ -80,6 +89,8 @@ class GridParams(BaseModel):
     #: Above the range: sell everything and end the grid. None = no take-profit.
     take_profit_price: float | None = Field(default=None, gt=0)
     max_orders_per_day: int = Field(default=20, ge=4, le=200)
+    #: Pause between a full sell-out and the restart from an empty inventory. Absent from older stored params.
+    cooldown_minutes: int = Field(default=DEFAULT_COOLDOWN_MINUTES, ge=0, le=1440)
 
     @model_validator(mode="after")
     def _ordered(self) -> "GridParams":
@@ -222,9 +233,17 @@ def creation_problems(
     taker: float,
     spread: float,
     params: DcaParams | GridParams,
+    live_instances: int = 0,
+    max_instances: int | None = None,
 ) -> list[str]:
-    """Why the plan cannot run, in the operator's words; empty when it can."""
+    """Why the plan cannot run, in the operator's words; empty when it can.
+
+    ``live_instances`` counts the robots already running, without this one;
+    ``max_instances`` None leaves their number unchecked.
+    """
     problems: list[str] = []
+    if max_instances is not None and live_instances >= max_instances:
+        problems.append(f"já há {live_instances} robôs ativos (máximo de {max_instances})")
     cap = order_cap * CAP_HEADROOM
     risk_cap = sizing_capital * risk_per_trade_pct
     if plan["loss_at_stop_usd"] > risk_cap:
@@ -259,6 +278,17 @@ def creation_problems(
                 f"lucro por grade de {plan['profit_per_grid_net']:.2%} depois de taxas e spread; o mínimo é {MIN_NET_MARGIN:.2%}"
             )
     return problems
+
+
+def cooldown_ends(closed_at_iso: str, minutes: int) -> datetime:
+    """When the next round may start: ``minutes`` after the previous round closed, in UTC.
+
+    The store writes aware UTC timestamps; a naive one is read as UTC.
+    """
+    closed_at = datetime.fromisoformat(closed_at_iso)
+    if closed_at.tzinfo is None:
+        closed_at = closed_at.replace(tzinfo=timezone.utc)
+    return closed_at.astimezone(timezone.utc) + timedelta(minutes=minutes)
 
 
 def worst_case_loss(instance: dict[str, Any], *, taker: float) -> float:

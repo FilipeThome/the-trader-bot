@@ -42,14 +42,33 @@ def regime_factor(strategy_id: str, regime: str, direction: float) -> float:
     return 0.0
 
 
-def round_trip_cost(setup: Setup, *, slippage: float = 0.0005, funding: float = 0.0) -> float:
-    fee = FUTURES_TAKER if setup.market == "usdm" else SPOT_TAKER
+def round_trip_cost(
+    setup: Setup,
+    *,
+    slippage: float = 0.0005,
+    funding: float = 0.0,
+    taker: float = SPOT_TAKER,
+) -> float:
+    """Fees for every leg in and out, plus slippage and any funding paid.
+
+    ``taker`` is the spot taker fee. The runtime passes
+    ``max(SPOT_TAKER, account taker)``, so a discounted account never scores
+    a setup cheaper than the backtest that validated it. USD-M legs keep
+    ``FUTURES_TAKER``.
+    """
+    fee = FUTURES_TAKER if setup.market == "usdm" else taker
     legs = 2 if setup.strategy_id == "funding_carry" else 1
     return legs * 2 * fee + slippage + max(funding, 0.0)
 
 
-def score_setup(setup: Setup, *, slippage: float = 0.0005, funding: float = 0.0) -> float:
-    cost = round_trip_cost(setup, slippage=slippage, funding=funding)
+def score_setup(
+    setup: Setup,
+    *,
+    slippage: float = 0.0005,
+    funding: float = 0.0,
+    taker: float = SPOT_TAKER,
+) -> float:
+    cost = round_trip_cost(setup, slippage=slippage, funding=funding, taker=taker)
     sigma = setup.sigma if setup.sigma > 0 else 1.0
     factor = regime_factor(setup.strategy_id, setup.regime, setup.direction)
     net = setup.expected_return - cost
@@ -86,6 +105,17 @@ class Opportunity:
     blocker: str | None = None
     #: Ready only through the Spot Testnet test mode; manual execution only.
     test_only: bool = False
+    #: The limit that set ``size_usd`` (a ``risk.SIZE_LIMITS`` key), and every cap in USD.
+    size_limit: str | None = None
+    size_caps: dict[str, float] | None = None
+    #: Seconds since the candle that produced the signal closed.
+    signal_age_seconds: float | None = None
+    #: Correlation cluster of the pair (for example "BTC"), or None when it trades on its own.
+    cluster: str | None = None
+    #: Slippage share of the round-trip cost.
+    slippage_est: float | None = None
+    #: Target distance above the entry; the executor re-applies it on the average fill.
+    plan_target_pct: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -128,10 +158,11 @@ def classify(
     score_threshold: float = SCORE_READY,
     cost_multiple: float = COST_MULTIPLE,
     min_reward_risk: float = MIN_REWARD_RISK,
+    taker: float = SPOT_TAKER,
 ) -> Opportunity:
-    cost = round_trip_cost(setup, slippage=slippage, funding=funding)
+    cost = round_trip_cost(setup, slippage=slippage, funding=funding, taker=taker)
     net = setup.expected_return - cost
-    value = score_setup(setup, slippage=slippage, funding=funding)
+    value = score_setup(setup, slippage=slippage, funding=funding, taker=taker)
     reward_risk = net / setup.stop_pct if setup.stop_pct > 0 else 0.0
     reason = setup.reason
     status = "potencial"
@@ -182,4 +213,5 @@ def classify(
         gross_return=setup.expected_return,
         alphas=setup.alphas,
         blocker=blocker,
+        slippage_est=slippage,
     )

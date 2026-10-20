@@ -8,8 +8,10 @@ each order, and the bot's own risk checks use the tighter of the two.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -23,6 +25,10 @@ Mode = Literal["testnet", "production"]
 #: ``auto``: the cycle also enters ready rows whose estimated hit rate clears ``min_win_rate``
 #: (swing) or the first-target break-even plus ``DAY_WIN_RATE_MARGIN`` (day).
 EntryMode = Literal["manual", "auto"]
+#: ``btc_ema40d``: new entries wait while the BTC 4h close is below the EMA of 240 4h closes.
+MarketFilter = Literal["off", "btc_ema40d"]
+#: Operator-listed macro events; each pauses day-strategy entries around it.
+MAX_MACRO_EVENTS = 100
 DEFAULT_SYMBOLS = ("BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT")
 #: Each symbol costs about seven REST reads per cycle.
 MAX_SYMBOLS = 20
@@ -50,7 +56,29 @@ class RiskLimits(BaseModel):
     #: Spot has no leverage. A saved value above 1 is read as 1.
     max_leverage: float = 1.0
     max_daily_loss_pct: float = 0.03
+    #: Drawdown steps from the PnL peak, in increasing order: ``dd_reduce_pct`` halves the
+    #: risk and allows one entry per cycle (0 = off), ``max_drawdown_pct`` allows exits only,
+    #: ``halt_drawdown_pct`` halts. A bot.json without the outer two derives them from
+    #: ``max_drawdown_pct`` (half of it, and 1.5 times it within [15%, 50%]; a limit of 50% or
+    #: more halts at 1.5 times it, at most 100%).
     max_drawdown_pct: float = 0.10
+    dd_reduce_pct: float = Field(default=0.05, ge=0, le=0.5)
+    halt_drawdown_pct: float = Field(default=0.15, gt=0, le=1)
+    #: An order's exposure to one daily ATR14 costs at most this share of capital (0 = off).
+    vol_cap_pct: float = Field(default=0.01, ge=0, le=0.05)
+    #: Annualised portfolio volatility above which new entries shrink (0 = off).
+    target_vol_annual: float = Field(default=0.60, ge=0, le=3)
+    #: The size halves when the 7-day volatility of 4h returns exceeds this multiple of
+    #: the long-run one (0 = off).
+    vol_throttle_ratio: float = Field(default=2.0, ge=0, le=10)
+    #: A pair whose return correlation with BTC exceeds this belongs to the BTC cluster.
+    cluster_corr: float = Field(default=0.70, gt=0, le=1)
+    #: Live DCA and grid robots at once.
+    max_instances: int = Field(default=3, ge=0, le=20)
+    #: Mean round-trip slippage of a pair's last 20 trades above which it takes no entry (0 = off).
+    slippage_budget_pct: float = Field(default=0.003, ge=0, le=0.05)
+    #: Automatic entries skip a signal older than this many seconds (0 = off).
+    max_signal_age_seconds: int = Field(default=120, ge=0, le=3600)
     #: New positions per UTC day. The mandate allows four orders per entry.
     max_trades_per_day: int = Field(default=20, ge=1, le=100)
     max_positions: int = Field(default=5, ge=1, le=20)
@@ -86,10 +114,49 @@ class RiskLimits(BaseModel):
             raise ValueError("max_leverage must be positive")
         return min(value, 1.0)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_drawdown_steps(cls, data: Any) -> Any:
+        """Fill the drawdown steps an older bot.json lacks from its ``max_drawdown_pct``.
+
+        A value that is not a number is left for the field validation to report.
+        """
+        if not isinstance(data, dict):
+            return data
+        missing = {"dd_reduce_pct", "halt_drawdown_pct"} - data.keys()
+        drawdown = data.get("max_drawdown_pct", cls.model_fields["max_drawdown_pct"].default)
+        if not missing or isinstance(drawdown, bool):
+            return data
+        try:
+            drawdown = float(drawdown)
+        except (TypeError, ValueError):
+            return data
+        if not math.isfinite(drawdown):
+            return data
+        # Rounded so bot.json shows 0.15, not 0.15000000000000002.
+        halt = min(0.5, max(0.15, 1.5 * drawdown))
+        if halt <= drawdown:
+            # A drawdown limit of 50% or more: halt above it, never above 100%.
+            halt = min(1.0, 1.5 * drawdown)
+        derived = {
+            "dd_reduce_pct": round(drawdown / 2, 6),
+            "halt_drawdown_pct": round(halt, 6),
+        }
+        return {**data, **{name: derived[name] for name in missing}}
+
     @model_validator(mode="after")
     def _open_risk_covers_one_trade(self) -> "RiskLimits":
         if self.risk_per_trade_pct > self.max_open_risk_pct:
             raise ValueError("risk_per_trade_pct must not exceed max_open_risk_pct")
+        return self
+
+    @model_validator(mode="after")
+    def _drawdown_steps_in_order(self) -> "RiskLimits":
+        if not (self.dd_reduce_pct == 0 or self.dd_reduce_pct < self.max_drawdown_pct):
+            raise ValueError("dd_reduce_pct must be 0 or below max_drawdown_pct")
+        # Equal only at 100%: no halt level can sit above a drawdown limit of 100%.
+        if not (self.max_drawdown_pct < self.halt_drawdown_pct or self.halt_drawdown_pct == self.max_drawdown_pct == 1.0):
+            raise ValueError("halt_drawdown_pct must be above max_drawdown_pct")
         return self
 
 
@@ -124,6 +191,18 @@ class BotConfig(BaseModel):
     #: risk-adjusted 28-day momentum. Pairs with a live position always stay.
     auto_select: bool = False
     auto_select_count: int = Field(default=15, ge=5, le=MAX_SYMBOLS)
+    #: Market regime filter for new entries. Part of the validation key, so turning it on
+    #: needs a validation run with it on.
+    market_filter: MarketFilter = "off"
+    #: Trend and momentum exit on a band below the slow EMA or after two closed bars below it,
+    #: not on the first cross. Part of the validation key; each position records its own flag.
+    exit_hysteresis: bool = True
+    #: On the daily-loss pause, sell the open day-trade positions first.
+    flatten_day_on_daily_loss: bool = False
+    #: Macro events (ISO times, UTC unless an offset is given). Day strategies take no entry
+    #: within ``macro_pause_minutes`` of one. Operator convention; the backtest does not replay it.
+    macro_events_utc: list[str] = Field(default_factory=list, max_length=MAX_MACRO_EVENTS)
+    macro_pause_minutes: int = Field(default=15, ge=0, le=180)
     limits: RiskLimits = Field(default_factory=RiskLimits)
     score_threshold: float = 0.3
     min_reward_risk: float = 1.5
@@ -157,6 +236,21 @@ class BotConfig(BaseModel):
     def _basis_points(cls, value: float | None) -> float | None:
         """Whole basis points: the policy string records them exactly."""
         return None if value is None else round(value, 4)
+
+    @field_validator("macro_events_utc")
+    @classmethod
+    def _utc_events(cls, value: list[str]) -> list[str]:
+        """Parse each event, read a time without offset as UTC, then deduplicate and sort."""
+        moments: set[datetime] = set()
+        for item in value:
+            try:
+                moment = datetime.fromisoformat(item.strip())
+            except ValueError:
+                raise ValueError(f"macro_events_utc must be ISO times: {item!r}") from None
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            moments.add(moment.astimezone(timezone.utc))
+        return [moment.isoformat() for moment in sorted(moments)]
 
     @model_validator(mode="after")
     def _fixed_pair(self) -> "BotConfig":

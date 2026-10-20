@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import functools
 import json
+import math
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, TypeVar, cast
 
@@ -148,6 +149,30 @@ CREATE TABLE IF NOT EXISTS bot_instances (
     reason TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS instances_live ON bot_instances(kind, symbol) WHERE status IN ('active', 'stopping');
+CREATE TABLE IF NOT EXISTS validation_trials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    exit_policy TEXT NOT NULL,
+    pairset TEXT NOT NULL,
+    market_filter TEXT NOT NULL,
+    hysteresis INTEGER NOT NULL,
+    sharpe_trade REAL NOT NULL,
+    trades INTEGER NOT NULL,
+    passed INTEGER NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS validation_trials_strategy ON validation_trials(strategy_id, id);
+CREATE TABLE IF NOT EXISTS stop_windows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    position_id INTEGER,
+    ms REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS stop_windows_ts ON stop_windows(ts);
 """
 
 #: Columns ``update_position`` may change. Identity and timestamps stay with the store.
@@ -175,6 +200,18 @@ _POSITION_FIELDS = frozenset(
         "exit_deadline",
         "instance_id",
         "pending_leg",
+        "timeframe",
+        "plan_stop_pct",
+        "plan_target_pct",
+        "exit_hysteresis",
+        "entry_ref_price",
+        "initial_stop",
+        "initial_risk_usd",
+        "mae_price",
+        "mfe_price",
+        "entry_slippage",
+        "exit_slippage",
+        "r_multiple",
     }
 )
 
@@ -194,6 +231,35 @@ _ADDED_POSITION_COLUMNS = (
     # "sell" (leg, qty_before).
     ("instance_id", "INTEGER"),
     ("pending_leg", "TEXT"),
+    # The entry plan: the setup's timeframe, its stop and target distances (recomputed on the
+    # average fill) and whether the exit rule uses hysteresis. NULL on rows from before them.
+    ("timeframe", "TEXT"),
+    ("plan_stop_pct", "REAL"),
+    ("plan_target_pct", "REAL"),
+    ("exit_hysteresis", "INTEGER"),
+    # Execution quality: the quote the entry was priced on, the stop and the risk in USD at the
+    # fill, the lowest and highest price while open, slippage per leg and the result in R.
+    ("entry_ref_price", "REAL"),
+    ("initial_stop", "REAL"),
+    ("initial_risk_usd", "REAL"),
+    ("mae_price", "REAL"),
+    ("mfe_price", "REAL"),
+    ("entry_slippage", "REAL"),
+    ("exit_slippage", "REAL"),
+    ("r_multiple", "REAL"),
+)
+
+#: Columns of ``validation_trials`` a trial row must give; ``ts`` and ``payload`` are optional.
+_TRIAL_COLUMNS = (
+    "strategy_id",
+    "timeframe",
+    "exit_policy",
+    "pairset",
+    "market_filter",
+    "hysteresis",
+    "sharpe_trade",
+    "trades",
+    "passed",
 )
 
 #: Buckets of the estimated hit rate at entry; manual entries have no floor, hence below 50%.
@@ -401,16 +467,18 @@ class Store:
 
     @_locked
     def prune(self, before: str) -> dict[str, int]:
-        """Delete decisions, signals and equity points older than ``before`` (ISO time).
+        """Delete decisions, signals, equity points and stop windows older than ``before`` (ISO time).
 
         The PnL peak lives in ``bot_state``, so old equity points are not needed to
-        measure the drawdown. Positions and daily PnL are kept.
+        measure the drawdown. Positions, daily PnL and validation trials are kept: the
+        deflated Sharpe counts every trial since the last pass, however old.
         """
         with self._conn:
             decisions = self._conn.execute("DELETE FROM decisions WHERE ts < ?", (before,)).rowcount
             signals = self._conn.execute("DELETE FROM signals WHERE ts < ?", (before,)).rowcount
             equity = self._conn.execute("DELETE FROM equity WHERE ts < ?", (before,)).rowcount
-        return {"decisions": decisions, "signals": signals, "equity": equity}
+            windows = self._conn.execute("DELETE FROM stop_windows WHERE ts < ?", (before,)).rowcount
+        return {"decisions": decisions, "signals": signals, "equity": equity, "stop_windows": windows}
 
     @_locked
     def ignore(self, symbol: str, strategy: str, until: str) -> None:
@@ -444,23 +512,32 @@ class Store:
         entry_win_rate: float | None = None,
         exit_deadline: str | None = None,
         instance_id: int | None = None,
+        timeframe: str | None = None,
+        plan_stop_pct: float | None = None,
+        plan_target_pct: float | None = None,
+        exit_hysteresis: bool | None = None,
     ) -> int | None:
         """Reserve a live slot before the entry order. ``None`` when one already exists.
 
         ``entry_win_rate`` is the hit rate the strategy was estimated at when it
         entered; ``calibration`` compares it with how the trades ended.
+        ``plan_stop_pct`` and ``plan_target_pct`` are the setup's distances from the
+        entry, for the stop and target set on the average fill.
         """
         stamp = _now()
+        hysteresis = None if exit_hysteresis is None else int(bool(exit_hysteresis))
         try:
             with self._conn:
                 cursor = self._conn.execute(
                     """INSERT INTO positions
                     (symbol, strategy, side, qty, avg_price, stop_price, target_price,
-                     opened_at, updated_at, status, exit_policy, test_only, entry_win_rate, exit_deadline, instance_id)
-                    VALUES (?, ?, 'buy', 0, 0, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)""",
+                     opened_at, updated_at, status, exit_policy, test_only, entry_win_rate, exit_deadline, instance_id,
+                     timeframe, plan_stop_pct, plan_target_pct, exit_hysteresis)
+                    VALUES (?, ?, 'buy', 0, 0, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         symbol, strategy, stop_price, target_price, stamp, stamp, exit_policy,
                         1 if test_only else 0, entry_win_rate, exit_deadline, instance_id,
+                        timeframe, plan_stop_pct, plan_target_pct, hysteresis,
                     ),
                 )
         except sqlite3.IntegrityError:
@@ -574,17 +651,74 @@ class Store:
         return int(row["wins"] or 0), int(row["total"] or 0)
 
     @_locked
-    def strategy_daily_returns(self, strategy_id: str, capital: float) -> list[float]:
-        """Realized PnL per UTC close day as a fraction of ``capital``, oldest first."""
+    def closed_trades(
+        self,
+        *,
+        strategy: str | None = None,
+        symbol: str | None = None,
+        exit_policy: str | None = None,
+        since: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Closed strategy trades, newest first: test-mode and DCA/grid rows are left out.
+
+        ``since`` (ISO time) keeps the trades closed at or after it; ``limit`` keeps the newest ones.
+        """
+        clauses = ["status='closed'", "test_only=0", "instance_id IS NULL", "closed_at IS NOT NULL"]
+        values: list[Any] = []
+        for column, value in (("strategy", strategy), ("symbol", symbol), ("exit_policy", exit_policy)):
+            if value is not None:
+                clauses.append(f"{column}=?")
+                values.append(value)
+        if since is not None:
+            clauses.append("closed_at >= ?")
+            values.append(since)
+        query = f"SELECT * FROM positions WHERE {' AND '.join(clauses)} ORDER BY closed_at DESC, id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            values.append(max(0, int(limit)))
+        return [dict(row) for row in self._conn.execute(query, values).fetchall()]
+
+    @_locked
+    def strategy_daily_returns(
+        self,
+        strategy_id: str,
+        capital: float,
+        *,
+        calendar_days: int | None = None,
+        now: datetime | None = None,
+    ) -> list[float]:
+        """Realized PnL per UTC close day as a fraction of ``capital``, oldest first.
+
+        Without ``calendar_days``, one value per day that closed a trade. With it, exactly
+        that many UTC days ending on the day of ``now`` (default: the current time), a day
+        without a close counting 0, so a Sharpe over them is comparable with a backtest's.
+        A capital of 0 or less measures nothing and returns no day in either form.
+        """
+        if calendar_days is not None and calendar_days < 1:
+            raise ValueError("calendar_days must be at least 1")
         if capital <= 0:
             return []
+        filters = "strategy=? AND status='closed' AND closed_at IS NOT NULL AND test_only=0"
+        if calendar_days is None:
+            rows = self._conn.execute(
+                f"""SELECT substr(closed_at, 1, 10) AS day, SUM(realized_pnl) AS pnl
+                FROM positions WHERE {filters} GROUP BY day ORDER BY day""",
+                (strategy_id,),
+            ).fetchall()
+            return [float(row["pnl"]) / capital for row in rows]
+        moment = now or datetime.now(timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        today = moment.astimezone(timezone.utc).date()
+        days = [(today - timedelta(days=offset)).isoformat() for offset in range(calendar_days - 1, -1, -1)]
         rows = self._conn.execute(
-            """SELECT substr(closed_at, 1, 10) AS day, SUM(realized_pnl) AS pnl
-            FROM positions WHERE strategy=? AND status='closed' AND closed_at IS NOT NULL AND test_only=0
-            GROUP BY day ORDER BY day""",
-            (strategy_id,),
+            f"""SELECT substr(closed_at, 1, 10) AS day, SUM(realized_pnl) AS pnl
+            FROM positions WHERE {filters} AND closed_at >= ? AND closed_at < ? GROUP BY day""",
+            (strategy_id, days[0], (today + timedelta(days=1)).isoformat()),
         ).fetchall()
-        return [float(row["pnl"]) / capital for row in rows]
+        pnl = {row["day"]: float(row["pnl"]) for row in rows}
+        return [pnl.get(day, 0.0) / capital for day in days]
 
     # -- daily PnL and equity ----------------------------------------------
 
@@ -724,6 +858,91 @@ class Store:
                 return row
         return None
 
+    @_locked
+    def add_trial(self, row: dict[str, Any]) -> int:
+        """Log one validation run of a strategy on one timeframe; returns its id.
+
+        ``row`` gives every column of ``validation_trials`` but ``id``; ``ts`` defaults to
+        now and ``payload`` (any JSON value) to the row itself. A non-finite
+        ``sharpe_trade`` is stored as 0, a run without a measurable Sharpe.
+        """
+        missing = [name for name in _TRIAL_COLUMNS if name not in row]
+        if missing:
+            raise ValueError(f"missing trial fields: {missing}")
+        sharpe = float(row["sharpe_trade"])
+        with self._conn:
+            cursor = self._conn.execute(
+                """INSERT INTO validation_trials
+                (ts, strategy_id, timeframe, exit_policy, pairset, market_filter, hysteresis,
+                 sharpe_trade, trades, passed, payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    row.get("ts") or _now(),
+                    row["strategy_id"],
+                    row["timeframe"],
+                    row["exit_policy"],
+                    row["pairset"],
+                    row["market_filter"],
+                    1 if row["hysteresis"] else 0,
+                    sharpe if math.isfinite(sharpe) else 0.0,
+                    int(row["trades"]),
+                    1 if row["passed"] else 0,
+                    json.dumps(row["payload"] if "payload" in row else row, default=str),
+                ),
+            )
+        return int(cursor.lastrowid or 0)
+
+    @_locked
+    def trials_since_pass(self, strategy_id: str) -> list[dict[str, Any]]:
+        """The strategy's trials after its most recent passing one, oldest first.
+
+        Every trial when none passed. The passing trial itself is not included.
+        """
+        rows = self._conn.execute(
+            """SELECT * FROM validation_trials
+            WHERE strategy_id=? AND id > COALESCE(
+                (SELECT MAX(id) FROM validation_trials WHERE strategy_id=? AND passed=1), 0)
+            ORDER BY id""",
+            (strategy_id, strategy_id),
+        ).fetchall()
+        return [_trial(row) for row in rows]
+
+    # -- unprotected windows -------------------------------------------------
+
+    @_locked
+    def record_stop_window(
+        self, kind: str, symbol: str, position_id: int | None, ms: float, *, ts: str | None = None
+    ) -> None:
+        """Record how long a position stood without a stop while it was replaced (``kind``:
+        trail, tp1, partial, restop or exit_remainder)."""
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO stop_windows(ts, kind, symbol, position_id, ms) VALUES (?, ?, ?, ?, ?)",
+                (ts or _now(), kind, symbol, position_id, float(ms)),
+            )
+
+    @_locked
+    def stop_window_stats(self, since: str) -> dict[str, Any]:
+        """Count, mean, p95 and max of the windows recorded at or after ``since`` (ISO time),
+        overall and by kind. The statistics are None when there is no window."""
+        rows = self._conn.execute(
+            "SELECT kind, ms FROM stop_windows WHERE ts >= ? ORDER BY id", (since,)
+        ).fetchall()
+        values = [float(row["ms"]) for row in rows]
+        by_kind: dict[str, list[float]] = {}
+        for row in rows:
+            by_kind.setdefault(row["kind"], []).append(float(row["ms"]))
+        return {
+            "count": len(values),
+            "mean_ms": sum(values) / len(values) if values else None,
+            "p95_ms": _percentile(values, 0.95) if values else None,
+            "max_ms": max(values) if values else None,
+            "by_kind": {
+                kind: {"count": len(items), "mean_ms": sum(items) / len(items), "max_ms": max(items)}
+                for kind, items in sorted(by_kind.items())
+            },
+        }
+
     # -- armed entries -----------------------------------------------------
 
     @_locked
@@ -824,6 +1043,23 @@ def _instance(row: sqlite3.Row) -> dict[str, Any]:
     item["params"] = json.loads(item["params"])
     item["state"] = json.loads(item["state"])
     return item
+
+
+def _trial(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    item["hysteresis"] = bool(item["hysteresis"])
+    item["passed"] = bool(item["passed"])
+    item["payload"] = json.loads(item["payload"])
+    return item
+
+
+def _percentile(values: list[float], q: float) -> float:
+    """Linear-interpolation percentile of a non-empty list (numpy's default method)."""
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * q
+    low = int(position)
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
 
 
 def _position_ddl() -> list[str]:

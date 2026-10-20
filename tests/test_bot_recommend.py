@@ -111,3 +111,12 @@ def test_recommendations_route_uses_the_cache(api_client) -> None:
     response = api_client.get("/bot/recommendations")
     assert response.status_code == 200
     assert response.json()["rows"] == cached
+
+
+def test_setup_rows_are_marked_as_forming_bar() -> None:
+    rows = rank_setups([_setup("A/USDT", 0.05), _setup("B/USDT", 0.04, strategy="mean_reversion")])
+    assert rows and all(row["forming_bar"] is True for row in rows)
+    usdt = {"ETHUSDT": "ETH/USDT"}
+    tickers = [{"symbol": "ETHUSDT", "quoteVolume": "80000000", "priceChangePercent": "6"}]
+    movers = _fill_with_movers(rows, tickers, usdt, min_volume=5_000_000)[len(rows):]
+    assert movers and not any("forming_bar" in row for row in movers)

@@ -20,7 +20,7 @@ from bot.strategies.base import Setup
 from bot.strategies.day import DAY, MIN_HOURLY_BARS, hourly_trend
 from bot.strategies.fixed import FixedExit, parse_fixed
 from test_bot_executor import PROFILE, _ready
-from test_bot_runtime import _ready_cycle, _runtime
+from test_bot_runtime import _ready_cycle, _runtime, _validated
 
 POLICY = "fixed:300:150"
 
@@ -56,10 +56,13 @@ def test_the_rule_replaces_stop_and_target_without_inflating_the_signal() -> Non
 def test_the_rule_covers_day_strategies_and_their_validation_needs_the_day_rules() -> None:
     assert exit_policy_for("intraday_momentum", POLICY) == POLICY
     assert exit_policy_for("intraday_momentum", "trailing") == "day"
-    assert validated_for({"exit_policy": POLICY}, "trend", POLICY)
-    assert not validated_for({"exit_policy": "fixed:300:100"}, "trend", POLICY)
-    assert not validated_for({"exit_policy": POLICY}, "intraday_momentum", POLICY)
-    assert validated_for({"exit_policy": POLICY, "day": DAY.params}, "intraday_momentum", POLICY)
+    assert validated_for(_validated("trend", POLICY), "trend", POLICY)
+    assert not validated_for(_validated("trend", "fixed:300:100"), "trend", POLICY)
+    day = _validated("intraday_momentum", POLICY, "15m")
+    assert day["day"] == DAY.params and validated_for(day, "intraday_momentum", POLICY)
+    assert not validated_for({key: value for key, value in day.items() if key != "day"}, "intraday_momentum", POLICY)
+    # The fixed rule replaces the EMA exit, so the hysteresis flag cannot stale a fixed-rule validation.
+    assert validated_for(_validated("trend", POLICY), "trend", POLICY, hysteresis=False)
 
 
 # -- backtest ----------------------------------------------------------------
@@ -90,7 +93,7 @@ def test_the_replay_sells_on_a_close_at_the_target_not_on_a_wick(monkeypatch) ->
     monkeypatch.setattr(runner, "_strategy", lambda _id: _Once())
     trades = runner.simulate("trend", "BTC/USDT", _bars(closes, highs=highs), "1h", exit_policy=POLICY)
     # The wick to 104 is not a sale: the cycle sells at the last price, at 103.5 on the next close.
-    assert len(trades) == 1 and trades[0].net_return == pytest.approx(0.035 - runner.ROUND_TRIP_COST)
+    assert len(trades) == 1 and trades[0].net_return == pytest.approx(0.035 - runner.ROUND_TRIP_COST - 2 * runner.LEG_SLIPPAGE)
     assert trades[0].exit_time == _bars(closes).index[-1]
 
 
@@ -100,13 +103,16 @@ def test_the_replay_stop_wins_when_one_bar_reaches_both(monkeypatch) -> None:
     monkeypatch.setattr(runner, "_strategy", lambda _id: _Once())
     trades = runner.simulate("trend", "BTC/USDT", _bars(closes, lows=lows), "1h", exit_policy=POLICY)
     # The strategy's own 10% stop and 20% target are replaced by 1.5% and 3%.
-    assert len(trades) == 1 and trades[0].net_return == pytest.approx(-0.015 - runner.ROUND_TRIP_COST)
+    assert len(trades) == 1 and trades[0].net_return == pytest.approx(-0.015 - runner.ROUND_TRIP_COST - 2 * runner.LEG_SLIPPAGE)
 
 
 def test_a_day_strategy_under_the_rule_keeps_the_day_gate_and_records_its_rule() -> None:
     stamps = pd.date_range("2026-01-01", periods=40, freq="D", tz="UTC")
-    result = runner.evaluate("intraday_momentum", [runner.Trade(stamp, 0.01) for stamp in stamps], 0.25, exit_policy=POLICY)
-    assert result.exit_policy == POLICY and "30" not in result.reason
+    returns = [0.01, 0.005] * 20
+    trades = [runner.Trade(stamp, value) for stamp, value in zip(stamps, returns)]
+    result = runner.evaluate("intraday_momentum", trades, 40 / 365, exit_policy=POLICY)
+    # The day gate (daily Sharpe, 30 in-sample trades, mean return per trade) judged it, under the rule's name.
+    assert result.exit_policy == POLICY and result.passed and result.gate_trades >= runner.DAY_MIN_TRADES
     record = runner.promotion_record(result)
     assert record["params"]["exit_policy"] == POLICY and record["params"]["day"] == DAY.params
     assert validated_for(record["params"], "intraday_momentum", POLICY)
@@ -141,7 +147,7 @@ def _fixed_cycle(tmp_path, monkeypatch, wins: int):
         tmp_path, monkeypatch, entry_mode="auto", take_profit_pct=0.03, stop_loss_pct=0.015, min_reward_risk=5.0
     )
     runtime.store.save_strategy(
-        {"strategy_id": "trend", "signal_only": False, "params": {"wins": wins, "trades": 40, "exit_policy": POLICY}}
+        {"strategy_id": "trend", "signal_only": False, "params": _validated("trend", POLICY, wins=wins, trades=40)}
     )
     return runtime, executor
 
@@ -163,7 +169,7 @@ def test_a_fixed_row_enters_above_the_breakeven_of_its_payoff(tmp_path, monkeypa
 def test_a_validation_under_other_percentages_is_signal_only(tmp_path, monkeypatch) -> None:
     runtime, executor = _fixed_cycle(tmp_path, monkeypatch, wins=30)
     runtime.store.save_strategy(
-        {"strategy_id": "trend", "signal_only": False, "params": {"wins": 30, "trades": 40, "exit_policy": "fixed:500:150"}}
+        {"strategy_id": "trend", "signal_only": False, "params": _validated("trend", "fixed:500:150", wins=30, trades=40)}
     )
     runtime.tick()
     row = runtime.store.opportunities()[0]
