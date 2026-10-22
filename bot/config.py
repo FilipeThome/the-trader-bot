@@ -32,7 +32,7 @@ MAX_MACRO_EVENTS = 100
 DEFAULT_SYMBOLS = ("BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT")
 #: Each symbol costs about seven REST reads per cycle.
 MAX_SYMBOLS = 20
-_SYMBOL = re.compile(r"^[A-Z0-9]{2,20}/USDT$")
+_SYMBOL = re.compile(r"^[A-Z0-9]{1,20}/USDT$")
 #: Every strategy id the engine knows, off until the operator turns it on.
 DEFAULT_STRATEGIES = {
     "trend": False,

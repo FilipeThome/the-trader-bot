@@ -138,3 +138,12 @@ def test_a_legacy_bot_json_with_a_wide_drawdown_limit_still_loads(tmp_path, draw
     assert config.limits.max_drawdown_pct == drawdown
     assert config.limits.halt_drawdown_pct == pytest.approx(halt)
     assert config.limits.dd_reduce_pct == pytest.approx(drawdown / 2)
+
+
+def test_a_one_letter_base_asset_is_a_valid_pair() -> None:
+    # Binance lists U/USDT; "usar os mais líquidos" answered 500 while the regex wanted two letters.
+    assert BotConfig(symbols=["btc/usdt", "U/USDT"]).symbols == ["BTC/USDT", "U/USDT"]
+    with pytest.raises(ValidationError, match="BASE/USDT"):
+        BotConfig(symbols=["/USDT"])
+    with pytest.raises(ValidationError, match="BASE/USDT"):
+        BotConfig(symbols=["BTC/BUSD"])
