@@ -1,7 +1,8 @@
 """Top liquid Binance pairs for the panel.
 
 Rows of kind ``setup`` carry the same score the bot uses to judge a trade.
-When fewer than five setups qualify, rows of kind ``movimento`` list liquid
+They are read on the candle that is still open (``forming_bar``), so they
+are a preview: the bot itself decides on closed candles only. When fewer than five setups qualify, rows of kind ``movimento`` list liquid
 USDT pairs that rose today. Those rows have no score and no strategy: they
 are a watch list, never an order signal, and they always come after the
 scored rows.
@@ -67,6 +68,7 @@ def rank_setups(setups: list[Setup]) -> list[dict[str, Any]]:
                 "net_return": round(item.net_return, 6),
                 "status": item.status,
                 "reason": item.reason,
+                "forming_bar": True,
             }
         )
     ranked.sort(key=lambda row: (float(row["score"]), float(row["net_return"])), reverse=True)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from typing import Any
 
 import pytest
 
@@ -176,25 +177,27 @@ def test_calibration_compares_the_estimate_at_entry_with_the_outcome(tmp_path) -
 _ROW = {"strategy": "trend", "decision": "pronta"}
 
 
-def test_prune_drops_old_history_but_keeps_the_equity_peak(tmp_path) -> None:
+def test_prune_drops_old_history_but_keeps_the_pnl_peak(tmp_path) -> None:
     store = Store(tmp_path / "bot.sqlite")
-    store.record_equity(1500.0, "2026-08-01T00:00:00+00:00")
-    store.record_equity(1000.0, "2026-10-15T00:00:00+00:00")
+    store.record_equity(1500.0, "2026-08-01T00:00:00+00:00", pnl=500.0)
+    store.record_equity(1000.0, "2026-10-15T00:00:00+00:00", pnl=0.0)
     store.add_decision({"ts": "2026-08-01T00:00:00+00:00", "symbol": "BTC/USDT", **_ROW, "reason": "old"})
     store.add_decision({"ts": "2026-10-15T00:00:00+00:00", "symbol": "BTC/USDT", **_ROW, "reason": "new"})
-    assert store.prune("2026-09-15T00:00:00+00:00") == {"decisions": 1, "signals": 0, "equity": 1}
+    assert store.prune("2026-09-15T00:00:00+00:00") == {"decisions": 1, "signals": 0, "equity": 1, "stop_windows": 0}
     assert [row["reason"] for row in store.decisions()] == ["new"]
     # The drawdown still measures from the old peak.
-    assert store.peak_equity() == 1500.0
+    assert store.peak_pnl() == 500.0
 
 
-def test_the_peak_of_an_upgraded_store_is_seeded_from_its_equity_table(tmp_path) -> None:
+def test_the_pnl_peak_of_an_upgraded_store_is_seeded_from_the_daily_pnl(tmp_path) -> None:
     path = tmp_path / "bot.sqlite"
     store = Store(path)
-    store._conn.execute("INSERT INTO equity(ts, equity) VALUES('2026-10-01T00:00:00+00:00', 1234.0)")
-    store._conn.commit()
+    # The absolute equity peak of older versions includes a capital that may have changed since.
+    store.set_state("equity_peak", 1000.0)
+    for day, pnl in (("2026-10-01", 30.0), ("2026-10-02", 20.0), ("2026-10-03", -40.0)):
+        store.record_day(day, net_pnl=pnl)
     store.close()
-    assert Store(path).peak_equity() == 1234.0
+    assert Store(path).peak_pnl() == 50.0
 
 
 def test_a_day_report_reads_every_decision_of_that_day(tmp_path) -> None:
@@ -223,3 +226,147 @@ def test_a_table_from_before_day_trades_gains_their_columns(tmp_path) -> None:
     assert row["tp1_done"] == 0 and row["keep_qty"] is None and row["exit_deadline"] is None
     migrated.update_position(row["id"], tp1_done=1, keep_qty=0.5, exit_deadline="2026-10-16T18:00:00+00:00")
     assert migrated.position(row["id"])["keep_qty"] == 0.5
+
+
+_PLAN_COLUMNS = (
+    "timeframe", "plan_stop_pct", "plan_target_pct", "exit_hysteresis", "entry_ref_price", "initial_stop",
+    "initial_risk_usd", "mae_price", "mfe_price", "entry_slippage", "exit_slippage", "r_multiple",
+)
+
+
+def test_an_older_table_gains_the_plan_and_execution_columns_and_keeps_its_rows(tmp_path) -> None:
+    path = tmp_path / "bot.sqlite"
+    Store(path).close()
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        "".join(f"ALTER TABLE positions DROP COLUMN {name};" for name in _PLAN_COLUMNS)
+        + "INSERT INTO positions (symbol, strategy, side, qty, avg_price, stop_price, opened_at, updated_at, status,"
+        " exit_policy, realized_pnl) VALUES ('BTC/USDT', 'trend', 'buy', 1, 100, 98, 't', 't', 'open', 'trailing', 0);"
+    )
+    connection.commit()
+    connection.close()
+    migrated = Store(path)
+    row = migrated.open_positions()[0]
+    assert all(row[name] is None for name in _PLAN_COLUMNS)
+    assert (row["qty"], row["avg_price"], row["stop_price"], row["exit_policy"]) == (1, 100, 98, "trailing")
+    migrated.update_position(row["id"], mae_price=97.5, mfe_price=104.0, entry_slippage=0.001, r_multiple=1.5)
+    updated = migrated.position(row["id"])
+    assert updated is not None and (updated["mae_price"], updated["r_multiple"]) == (97.5, 1.5)
+    migrated.close()
+    Store(path).close()
+
+
+def test_open_pending_records_the_entry_plan(tmp_path) -> None:
+    store = Store(tmp_path / "bot.sqlite")
+    planned = store.open_pending(
+        "BTC/USDT", "trend", timeframe="4h", plan_stop_pct=0.02, plan_target_pct=0.05, exit_hysteresis=True
+    )
+    legacy = store.open_pending("ETH/USDT", "trend")
+    off = store.open_pending("SOL/USDT", "trend", exit_hysteresis=False)
+    assert planned and legacy and off
+    row, old, without = store.position(planned), store.position(legacy), store.position(off)
+    assert row is not None and old is not None and without is not None
+    assert (row["timeframe"], row["plan_stop_pct"], row["plan_target_pct"], row["exit_hysteresis"]) == ("4h", 0.02, 0.05, 1)
+    assert (old["timeframe"], old["plan_stop_pct"], old["plan_target_pct"], old["exit_hysteresis"]) == (None,) * 4
+    assert without["exit_hysteresis"] == 0
+
+
+def _trial_row(passed: bool, sharpe: float, **overrides: object) -> dict[str, object]:
+    return {
+        "strategy_id": "trend", "timeframe": "1h", "exit_policy": "trailing", "pairset": "a1b2c3d4e5f6",
+        "market_filter": "off", "hysteresis": True, "sharpe_trade": sharpe, "trades": 40, "passed": passed,
+        **overrides,
+    }
+
+
+def test_trials_since_pass_lists_the_runs_after_the_last_pass(tmp_path) -> None:
+    store = Store(tmp_path / "bot.sqlite")
+    store.add_trial(_trial_row(False, 0.1))
+    assert [row["sharpe_trade"] for row in store.trials_since_pass("trend")] == [0.1]
+    store.add_trial(_trial_row(True, 0.3))
+    assert store.trials_since_pass("trend") == []
+    store.add_trial(_trial_row(False, 0.2, timeframe="4h", payload={"dsr": 0.4}))
+    store.add_trial(_trial_row(False, float("nan"), hysteresis=False))
+    store.add_trial(_trial_row(True, 0.9, strategy_id="momentum"))
+    rows = store.trials_since_pass("trend")
+    assert [row["timeframe"] for row in rows] == ["4h", "1h"]
+    # A Sharpe that could not be measured is stored as 0.
+    assert [row["sharpe_trade"] for row in rows] == [0.2, 0.0]
+    assert [row["hysteresis"] for row in rows] == [True, False] and not any(row["passed"] for row in rows)
+    assert rows[0]["payload"] == {"dsr": 0.4} and rows[1]["payload"]["pairset"] == "a1b2c3d4e5f6"
+    assert store.trials_since_pass("momentum") == []
+    with pytest.raises(ValueError):
+        store.add_trial({"strategy_id": "trend"})
+
+
+def test_trials_survive_prune(tmp_path) -> None:
+    store = Store(tmp_path / "bot.sqlite")
+    store.add_trial(_trial_row(False, 0.1, ts="2020-01-01T00:00:00+00:00"))
+    store.prune("2026-01-01T00:00:00+00:00")
+    assert len(store.trials_since_pass("trend")) == 1
+
+
+def test_stop_window_stats_mean_p95_max_by_kind(tmp_path) -> None:
+    store = Store(tmp_path / "bot.sqlite")
+    empty = store.stop_window_stats("2000-01-01T00:00:00+00:00")
+    assert empty == {"count": 0, "mean_ms": None, "p95_ms": None, "max_ms": None, "by_kind": {}}
+    for ms in (100.0, 200.0, 300.0, 400.0):
+        store.record_stop_window("trail", "BTC/USDT", 1, ms)
+    store.record_stop_window("tp1", "ETH/USDT", 2, 1000.0)
+    store.record_stop_window("restop", "ETH/USDT", None, 50.0, ts="2026-01-01T00:00:00+00:00")
+    stats = store.stop_window_stats("2026-06-01T00:00:00+00:00")
+    assert stats["count"] == 5 and stats["max_ms"] == 1000.0
+    assert stats["mean_ms"] == pytest.approx(400.0)
+    # Linear interpolation over [100, 200, 300, 400, 1000] at position 3.8.
+    assert stats["p95_ms"] == pytest.approx(880.0)
+    assert stats["by_kind"] == {
+        "tp1": {"count": 1, "mean_ms": 1000.0, "max_ms": 1000.0},
+        "trail": {"count": 4, "mean_ms": 250.0, "max_ms": 400.0},
+    }
+    assert store.stop_window_stats("2000-01-01T00:00:00+00:00")["by_kind"]["restop"]["count"] == 1
+    assert store.prune("2026-06-01T00:00:00+00:00")["stop_windows"] == 1
+    assert store.stop_window_stats("2000-01-01T00:00:00+00:00")["count"] == 5
+
+
+def _closed(store: Store, symbol: str, pnl: float, *, strategy: str = "trend", **kwargs: Any) -> int:
+    position_id = store.open_pending(symbol, strategy, **kwargs)
+    assert position_id is not None
+    store.update_position(position_id, status="open", qty=1.0, avg_price=100.0)
+    store.close_position(position_id, exit_price=100.0 + pnl, realized_pnl=pnl, fees=0.0)
+    return position_id
+
+
+def test_closed_trades_filter_and_leave_out_test_and_instance_rows(tmp_path) -> None:
+    store = Store(tmp_path / "bot.sqlite")
+    first = _closed(store, "BTC/USDT", 1.0, exit_policy="trailing")
+    second = _closed(store, "ETH/USDT", -1.0, exit_policy="target")
+    third = _closed(store, "BTC/USDT", 2.0, exit_policy="trailing")
+    _closed(store, "SOL/USDT", 5.0, strategy="momentum", exit_policy="trailing")
+    _closed(store, "BTC/USDT", 9.0, exit_policy="trailing", test_only=True)
+    _closed(store, "XRP/USDT", 9.0, strategy="dca", instance_id=1)
+    store.open_pending("BNB/USDT", "trend")
+    assert [row["id"] for row in store.closed_trades(strategy="trend")] == [third, second, first]
+    assert [row["id"] for row in store.closed_trades(strategy="trend", symbol="BTC/USDT")] == [third, first]
+    assert [row["id"] for row in store.closed_trades(exit_policy="target")] == [second]
+    assert [row["id"] for row in store.closed_trades(strategy="trend", limit=2)] == [third, second]
+    assert len(store.closed_trades()) == 4
+    assert store.closed_trades(since="2999-01-01T00:00:00+00:00") == []
+    assert len(store.closed_trades(since="2000-01-01T00:00:00+00:00")) == 4
+
+
+def test_daily_returns_are_one_value_per_utc_close_day(tmp_path) -> None:
+    store = Store(tmp_path / "bot.sqlite")
+    closes = (
+        (50.0, "2026-10-10T12:00:00+00:00"),
+        (10.0, "2026-10-18T09:00:00+00:00"),
+        (6.0, "2026-10-20T01:00:00+00:00"),
+        (-4.0, "2026-10-20T23:59:00+00:00"),
+        (70.0, "2026-10-21T00:30:00+00:00"),
+    )
+    for pnl, closed_at in closes:
+        position_id = _closed(store, "BTC/USDT", pnl)
+        store._conn.execute("UPDATE positions SET closed_at=? WHERE id=?", (closed_at, position_id))
+    store._conn.commit()
+    # Only the days that closed a trade, summed per UTC day, oldest first.
+    assert store.strategy_daily_returns("trend", 1000.0) == pytest.approx([0.05, 0.01, 0.002, 0.07])
+    assert store.strategy_daily_returns("momentum", 1000.0) == []

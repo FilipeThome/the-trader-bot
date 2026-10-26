@@ -124,13 +124,14 @@ def test_validation_runs_in_the_background_and_records_the_verdict(api_client, m
     assert response.status_code == 202 and response.json()["status"] == "running"
     _join_validations()
     job = api_client.get("/bot/status").json()["validations"]["trend"]
-    assert job["status"] == "done" and job["done"] == job["total"] == 5
-    assert job["result"]["passed"] is False
+    # Five pairs on each of trend's two timeframes.
+    assert job["status"] == "done" and job["done"] == job["total"] == 10
+    assert job["result"]["passed"] is False and set(job["result"]["timeframes"]) == {"1h", "4h"}
     assert ctx.runtime is not None
     stats = ctx.runtime.store.strategy("trend")
-    assert stats is not None and stats["signal_only"] is True and stats["params"]["days"] == 180
+    assert stats is not None and stats["signal_only"] is True and stats["params"]["days"] == {"1h": 240, "4h": 480}
     started = pd.Timestamp(loader.starts[0])
-    assert 179 <= (pd.Timestamp.now(tz="UTC") - started).days <= 180
+    assert 239 <= (pd.Timestamp.now(tz="UTC") - started).days <= 240
     assert api_client.post("/bot/strategies/funding_carry/validate").status_code == 422
 
 
@@ -215,7 +216,7 @@ def test_switching_to_auto_entries_stops_the_cycle(api_client) -> None:
 
 
 def _catalog() -> list[dict[str, str]]:
-    return [{"symbol": f"{base}/USDT", "base": base, "quote": "USDT"} for base in ("BTC", "ETH", "SOL", "USDC", "BTCUP", "JUP")]
+    return [{"symbol": f"{base}/USDT", "base": base, "quote": "USDT"} for base in ("BTC", "ETH", "SOL", "USDC", "RLUSD", "BTCUP", "JUP")]
 
 
 def test_top_pairs_skip_stablecoins_and_leveraged_tokens_and_keep_live_positions(api_client) -> None:
@@ -227,6 +228,7 @@ def test_top_pairs_skip_stablecoins_and_leveraged_tokens_and_keep_live_positions
     collector.testnet_cache = (pd.Timestamp.now(tz="UTC").to_pydatetime(), listed)
     tickers = [
         {"symbol": "USDCUSDT", "quoteVolume": "9e9"},
+        {"symbol": "RLUSDUSDT", "quoteVolume": "8.5e9"},
         {"symbol": "BTCUPUSDT", "quoteVolume": "8e9"},
         {"symbol": "ETHUSDT", "quoteVolume": "5e9"},
         {"symbol": "JUPUSDT", "quoteVolume": "4e9"},

@@ -172,6 +172,9 @@ Uma seção "Day trade" com a evidência acima, sem prometer lucro: o que cada r
 
 - Stop móvel depois do TP1. Será testado no backtest antes de entrar.
 - Ordens maker na entrada.
+
+  Revisão de estratégias (`docs/revisao-estrategias-e-bots.md`, seção 11): a entrada das estratégias passou a ser LIMIT IOC 0,2% acima do ask, que limita o slippage mas paga taker. Compras paradas no livro (LIMIT GTC) existem só para os robôs DCA e grid, por opção (D18); o day trade continua fora.
+- OCO no TP1 (D17). Não foi construída. Uma OCO é uma lista de ordens que o journal, a chave de idempotência, a avaliação do gate e a reconciliação não modelam; a perna limitada dela executaria num pavio, enquanto o TP1 validado vende no fechamento de 15 min; e o stop teria de virar duas ordens. O ganho seria uma janela de poucos segundos sem stop em metade da posição. O robô mede essa janela; a OCO volta a ser estudada se o p95 da janela do TP1 passar de 2 s em 30 dias, ou se um stop atravessado (`stop_gapped`) acontecer durante um TP1.
 - Velas de 1 e 5 min.
 - Vender a descoberto.
 

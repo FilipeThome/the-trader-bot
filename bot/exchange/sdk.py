@@ -712,24 +712,41 @@ def get_open_orders(
 
 
 def get_quote(symbol: str, *, config: BinanceConfig | None = None, **_: Any) -> dict[str, Any]:
-    """Fetch a latest ticker snapshot for ``symbol`` (ccxt unified format)."""
+    """Fetch a latest ticker snapshot for ``symbol`` (ccxt unified format).
+
+    The quote time is the exchange's ticker timestamp, and the order gate refuses
+    a quote older than ``QUOTE_MAX_AGE``. The Spot Testnet serves its 24h ticker
+    from a cache that a thin pair refreshes only every 30 s to minutes, so there
+    the bid and ask come from the live book (``fetch_order_book``) and the time is
+    when that book was received: the book carries no time of its own. Production
+    keeps the exchange timestamp.
+    """
     cfg = config or load_config()
     _reject_unsupported_usdm_surface(cfg)
     _assert_host(cfg)
     ex = _public_exchange(cfg)
     clean = normalize_symbol(symbol)
     ticker = ex.fetch_ticker(clean)
+    bid, ask, time = _obj_get(ticker, "bid"), _obj_get(ticker, "ask"), str(_obj_get(ticker, "timestamp", ""))
+    if cfg.is_testnet:
+        book = ex.fetch_order_book(clean, limit=5)
+        received = int(datetime.now(timezone.utc).timestamp() * 1000)
+        bids, asks = book.get("bids") or [], book.get("asks") or []
+        # An empty side has no price: the gate then refuses the quote as unavailable.
+        bid = bids[0][0] if bids else None
+        ask = asks[0][0] if asks else None
+        time = str(received)
     return {
         "status": "ok",
         "symbol": clean,
         "quote": {
-            "bid": _obj_get(ticker, "bid"),
-            "ask": _obj_get(ticker, "ask"),
+            "bid": bid,
+            "ask": ask,
             "last": _obj_get(ticker, "last"),
             "high": _obj_get(ticker, "high"),
             "low": _obj_get(ticker, "low"),
             "volume": _obj_get(ticker, "baseVolume"),
-            "time": str(_obj_get(ticker, "timestamp", "")),
+            "time": time,
         },
     }
 
@@ -915,6 +932,70 @@ def get_order(
     if raw is None:
         return {**base, "status": "error", "error": "read_failed (empty payload)"}
     return {**base, "status": "ok", "order": _order_to_dict(raw)}
+
+
+def _commission_rate(payload: Mapping[str, Any], side: str) -> Decimal | None:
+    """Standard plus tax rate for ``side`` ("maker" or "taker"); ``None`` when unreadable.
+
+    The BNB discount is not applied: the bot never assumes it pays fees in BNB.
+    """
+    total = Decimal(0)
+    for block in ("standardCommission", "taxCommission"):
+        rates = payload.get(block)
+        if rates is None and block == "taxCommission":
+            continue
+        if not isinstance(rates, Mapping):
+            return None
+        value = rates.get(side)
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            rate = Decimal(str(value).strip())
+        except InvalidOperation:
+            return None
+        if not rate.is_finite() or rate < 0 or rate >= 1:
+            return None
+        total += rate
+    return total
+
+
+def get_account_commission(symbol: str, *, config: BinanceConfig | None = None) -> dict[str, Any]:
+    """Read the account's commission rates for one spot symbol. Signed read-only call.
+
+    ``GET /api/v3/account/commission``. ``maker`` and ``taker`` are decimal
+    strings: the standard rate plus the tax rate, without the BNB discount.
+    Every failure (no keys, an auth or network error, an endpoint the Spot
+    Testnet does not serve, an unreadable payload) comes back as
+    ``status="error"``; it is never raised and never carries credentials.
+    """
+    try:
+        cfg = config or load_config()
+        _reject_unsupported_usdm_surface(cfg)
+        _assert_host(cfg)
+    except BinanceConfigError as exc:
+        return {"status": "error", "error": "config_invalid", "detail": str(exc)}
+    clean = normalize_symbol(symbol)
+    if "/" not in clean:
+        return {"status": "error", "error": f"could not resolve a valid trading pair from symbol '{symbol}'"}
+    base = {"symbol": clean, "profile": cfg.profile, "is_testnet": cfg.is_testnet, "venue": "binance"}
+    if not cfg.api_key or not cfg.api_secret:
+        return {**base, "status": "error", "error": "credentials_missing"}
+    try:
+        ex = _exchange(cfg)
+    except (BinanceConfigError, BinanceDependencyError) as exc:
+        return {**base, "status": "error", "error": str(exc)}
+    market_id = clean.replace("/", "")
+    try:
+        payload = _read_with_clock_retry(ex, lambda: ex.privateGetAccountCommission({"symbol": market_id}))
+    except Exception as exc:  # noqa: BLE001 - the caller keeps the market's taker fee
+        return {**base, "status": "error", "error": f"read_failed ({type(exc).__name__})"}
+    if not isinstance(payload, Mapping):
+        return {**base, "status": "error", "error": "read_failed (empty payload)"}
+    maker = _commission_rate(payload, "maker")
+    taker = _commission_rate(payload, "taker")
+    if maker is None or taker is None:
+        return {**base, "status": "error", "error": "read_failed (unreadable commission)"}
+    return {**base, "status": "ok", "maker": str(maker), "taker": str(taker)}
 
 
 def paper_order_notional_limit(quote_asset: str) -> Decimal | None:

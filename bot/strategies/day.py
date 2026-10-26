@@ -16,7 +16,7 @@ from typing import Any
 
 import pandas as pd
 
-from bot.indicators import ema
+from bot.indicators import ema, session_vwap
 
 #: The entry bar of every day strategy.
 ENTRY_TIMEFRAME = "15m"
@@ -52,23 +52,56 @@ class DayRules:
 
 DAY = DayRules()
 
+#: Automatic day entries need an estimated hit rate this far above the break-even of the
+#: first-target leg (``bot.risk.breakeven_win_rate``). A live entry rule, not replayed by
+#: the backtest, so it stays out of ``DAY.params`` and out of the validation key. The
+#: break-even of the TP1 leg is not the one of the blended payoff (half at TP1, half near
+#: break-even or the deadline): this floor is a guard against live drift, not proof of an
+#: edge; the backtest gate judges the expectancy.
+DAY_WIN_RATE_MARGIN = 0.03
+
 
 def in_quiet_hours(decision_time: datetime | pd.Timestamp, rules: DayRules = DAY) -> bool:
     """True when ``decision_time`` (the close of the entry bar) falls in the quiet hours."""
     return rules.quiet_start_hour <= decision_time.hour < rules.quiet_end_hour
 
 
-def hourly_trend(hourly: pd.DataFrame | None) -> float | None:
+def hourly_trend(hourly: pd.DataFrame | None, entry: pd.DataFrame | None = None) -> float | None:
     """How far EMA 20 sits above EMA 50 on the closed 1h bars, or None when the 1h does not trend up.
 
     Up means EMA 20 above EMA 50 and the last close above EMA 50.
+
+    A young pair (listed less than ``MIN_HOURLY_BARS`` hours ago) has too few 1h bars
+    for EMA 50; with its 15m ``entry`` bars the filter then reads the day itself
+    (``session_trend``). An established pair always has the 1h bars, live (the
+    collector reads 300) and in the replay (the 1h history starts days earlier).
     """
-    if hourly is None or len(hourly) < MIN_HOURLY_BARS:
+    if hourly is None:
         return None
+    if len(hourly) < MIN_HOURLY_BARS:
+        return session_trend(entry) if entry is not None and not hourly.empty else None
     close = hourly["close"]
     fast = float(ema(close, 20).iloc[-1])
     slow = float(ema(close, 50).iloc[-1])
     if slow <= 0 or fast <= slow or float(close.iloc[-1]) <= slow:
+        return None
+    return fast / slow - 1
+
+
+def session_trend(entry: pd.DataFrame) -> float | None:
+    """The day's trend on the closed 15m bars of a young pair, or None when it is not up.
+
+    Up means 15m EMA 20 above EMA 50 and the last close above the day's VWAP.
+    """
+    if len(entry) < 50:
+        return None
+    close = entry["close"]
+    fast = float(ema(close, 20).iloc[-1])
+    slow = float(ema(close, 50).iloc[-1])
+    vwap = session_vwap(entry)
+    if slow <= 0 or fast <= slow or vwap is None or pd.isna(vwap.iloc[-1]):
+        return None
+    if float(close.iloc[-1]) <= float(vwap.iloc[-1]):
         return None
     return fast / slow - 1
 

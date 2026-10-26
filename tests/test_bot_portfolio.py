@@ -169,6 +169,48 @@ def test_a_row_below_the_minimum_expected_profit_is_refused() -> None:
     assert rows[1].status == "bloqueada" and "lucro esperado" in rows[1].reason
 
 
+def test_a_shrink_to_the_cash_reports_the_cash_as_the_binding_limit() -> None:
+    rows = [_opportunity("BTC/USDT", 2.0), _opportunity("ETH/USDT", 1.0)]
+    rows[1].size_limit, rows[1].size_caps = "safety", {"safety": 100.0}
+    _allocate(rows, cash=170.0, limits=RiskLimits(max_entries_per_cycle=5))
+    assert rows[0].size_limit is None and rows[0].size_usd == 100.0
+    assert rows[1].size_limit == "cash"
+    assert rows[1].size_caps == {"safety": 100.0, "cash": rows[1].size_usd}
+
+
+def test_a_size_below_the_pair_minimum_is_refused_and_an_unknown_minimum_is_not() -> None:
+    small = [_opportunity("BTC/USDT", 1.0, size=8.0)]
+    assert _allocate(small, cash=10_000, floor=10.0) == []
+    assert small[0].status == "bloqueada" and "abaixo do mínimo de US$ 10.00" in small[0].reason
+    unknown = [_opportunity("BTC/USDT", 1.0, size=8.0)]
+    assert len(_allocate(unknown, cash=10_000, floor=None)) == 1
+    calls: list[str] = []
+
+    def floor(symbol: str) -> float:
+        calls.append(symbol)
+        return 5.0
+
+    rows = [_opportunity("BTC/USDT", 2.0), _opportunity("ETH/USDT", 1.0)]
+    allocate(rows, cash=10_000, live=[], capital=1000.0, limits=RiskLimits(), min_notional=floor)
+    assert sorted(calls) == ["BTC/USDT", "ETH/USDT"]
+
+
+def test_the_cautious_level_opens_one_entry_per_cycle_and_reducing_none() -> None:
+    rows = [_opportunity("BTC/USDT", 2.0), _opportunity("ETH/USDT", 1.0)]
+    accepted = allocate(rows, cash=10_000, live=[], capital=1000.0, limits=RiskLimits(),
+                        min_notional=lambda _symbol: 5.0, max_entries=1)
+    assert [row.symbol for row in accepted] == ["BTC/USDT"]
+    assert rows[1].reason == "limite de 1 entrada por ciclo no modo cauteloso; volta no próximo"
+    none = [_opportunity("BTC/USDT", 1.0)]
+    assert allocate(none, cash=10_000, live=[], capital=1000.0, limits=RiskLimits(),
+                    min_notional=lambda _symbol: 5.0, max_entries=0) == []
+    assert "nenhuma entrada" in none[0].reason
+    # A max_entries above the configured cap does not raise it.
+    many = [_opportunity(symbol, score) for symbol, score in (("BTC/USDT", 3.0), ("ETH/USDT", 2.0), ("SOL/USDT", 1.0))]
+    assert len(allocate(many, cash=10_000, live=[], capital=1000.0, limits=RiskLimits(),
+                        min_notional=lambda _symbol: 5.0, max_entries=9)) == 2
+
+
 def test_an_unreadable_balance_blocks_every_entry() -> None:
     rows = [_opportunity("BTC/USDT", 1.0)]
     assert _allocate(rows, cash=None) == []
@@ -218,27 +260,25 @@ def test_merge_keeps_live_pairs_first_and_the_symbol_cap() -> None:
 
 def test_testnet_picks_only_pairs_the_spot_testnet_lists() -> None:
     steady = [100 * 1.01**i * (1 + 0.002 * math.sin(i)) for i in range(31)]
-    series = {"SOL/USDT": steady, "DOGE/USDT": steady}
-    inner = _ranking_fetch(series, {"SOL/USDT": 2e9, "DOGE/USDT": 1e9})
+    series = {"SOL/USDT": steady, "DOGE/USDT": steady, "ADA/USDT": steady}
+    inner = _ranking_fetch(series, {"SOL/USDT": 2e9, "DOGE/USDT": 1e9, "ADA/USDT": 5e8})
     testnet_reads: list[str] = []
 
     def fetch(url: str):
         if url.startswith(TESTNET_SPOT):
             testnet_reads.append(url)
-            if url.endswith("/ticker/24hr"):
-                return [{"symbol": "DOGEUSDT", "count": 25000}, {"symbol": "SOLUSDT", "count": 900}], {}
             listed = [{"status": "TRADING", "baseAsset": base, "quoteAsset": "USDT"} for base in ("DOGE", "SOL")]
             return {"symbols": listed}, {}
         return inner(url)
 
     collector = Collector(fetch)
     assert venue_symbols(collector, "production") is None and testnet_reads == []
-    # SOL is listed on the testnet but trades too rarely there for fresh quotes.
+    # Every listed pair counts, however thin its testnet book; ADA is not listed there.
     listed = venue_symbols(collector, "testnet")
-    assert listed == frozenset({"DOGE/USDT"})
-    assert venue_symbols(collector, "testnet") == listed and len(testnet_reads) == 2
-    assert rank_promising(collector, 5, listed=listed) == ["DOGE/USDT"]
-    assert rank_promising(collector, 5) == ["SOL/USDT", "DOGE/USDT"]
+    assert listed == frozenset({"DOGE/USDT", "SOL/USDT"})
+    assert venue_symbols(collector, "testnet") == listed and len(testnet_reads) == 1
+    assert rank_promising(collector, 5, listed=listed) == ["SOL/USDT", "DOGE/USDT"]
+    assert set(rank_promising(collector, 5)) == {"SOL/USDT", "DOGE/USDT", "ADA/USDT"}
 
 
 
@@ -276,8 +316,9 @@ def test_kelly_lowers_the_risk_share_when_the_edge_is_thin() -> None:
 def test_a_row_with_no_estimated_edge_is_refused_but_a_test_row_is_not() -> None:
     limits = RiskLimits(kelly_fraction=0.25)
     manager = RiskManager(limits, 1000.0)
-    common = dict(open_positions=[], exposure_usd=0.0, day_pnl=0.0, peak_equity=1000.0, equity=1000.0,
-                  trades_today=0, returns_by_symbol={}, stale=False, signal_only=False)
+    state = manager.portfolio_state(day_change=0.0, peak_equity=1000.0, equity=1000.0)
+    common = dict(open_positions=[], exposure_usd=0.0,
+                  trades_today=0, returns_by_symbol={}, stale=False, signal_only=False, state=state)
     refused = manager.assess(_rated(0.30), **common)
     assert refused.allowed is False and "sem vantagem estimada" in refused.reason
     assert manager.assess(_rated(0.30, test_only=True), **common).allowed is True

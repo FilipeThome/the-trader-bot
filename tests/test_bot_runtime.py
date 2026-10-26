@@ -14,10 +14,29 @@ from bot.exchange import service
 from bot.executor import UnprotectedPosition
 from bot.live.halt import halt_flag_set
 from bot.paths import get_runtime_root, pin_mode_root
-from bot.strategies import STRATEGIES
+from bot.strategies import STRATEGIES, validation_params
 from bot.runtime import Runtime, mode_root
 from bot.store import Store
 from bot.strategies.base import Setup
+
+
+def _validated(
+    strategy_id: str, policy: str, timeframe: str = "1h", *, symbols: list[str] | None = None, **outcomes: Any
+) -> dict[str, Any]:
+    """A current (gate v2) validation that passed on ``timeframe`` over ``symbols``, with the default
+    market filter and hysteresis. ``outcomes`` (wins, trades, ...) go to the pooled record and to
+    the timeframe's result, which the hit rate reads."""
+    return {
+        **validation_params(
+            strategy_id,
+            policy,
+            timeframes={timeframe: {"passed": True, "mc_p95_dd_r": 0.0, **outcomes}},
+            symbols=symbols or ["BTC/USDT"],
+            market_filter="off",
+            hysteresis=True,
+        ),
+        **outcomes,
+    }
 
 
 def _snapshot(symbols: list[str]) -> MarketSnapshot:
@@ -39,6 +58,9 @@ class FakeCollector:
     def refresh(self, symbols: list[str]) -> MarketSnapshot:
         return self.snapshot
 
+    def view(self) -> MarketSnapshot:
+        return self.snapshot
+
 
 class FakeExecutor:
     def __init__(self) -> None:
@@ -51,6 +73,9 @@ class FakeExecutor:
         self.events.append("sync")
         if self.raise_on_sync is not None:
             raise self.raise_on_sync
+
+    def mark(self, position_id: int, last: Any) -> None:
+        self.events.append(f"mark:{position_id}")
 
     def act(
         self, opportunities: list[Any], *, clock_blocked: bool, manual: bool = False, allow_test: bool = False
@@ -72,6 +97,9 @@ class FakeExecutor:
         self.events.append(f"exit:{position_id}")
         return {"status": "ok"}
 
+    def cancel_resting_buys(self) -> list[dict[str, Any]]:
+        return []
+
 
 def _runtime(
     tmp_path, monkeypatch, symbols: list[str] | None = None, **overrides: Any
@@ -85,6 +113,7 @@ def _runtime(
     collector = FakeCollector(_snapshot(config.symbols))
     monkeypatch.setattr(service, "free_balance", lambda asset, profile_id: Decimal("100000"))
     monkeypatch.setattr(service, "market_rules", lambda symbol, profile_id: None)
+    monkeypatch.setattr(service, "trading_fees", lambda symbol, profile_id: None)
     runtime = Runtime(config, Store(tmp_path / "bot.sqlite"), collector)  # type: ignore[arg-type]
     executor = FakeExecutor()
     runtime.executor = executor  # type: ignore[assignment]
@@ -129,8 +158,7 @@ def test_the_cycle_syncs_the_clock_and_settles_positions_before_entries(tmp_path
 def test_a_drawdown_halts_once_per_cycle(tmp_path, monkeypatch) -> None:
     runtime, _collector, _executor = _runtime(tmp_path, monkeypatch, ["BTC/USDT", "ETH/USDT", "SOL/USDT"])
     monkeypatch.setattr("bot.runtime._setup", _setup)
-    runtime.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": {"exit_policy": "trailing"}})
-    runtime.store.record_equity(1000.0, "2026-01-01T00:00:00+00:00")
+    runtime.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": _validated("trend", "trailing")})
     runtime.store.record_day("2026-01-01", net_pnl=-200.0)
     halts: list[str] = []
     monkeypatch.setattr(runtime, "halt", lambda reason, **_kwargs: halts.append(reason))
@@ -139,15 +167,34 @@ def test_a_drawdown_halts_once_per_cycle(tmp_path, monkeypatch) -> None:
     assert len(halts) == 1 and "drawdown" in halts[0]
 
 
+def test_a_lower_capital_is_not_a_drawdown(tmp_path, monkeypatch) -> None:
+    runtime, _executor = _ready_cycle(tmp_path, monkeypatch)
+    runtime.tick()
+    runtime.config = runtime.config.model_copy(update={"allocated_capital_usd": 150.0})
+    runtime.tick()
+    assert runtime.halted is False and runtime.store.get_state("risk_state")["level"] == "normal"
+    # A real loss still counts against the lower capital: 20 of 150 is past the 10% step (exits only)...
+    runtime.store.record_day("2026-01-01", net_pnl=-20.0)
+    halts: list[str] = []
+    monkeypatch.setattr(runtime, "halt", lambda reason, **_kwargs: halts.append(reason))
+    runtime.tick()
+    assert halts == [] and runtime.store.get_state("risk_state")["level"] == "reducing"
+    # ...and 25 of 150 past the 15% halt step.
+    runtime.store.record_day("2026-01-02", net_pnl=-5.0)
+    runtime.tick()
+    assert halts and "drawdown" in halts[0]
+
+
 def test_a_real_daily_loss_pauses_until_the_next_utc_day(tmp_path, monkeypatch) -> None:
     runtime, _collector, _executor = _runtime(tmp_path, monkeypatch)
     monkeypatch.setattr("bot.runtime._setup", _setup)
-    runtime.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": {"exit_policy": "trailing"}})
+    runtime.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": _validated("trend", "trailing")})
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     runtime.store.record_day(today, net_pnl=-40.0)
     runtime.store.set_state("running", True)
     runtime.tick()
-    assert runtime.store.get_state("running") is False
+    # The pause refuses buys only: the cycle keeps syncing stops and running exits (review F2).
+    assert runtime.store.get_state("running") is True
     assert runtime.store.get_state("paused_until")
 
 
@@ -173,7 +220,7 @@ def test_an_unprotected_position_halts_at_once_without_flatten(tmp_path, monkeyp
 def test_decay_runs_once_per_utc_day(tmp_path, monkeypatch) -> None:
     runtime, _collector, _executor = _runtime(tmp_path, monkeypatch)
     calls: list[str] = []
-    monkeypatch.setattr("bot.runtime.apply_decay", lambda _store, strategy_id, _returns: calls.append(strategy_id) or False)
+    monkeypatch.setattr("bot.runtime.review_strategy", lambda _store, strategy_id, **_kwargs: calls.append(strategy_id))
     runtime.tick()
     runtime.tick()
     assert sorted(calls) == sorted(STRATEGIES)
@@ -244,7 +291,7 @@ def _ready_cycle(tmp_path, monkeypatch, **overrides: Any) -> tuple[Runtime, Fake
     runtime, _collector, executor = _runtime(tmp_path, monkeypatch, **overrides)
     monkeypatch.setattr("bot.runtime._setup", _setup)
     runtime.store.save_strategy(
-        {"strategy_id": "trend", "signal_only": False, "params": {"wins": 30, "trades": 40, "exit_policy": "trailing"}}
+        {"strategy_id": "trend", "signal_only": False, "params": _validated("trend", "trailing", wins=30, trades=40)}
     )
     runtime.store.set_state("running", True)
     return runtime, executor
@@ -327,7 +374,7 @@ def test_trailing_skips_the_fixed_target_and_reserves_one_order_per_position(tmp
 def test_a_strategy_validated_under_another_exit_rule_is_signal_only(tmp_path, monkeypatch) -> None:
     runtime, executor = _ready_cycle(tmp_path, monkeypatch, entry_mode="auto")
     runtime.store.save_strategy(
-        {"strategy_id": "trend", "signal_only": False, "params": {"wins": 30, "trades": 40, "exit_policy": "target"}}
+        {"strategy_id": "trend", "signal_only": False, "params": _validated("trend", "target", wins=30, trades=40)}
     )
     runtime.tick()
     row = runtime.store.opportunities()[0]
@@ -373,14 +420,14 @@ def test_test_rows_exist_only_in_the_spot_testnet_test_mode(tmp_path, monkeypatc
 
 
 def test_a_smaller_balance_shrinks_orders_without_a_drawdown_halt(tmp_path, monkeypatch) -> None:
-    runtime, _executor = _ready_cycle(tmp_path, monkeypatch)
+    runtime, _executor = _ready_cycle(tmp_path, monkeypatch, limits=RiskLimits(max_order_notional_pct=0.02))
     runtime.tick()
     # 2% of 1000 is the order cap; entries keep 10% of it as headroom for the stop.
     assert runtime.store.opportunities()[0]["size_usd"] == pytest.approx(18.0)
     monkeypatch.setattr(service, "free_balance", lambda asset, profile_id: Decimal("100"))
     for _ in range(3):
         runtime.tick()
-    assert runtime.halted is False and runtime.store.peak_equity() == pytest.approx(1000.0)
+    assert runtime.halted is False and runtime.store.peak_pnl() == pytest.approx(0.0)
     assert runtime.store.opportunities()[0]["size_usd"] == pytest.approx(1.8)
 
 
@@ -394,6 +441,13 @@ def test_auto_entries_share_the_free_balance_across_pairs(tmp_path, monkeypatch)
         min_win_rate=0.70,
         symbols=["BTC/USDT", "ETH/USDT", "SOL/USDT"],
         limits=RiskLimits(max_order_notional_pct=0.5, max_entries_per_cycle=5),
+    )
+    runtime.store.save_strategy(
+        {
+            "strategy_id": "trend",
+            "signal_only": False,
+            "params": _validated("trend", "trailing", symbols=["BTC/USDT", "ETH/USDT", "SOL/USDT"], wins=30, trades=40),
+        }
     )
     # Orders are sized on the 30 USDT the account holds: 13.50 each (15 less headroom); 28.47 can be spent.
     monkeypatch.setattr(service, "free_balance", lambda asset, profile_id: Decimal("30"))
@@ -469,7 +523,9 @@ def _open(runtime: Runtime, symbol: str, strategy: str, *, qty: float, avg: floa
 
 
 def test_open_risk_is_capped_on_the_configured_capital_not_the_balance(tmp_path, monkeypatch) -> None:
-    runtime, executor = _ready_cycle(tmp_path, monkeypatch, entry_mode="auto", min_win_rate=0.70)
+    runtime, executor = _ready_cycle(
+        tmp_path, monkeypatch, entry_mode="auto", min_win_rate=0.70, limits=RiskLimits(max_order_notional_pct=0.02)
+    )
     # 50 USDT at risk to the stop: under 6% of the configured 1000, far above 6% of the 200 the account funds.
     _open(runtime, "XRP/USDT", "trend", qty=100, avg=1.0, stop=0.5)
     monkeypatch.setattr(service, "free_balance", lambda asset, profile_id: Decimal("100"))
@@ -791,10 +847,50 @@ def test_a_full_analysed_list_is_read_whole_next_to_a_held_pair_outside_it(tmp_p
     collector.refresh = lambda symbols: (asked.append(list(symbols)), inner(symbols))[1]  # type: ignore[method-assign]
     assert runtime.tick()["status"] == "ok"
     # Every scored pair is read in this cycle; none falls back on an older cycle's candles.
-    assert asked == [["ETH/USDT", *analysed]]
+    # BTC/USDT is read too: the market filter and the correlation cluster need it.
+    assert asked == [["ETH/USDT", *analysed, "BTC/USDT"]]
 
 
 def test_a_leftover_row_of_a_pair_no_longer_analysed_is_refused(tmp_path, monkeypatch) -> None:
     runtime, _collector, executor = _runtime(tmp_path, monkeypatch, ["ETH/USDT"])
     result = runtime.execute_manual(_manual_opportunity())
     assert result["results"][0]["decision"] == "bloqueado" and executor.events == []
+
+
+def _day_ready(tmp_path, monkeypatch, wins: int) -> tuple[Runtime, FakeExecutor]:
+    runtime, collector, executor = _runtime(tmp_path, monkeypatch, entry_mode="auto", min_win_rate=0.95, min_reward_risk=1.2)
+    runtime.config.strategies.update(trend=False, intraday_momentum=True)
+    # Fresh 15m bars: a day row prices and checks staleness on them.
+    now = datetime.now(timezone.utc)
+    index = pd.DatetimeIndex([pd.Timestamp(now).floor("15min")])
+    bars = pd.DataFrame({"open": [100.0], "high": [101.0], "low": [99.0], "close": [100.0], "volume": [10.0]}, index=index)
+    collector.snapshot.candles[("BTC/USDT", "15m")] = Series(bars, now, "test")
+    monkeypatch.setattr("bot.runtime.in_quiet_hours", lambda *_a: False)
+    monkeypatch.setattr(
+        "bot.runtime._setup",
+        lambda *_a: Setup(
+            "intraday_momentum", "BTC/USDT", "15m", "Comprar", 1.0, 0.015, 0.004, 0.01, 0.015, "rompimento", "trend_up",
+            confidence=0.9,
+        ),
+    )
+    runtime.store.save_strategy(
+        {
+            "strategy_id": "intraday_momentum",
+            "signal_only": False,
+            "params": _validated("intraday_momentum", "day", "15m", wins=wins, trades=69),
+        }
+    )
+    runtime.store.set_state("running", True)
+    return runtime, executor
+
+
+def test_a_day_row_enters_above_its_first_target_breakeven_not_the_swing_floor(tmp_path, monkeypatch) -> None:
+    # 34 of 69 (Laplace 0.493) clears the TP1 break-even (about 0.44) plus 0.03, far below the 95% swing floor.
+    runtime, executor = _day_ready(tmp_path, monkeypatch, wins=34)
+    runtime.tick()
+    assert runtime.store.opportunities()[0]["status"] == "pronta"
+    assert "act:1" in executor.events
+    # 32 of 69 (Laplace 0.465) clears the break-even (about 0.44) but not the 0.03 margin above it.
+    weak, weak_executor = _day_ready(tmp_path / "weak", monkeypatch, wins=32)
+    weak.tick()
+    assert "act:0" in weak_executor.events

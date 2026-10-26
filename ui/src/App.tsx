@@ -3,6 +3,7 @@ import { NavLink, Route, Routes } from "react-router";
 
 import { Help } from "./Help";
 import { Balance } from "./pages/Balance";
+import { Bots } from "./pages/Bots";
 import { Controls } from "./pages/Controls";
 import { History } from "./pages/History";
 import { Opportunities } from "./pages/Opportunities";
@@ -15,6 +16,7 @@ const links: [string, string, string][] = [
   ["/", "Oportunidades", "Lista o que o robô está vendo agora, da melhor nota para a pior. Nada aqui vira ordem sozinho se o status não for Pronta."],
   ["/positions", "Posições", "Mostra o que está aberto neste ambiente: quanto entrou, onde corta a perda e onde realiza o ganho."],
   ["/balance", "Saldo", "Mostra o saldo desta conta Binance (testnet ou produção), moeda por moeda, com o valor estimado em USDT."],
+  ["/robos", "Robôs", "DCA e Grid, como os robôs da Binance: você configura, simula no histórico e o robô opera sozinho, sempre com stop na corretora."],
   ["/performance", "Desempenho", "Mostra se o dinheiro cresceu ou encolheu ao longo dos dias, já descontando custos."],
   ["/controls", "Controles", "Liga, pausa e configura o robô. Também é aqui que se troca o ensaio (testnet) pela conta real."],
   ["/history", "Histórico", "Registro do que o robô decidiu, inclusive quando escolheu não operar."],
@@ -83,6 +85,20 @@ export function App() {
           <Help text="Quantas operações foram concluídas hoje neste ambiente." />
           <span>· violações evitadas {status.violations_avoided}</span>
           <Help text="Vezes em que uma ordem foi barrada porque passaria de um limite de risco, como tamanho, perda do dia ou número de posições." />
+          {(status.risk_state?.level === "cautious" || status.risk_state?.level === "reducing") && (
+            <>
+              <span className={status.risk_state.level === "reducing" ? "font-medium text-red-600" : "font-medium text-amber-600"}>
+                · {status.risk_state.level === "reducing" ? "modo só reduzir" : "modo cautela"}
+              </span>
+              <Help
+                text={
+                  status.risk_state.level === "reducing"
+                    ? "O patrimônio caiu além do drawdown máximo a partir do pico. Nenhuma compra nova; stops e saídas continuam. Volta sozinho quando a queda diminui. Detalhes em Controles."
+                    : "O patrimônio caiu além do primeiro degrau de drawdown. Cada trade arrisca a metade e entra no máximo uma posição por ciclo. Detalhes em Controles."
+                }
+              />
+            </>
+          )}
           <span>{status.halted ? "· halt ativo" : status.running ? "· em ciclo" : "· parado"}</span>
           <Help
             text={
@@ -112,6 +128,7 @@ export function App() {
           <Route path="/" element={<Opportunities />} />
           <Route path="/positions" element={<Positions />} />
           <Route path="/balance" element={<Balance />} />
+          <Route path="/robos" element={<Bots />} />
           <Route path="/performance" element={<Performance />} />
           <Route path="/controls" element={<Controls />} />
           <Route path="/history" element={<History />} />
