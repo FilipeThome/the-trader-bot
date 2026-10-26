@@ -50,3 +50,37 @@ export function decisionName(value: string): string {
   if (!value) return "—";
   return decisions[value] ?? statusLabels[value] ?? value;
 }
+
+/** The limit that set an order's size: the labels of bot.risk.SIZE_LIMITS. */
+export const sizeLimits: Record<string, string> = {
+  risk: "risco por trade",
+  kelly: "Kelly",
+  safety: "teto por ordem",
+  venue: "teto da corretora",
+  volatility: "volatilidade (ATR diário)",
+  exposure: "exposição total",
+  vol_target: "alvo de volatilidade",
+  cash: "caixa",
+  throttle: "volatilidade de 7 dias alta (metade)",
+};
+
+export function sizeLimitName(key: string): string {
+  return sizeLimits[key] ?? key;
+}
+
+/** Drawdown levels kept in bot_state.risk_state. */
+export const riskLevels: Record<string, string> = {
+  normal: "normal",
+  cautious: "cautela",
+  reducing: "só reduzir",
+  halt: "halt",
+};
+
+/** Kinds of the unprotected window between taking a stop off and placing the next one. */
+export const stopWindowKinds: Record<string, string> = {
+  trail: "stop móvel",
+  tp1: "TP1 do day trade",
+  partial: "venda parcial",
+  restop: "novo stop após compra",
+  exit_remainder: "stop do que sobrou",
+};

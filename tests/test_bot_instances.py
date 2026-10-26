@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pandas as pd
@@ -203,9 +203,12 @@ def _price(runtime: Runtime, venue, close: float) -> None:
         runtime.collector.snapshot.candles[("BTC/USDT", interval)] = Series(frame, now, "test")
 
 
-def _step(runtime: Runtime) -> None:
+def _step(runtime: Runtime, moment: datetime | None = None) -> None:
+    """The robots' part of one cycle: the cycle's risk level, then one step of every instance."""
+    moment = moment or datetime.now(timezone.utc)
     with runtime.lock:
-        runtime._instances(runtime.collector.snapshot, datetime.now(timezone.utc))
+        state = runtime._risk_state(runtime.collector.snapshot, moment)
+        runtime._instances(runtime.collector.snapshot, moment, state=state)
 
 
 def test_an_instance_needs_orders_reserved_for_robots(tmp_path, monkeypatch, venue) -> None:
@@ -418,7 +421,8 @@ def test_a_daily_loss_pauses_the_day_and_stops_robot_buys(tmp_path, monkeypatch,
     _step(runtime)
     assert runtime.store.open_positions()[0]["qty"] == held
     assert "perda diária" in runtime.store.instances()[0]["reason"]
-    assert runtime.store.get_state("paused_until") and not runtime.running
+    # The pause refuses buys only: the cycle keeps running (review F2).
+    assert runtime.store.get_state("paused_until") and runtime.running
     assert runtime.create_instance("dca", "ETH/USDT", DCA)["error"].startswith("pausado")
 
 
@@ -426,7 +430,7 @@ def test_a_drawdown_halts_and_stops_every_robot(tmp_path, monkeypatch, venue) ->
     runtime = _live_runtime(tmp_path, monkeypatch)
     _price(runtime, venue, 100.0)
     runtime.create_instance("grid", "BTC/USDT", GRID)
-    runtime.store.record_equity(2000.0, "2026-01-01T00:00:00+00:00")
+    runtime.store.record_equity(2000.0, "2026-01-01T00:00:00+00:00", pnl=1000.0)
     _step(runtime)
     assert runtime.halted and runtime.store.instances()[0]["status"] == "stopped"
 
@@ -434,7 +438,7 @@ def test_a_drawdown_halts_and_stops_every_robot(tmp_path, monkeypatch, venue) ->
 def test_a_dca_with_repeat_opens_the_next_round_after_its_take_profit(tmp_path, monkeypatch, venue) -> None:
     runtime = _live_runtime(tmp_path, monkeypatch)
     _price(runtime, venue, 100.0)
-    runtime.create_instance("dca", "BTC/USDT", DCA.model_copy(update={"repeat": True}))
+    runtime.create_instance("dca", "BTC/USDT", DCA.model_copy(update={"repeat": True, "cooldown_minutes": 0}))
     first = runtime.store.open_positions()[0]["id"]
     _price(runtime, venue, 103.5)
     _step(runtime)
@@ -445,6 +449,67 @@ def test_a_dca_with_repeat_opens_the_next_round_after_its_take_profit(tmp_path, 
     assert instance["status"] == "active" and instance["state"]["round"] == 2
     second = runtime.store.open_positions()[0]
     assert second["id"] != first and instance["state"]["base_price"] == 101.0
+
+
+def test_dca_repeat_waits_the_cooldown_after_take_profit(tmp_path, monkeypatch, venue) -> None:
+    runtime = _live_runtime(tmp_path, monkeypatch)
+    _price(runtime, venue, 100.0)
+    runtime.create_instance("dca", "BTC/USDT", DCA.model_copy(update={"repeat": True}))
+    _price(runtime, venue, 103.5)
+    _step(runtime)
+    assert runtime.store.open_positions() == []
+    closed_at = datetime.now(timezone.utc)
+    _price(runtime, venue, 101.0)
+    _step(runtime, closed_at)
+    instance = runtime.store.instances()[0]
+    # The default one-minute pause between rounds (Binance's 60 s).
+    assert instance["state"]["round"] == 1 and instance["reason"].startswith("pausa entre rodadas até")
+    assert runtime.store.open_positions() == []
+    _step(runtime, closed_at + timedelta(seconds=61))
+    assert runtime.store.instances()[0]["state"]["round"] == 2 and len(runtime.store.open_positions()) == 1
+
+
+def test_grid_restart_waits_the_cooldown(tmp_path, monkeypatch, venue) -> None:
+    runtime = _live_runtime(tmp_path, monkeypatch)
+    _price(runtime, venue, 100.0)
+    runtime.create_instance("grid", "BTC/USDT", GRID)
+    _price(runtime, venue, 111.0)
+    _step(runtime)
+    # Sold out above the range floor: the grid stays active, with an empty inventory.
+    assert runtime.store.open_positions() == [] and runtime.store.instances()[0]["status"] == "active"
+    sold_at = datetime.now(timezone.utc)
+    _price(runtime, venue, 100.0)
+    _step(runtime, sold_at)
+    assert runtime.store.open_positions() == []
+    assert runtime.store.instances()[0]["reason"].startswith("pausa entre rodadas até")
+    _step(runtime, sold_at + timedelta(seconds=61))
+    assert len(runtime.store.open_positions()) == 1
+
+
+def test_creation_refuses_a_robot_past_max_instances(tmp_path, monkeypatch, venue) -> None:
+    runtime = _live_runtime(tmp_path, monkeypatch)
+    runtime.config = runtime.config.model_copy(update={"limits": RiskLimits(instance_orders_per_day=40, max_instances=1)})
+    _price(runtime, venue, 100.0)
+    assert runtime.create_instance("grid", "BTC/USDT", GRID)["status"] == "ok"
+    preview = runtime.preview_instance("dca", "ETH/USDT", DCA)
+    assert any("máximo de 1" in item for item in preview["problems"])
+
+
+@pytest.mark.parametrize(("mandate", "expected"), [
+    (False, "teto por ordem indisponível: confirme o mandato em Controles"),
+    (True, "teto por ordem do testnet indisponível: defina testnet_max_order_notional em binance.json"),
+])
+def test_a_missing_order_cap_names_its_fix(tmp_path, monkeypatch, venue, mandate: bool, expected: str) -> None:
+    from bot.mandate_io import commit_mandate_for
+
+    runtime = _live_runtime(tmp_path, monkeypatch)
+    if mandate:
+        commit_mandate_for(runtime.config)
+    venue.cap = None
+    _price(runtime, venue, 100.0)
+    problems = runtime.preview_instance("grid", "BTC/USDT", GRID)["problems"]
+    assert expected in problems
+    assert runtime.create_instance("grid", "BTC/USDT", GRID)["status"] == "error"
 
 
 def test_a_grid_ends_when_its_stop_filled_at_the_broker(tmp_path, monkeypatch, venue) -> None:

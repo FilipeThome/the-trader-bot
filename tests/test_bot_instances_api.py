@@ -31,15 +31,34 @@ def test_the_dca_replay_repeats_rounds_until_the_stop() -> None:
     assert calm["wins"] == 1 and calm["pnl_usd"] > 0
 
 
+def _hourly(closes: list[float]) -> pd.DataFrame:
+    index = pd.date_range("2026-04-01", periods=len(closes), freq="h", tz="UTC")
+    return pd.DataFrame({"open": closes, "high": closes, "low": closes, "close": closes, "volume": 1.0}, index=index)
+
+
+class _History:
+    """Candle loader stub: serves ``frame`` for the asked pair and records (interval, days) per read."""
+
+    def __init__(self) -> None:
+        self.frame = _frame([100.0, 94.0, 100.0, 106.0])
+        self.reads: list[tuple[str, int]] = []
+
+    def fetch(self, symbols, start, end, interval="1h", **_kwargs):
+        self.reads.append((interval, (pd.Timestamp(end) - pd.Timestamp(start)).days))
+        return {symbols[0]: self.frame}
+
+
 @pytest.fixture
-def listed(monkeypatch) -> None:
+def history(monkeypatch) -> _History:
     monkeypatch.setattr("bot.api.app._require_listed", lambda *_a: None)
+    loader = _History()
+    monkeypatch.setattr("bot.backtest.loaders.registry.resolve_loader", lambda _kind: loader)
+    return loader
 
-    class Loader:
-        def fetch(self, symbols, start, end, interval="15m", **_kwargs):
-            return {symbols[0]: _frame([100.0, 94.0, 100.0, 106.0])}
 
-    monkeypatch.setattr("bot.backtest.loaders.registry.resolve_loader", lambda _kind: Loader())
+@pytest.fixture
+def listed(history) -> None:
+    return None
 
 
 def test_a_preview_shows_the_plan_its_problems_and_the_replay(api_client, venue, listed) -> None:
@@ -48,10 +67,44 @@ def test_a_preview_shows_the_plan_its_problems_and_the_replay(api_client, venue,
     preview = body.json()
     assert preview["plan"]["levels"] == [90.0, 95.0, 100.0, 105.0, 110.0]
     assert any("instance_orders_per_day" in item for item in preview["problems"])
-    # 94 buys level 1, 100 sells it back, 106 sells level 2.
-    assert preview["replay"]["grid_trades"] == 2
+    # 94 buys level 1, 100 sells it back, 106 sells level 2 (the short history fits every window).
+    assert preview["replay"]["interval"] == "1h"
+    assert [window["grid_trades"] for window in preview["replay"]["windows"]] == [2, 2, 2]
     refused = api_client.post("/bot/instances", json={"kind": "grid", "symbol": "BTC/USDT", "params": GRID})
     assert refused.status_code == 409 and "instance_orders_per_day" in refused.json()["detail"]
+
+
+def test_preview_returns_three_windows_with_warning(api_client, venue, history) -> None:
+    # 180 days of 1h closes: inside the grid for the last 30 days only, above it before.
+    history.frame = _hourly([130.0] * (150 * 24) + [100.0] * (30 * 24))
+    body = api_client.post("/bot/instances/preview", json={"kind": "grid", "symbol": "BTC/USDT", "params": GRID})
+    assert body.status_code == 200, body.text
+    replay = body.json()["replay"]
+    # A single read of 180 days of 1h candles serves the three windows.
+    assert history.reads == [("1h", 180)]
+    windows = {window["days"]: window for window in replay["windows"]}
+    assert list(windows) == [30, 90, 180]
+    assert windows[30]["out_of_range_share"] < 0.01 and windows[30]["warn"] is False
+    assert windows[90]["out_of_range_share"] > 0.30 and windows[90]["warn"] is True
+    assert windows[180]["warn"] is True
+
+
+def test_a_preview_without_history_keeps_the_plan_and_says_why(api_client, venue, history) -> None:
+    history.frame = _hourly([])
+    body = api_client.post("/bot/instances/preview", json={"kind": "grid", "symbol": "BTC/USDT", "params": GRID})
+    assert body.status_code == 200, body.text
+    assert body.json()["replay"] == {"interval": "1h", "windows": [], "error": "histórico do par indisponível"}
+
+
+def test_creation_stops_at_max_instances(api_client, venue, listed) -> None:
+    saved = api_client.put("/bot/config", json={"limits": {"instance_orders_per_day": 40, "max_instances": 1}})
+    assert saved.status_code == 200, saved.text
+    first = api_client.post("/bot/instances", json={"kind": "grid", "symbol": "BTC/USDT", "params": GRID})
+    assert first.status_code == 200, first.text
+    preview = api_client.post("/bot/instances/preview", json={"kind": "grid", "symbol": "ETH/USDT", "params": GRID}).json()
+    assert preview["problems"].count("já há 1 robôs ativos (máximo de 1)") == 1
+    second = api_client.post("/bot/instances", json={"kind": "grid", "symbol": "ETH/USDT", "params": GRID})
+    assert second.status_code == 409 and second.json()["detail"] == "já há 1 robôs ativos (máximo de 1)"
 
 
 def test_instances_are_created_listed_and_stopped(api_client, venue, listed) -> None:
@@ -63,6 +116,9 @@ def test_instances_are_created_listed_and_stopped(api_client, venue, listed) -> 
     assert rows[0]["status"] == "active" and rows[0]["position"]["strategy"] == "grid"
     stopped = api_client.post(f"/bot/instances/{created.json()['id']}/stop")
     assert stopped.status_code == 200 and stopped.json()["instance_status"] == "stopped"
+    # Stopping sells what the robot held and halts nothing.
+    assert api_client.get("/bot/instances").json()["rows"][0]["position"] is None
+    assert api_client.get("/bot/status").json()["halted"] is False
 
 
 def test_bad_instance_params_are_refused(api_client, venue, listed) -> None:

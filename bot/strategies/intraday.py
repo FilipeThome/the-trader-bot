@@ -87,7 +87,7 @@ class IntradayMomentum:
         median = float(frame["volume"].iloc[-21:-1].median())
         if median <= 0 or volume <= VOLUME_SURGE * median:
             return None
-        trend = hourly_trend(hourly)
+        trend = hourly_trend(hourly, frame)
         if trend is None or hourly is None:
             return None
         vwap = session_vwap(frame)
@@ -123,7 +123,7 @@ class VwapPullback:
         previous = float(close.iloc[-2])
         if last <= previous:
             return None
-        trend = hourly_trend(hourly)
+        trend = hourly_trend(hourly, frame)
         if trend is None or hourly is None:
             return None
         fast = ema(close, 20)

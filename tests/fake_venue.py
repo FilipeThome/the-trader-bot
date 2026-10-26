@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
 import pytest
 
+from bot.exchange import service
 from bot.exchange.execution.rules import MarketRules
 
 
@@ -33,10 +35,25 @@ def _rules() -> MarketRules:
 
 
 class Venue:
-    """The slice of ``bot.exchange.service`` the executor uses, scripted per order type."""
+    """The slice of ``bot.exchange.service`` the executor uses, scripted per order type.
+
+    ``responses`` queues results by ``"{side}:{order_type}"`` (``"sell:limit"``) or,
+    for either side, by the order type alone (``"limit"``); the side key wins.
+    Unscripted, a buy LIMIT IOC (a strategy entry) fills in full at the ask when the
+    ask is at or under its limit, and expires with nothing filled otherwise.
+
+    A buy LIMIT GTC (a robot's resting buy) rests: it is kept in ``orders`` under the
+    client id its key gives, ``open`` with nothing filled, until ``fill_resting`` fills
+    it (in part or in full) or a cancel takes it off (``canceled``, keeping what filled).
+    With ``fill_rest_on_arrival`` it fills in full as it reaches the book (the price moved
+    through the level since the quote), and the send answers with that fill.
+    Scripted results for it are queued under ``"buy:gtc"`` only.
+    """
 
     def __init__(self) -> None:
         self.bid = Decimal("100")
+        #: Best ask when it differs from the bid.
+        self.ask: Decimal | None = None
         self.budget = 100
         self.calls: list[dict[str, Any]] = []
         self.events: list[str] = []
@@ -47,6 +64,8 @@ class Venue:
         self.blocker: str | None = None
         self.journal_blocked = False
         self.fail_market: Exception | None = None
+        #: Raised on a buy LIMIT order (a strategy entry), after it is recorded as sent.
+        self.fail_entry: Exception | None = None
         #: Per-order notional cap the gate enforces; None means unreadable.
         self.cap: Decimal | None = Decimal("1000")
         #: Last trade price when it differs from the bid.
@@ -54,19 +73,35 @@ class Venue:
         #: Raised on the n-th limit sell (1-based), to break a chunked exit midway.
         self.fail_limit_at: int | None = None
         self.limit_calls = 0
+        #: Called with the order id on a cancel; its result (None means ok) is returned.
+        #: It may move ``orders`` on, as Binance does when a stop fills before the cancel lands.
+        self.on_cancel: Callable[[str], dict[str, Any] | None] | None = None
+        #: Resting LIMIT GTC buys: order id -> client order id, in the order they were placed.
+        self.resting: dict[str, str] = {}
+        #: A resting LIMIT GTC buy fills in full on arrival.
+        self.fill_rest_on_arrival = False
 
     def submit_order(self, symbol: str, profile_id: str, *, held: Any = None, **kwargs: Any) -> dict[str, Any]:
-        self.events.append(f"submit:{kwargs['order_type']}")
+        buy_limit = kwargs["order_type"] == "limit" and kwargs.get("side") == "buy"
+        if buy_limit and kwargs.get("time_in_force") == "gtc":
+            return self._rest(symbol, profile_id, held, kwargs)
+        entry = buy_limit
+        # "submit:limit" stays an exit sale; an entry IOC logs as "submit:buy:limit".
+        self.events.append("submit:buy:limit" if entry else f"submit:{kwargs['order_type']}")
         self.calls.append({"symbol": symbol, "held": held, **kwargs})
         self.counter += 1
         client_id = f"c{self.counter}"
         if kwargs["order_type"] == "market" and self.fail_market is not None:
             raise self.fail_market
-        if kwargs["order_type"] == "limit":
+        if entry and self.fail_entry is not None:
+            raise self.fail_entry
+        if kwargs["order_type"] == "limit" and not entry:
             self.limit_calls += 1
             if self.limit_calls == self.fail_limit_at:
                 raise RuntimeError("binance.json unreadable")
-        queue = self.responses.get(kwargs["order_type"])
+        queue = self.responses.get(f"{kwargs.get('side', 'buy')}:{kwargs['order_type']}") or self.responses.get(
+            kwargs["order_type"]
+        )
         if queue:
             result = dict(queue.pop(0))
         elif kwargs["order_type"] == "market":
@@ -81,6 +116,20 @@ class Venue:
             }
         elif kwargs["order_type"] == "stop_loss_limit":
             result = {"status": "ok", "order_id": f"stop{self.counter}"}
+        elif entry:
+            qty = Decimal(kwargs["quantity"])
+            ask = self.ask if self.ask is not None else self.bid
+            if ask > Decimal(kwargs["limit_price"]):
+                result = {"status": "ok", "order_id": f"o{self.counter}", "filled": "0", "cost": "0", "fees": []}
+            else:
+                result = {
+                    "status": "ok",
+                    "order_id": f"o{self.counter}",
+                    "filled": str(qty),
+                    "cost": str(qty * ask),
+                    "average": str(ask),
+                    "fees": [{"cost": float(qty * Decimal("0.001")), "currency": "BTC"}],
+                }
         else:
             qty = Decimal(kwargs["quantity"])
             cost = qty * Decimal(kwargs["limit_price"])
@@ -94,6 +143,57 @@ class Venue:
         result.setdefault("client_order_id", client_id)
         return result
 
+    def _rest(self, symbol: str, profile_id: str, held: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+        self.events.append("submit:buy:gtc")
+        self.calls.append({"symbol": symbol, "held": held, **kwargs})
+        self.counter += 1
+        client_id = service.client_order_id(profile_id, kwargs["idempotency_key"])
+        queue = self.responses.get("buy:gtc")
+        if queue:
+            result = dict(queue.pop(0))
+            result.setdefault("client_order_id", client_id)
+            return result
+        order_id = f"r{self.counter}"
+        self.resting[order_id] = client_id
+        self.orders[client_id] = {
+            "status": "ok",
+            "order": {
+                "status": "open",
+                "order_id": order_id,
+                "price": kwargs["limit_price"],
+                "amount": kwargs["quantity"],
+                "filled": "0",
+                "cost": "0",
+                "fees": [],
+            },
+        }
+        if self.fill_rest_on_arrival:
+            order = self.fill_resting(client_id=client_id)
+            return {**order, "status": "ok", "client_order_id": client_id}
+        return {"status": "ok", "order_id": order_id, "client_order_id": client_id, "filled": "0"}
+
+    def resting_order(self, client_id: str | None = None) -> dict[str, Any]:
+        """The venue's view of a resting buy (the last one placed by default)."""
+        key = client_id if client_id is not None else list(self.resting.values())[-1]
+        return self.orders[key]["order"]
+
+    def fill_resting(self, qty: Decimal | None = None, *, client_id: str | None = None) -> dict[str, Any]:
+        """Fill a resting buy at its price: in full by default, else up to ``qty`` in total.
+        A full fill closes it; a partial one leaves it open. The fee is 0.1% in base."""
+        order = self.resting_order(client_id)
+        amount = Decimal(order["amount"])
+        filled = amount if qty is None else min(qty, amount)
+        price = Decimal(order["price"])
+        order.update(
+            filled=str(filled),
+            cost=str(filled * price),
+            average=str(price),
+            fees=[{"cost": float(filled * Decimal("0.001")), "currency": "BTC"}] if filled > 0 else [],
+        )
+        if filled >= amount:
+            order["status"] = "closed"
+        return order
+
     def order_status(self, symbol: str, profile_id: str, client_order_id: str) -> dict[str, Any]:
         self.events.append(f"status:{client_order_id}")
         return self.orders.get(client_order_id, {"status": "not_found"})
@@ -101,11 +201,19 @@ class Venue:
     def cancel_order(self, order_id: str, profile_id: str, **kwargs: Any) -> dict[str, Any]:
         self.events.append(f"cancel:{order_id}")
         self.cancelled.append(order_id)
-        return {"status": "ok"}
+        result = self.on_cancel(order_id) if self.on_cancel is not None else None
+        result = result if result is not None else {"status": "ok"}
+        client_id = self.resting.get(order_id)
+        if client_id is not None and result.get("status") == "ok":
+            order = (self.orders.get(client_id) or {}).get("order")
+            if isinstance(order, dict) and order["status"] == "open":
+                order["status"] = "canceled"
+        return result
 
     def get_quote(self, symbol: str, profile_id: str) -> dict[str, Any]:
         last = self.last if self.last is not None else self.bid
-        return {"status": "ok", "quote": {"bid": str(self.bid), "last": str(last)}}
+        ask = self.ask if self.ask is not None else self.bid
+        return {"status": "ok", "quote": {"bid": str(self.bid), "ask": str(ask), "last": str(last)}}
 
     def reconcile(self, profile_id: str) -> dict[str, Any]:
         self.events.append("reconcile")

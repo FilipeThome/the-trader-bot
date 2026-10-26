@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+import pytest
+
 from bot.executor import Executor
 from bot.strategies.day import DAY
 from test_bot_executor import PROFILE, Store, _ready
@@ -159,9 +161,11 @@ def test_a_stop_never_asks_for_more_than_the_balance_held(tmp_path, venue, monke
     monkeypatch.setattr("bot.exchange.service.free_balance", lambda *_a: Decimal("0.3"))
     executor.protect(position_id)
     stop = [call for call in venue.calls if call["order_type"] == "stop_loss_limit"][-1]
-    assert stop["quantity"] == "0.3"
+    # Sized like a fill, under the gate's fee margin: the gate wants qty x (1 + fee) free.
+    assert stop["quantity"] == "0.2997"
+    assert Decimal(stop["quantity"]) * Decimal("1.001") <= Decimal("0.3")
     # The store follows the balance: a later first target or exit is sized on what is held.
-    assert executor.store.position(position_id)["qty"] == 0.3
+    assert executor.store.position(position_id)["qty"] == pytest.approx(0.3 / 1.001)
 
 
 def test_a_break_even_stop_over_the_order_cap_keeps_the_old_stop(tmp_path, venue) -> None:
@@ -206,7 +210,7 @@ def test_an_unread_first_target_never_sells_into_the_kept_half(tmp_path, venue, 
     # Binance sold half, but the order cannot be read: the sync sizes the stop on the balance.
     monkeypatch.setattr("bot.exchange.service.free_balance", lambda *_a: Decimal("0.5"))
     executor.sync_positions()
-    assert executor.store.position(position_id)["qty"] == 0.5
+    assert executor.store.position(position_id)["qty"] == pytest.approx(0.5 / 1.001)
     executor.store.update_position(position_id, stop_order_id="stop-again")
     sold_before = [call for call in venue.calls if call["order_type"] == "limit"]
     assert executor.take_profit(position_id, reserve=1) == "concluído"

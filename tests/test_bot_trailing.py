@@ -7,9 +7,9 @@ import pandas as pd
 import pytest
 
 from bot.config import BotConfig
-from bot.executor import Executor
+from bot.executor import STOP_LIMIT_GAP, TRAIL_CLEARANCE, Executor, trail_clearance
 from bot.store import Store
-from bot.strategies import validated_for
+from bot.strategies import validated_for, validation_params
 from bot.strategies.trailing import TRAIL, trailing_level
 from test_bot_executor import PROFILE, _ready
 from test_bot_runtime import _runtime, _snapshot
@@ -33,10 +33,14 @@ def test_the_config_maps_the_two_flags_to_one_exit_policy() -> None:
 
 
 def test_a_trailing_tp_validation_holds_only_for_the_rules_it_replayed() -> None:
-    assert validated_for({"exit_policy": "trailing_tp", "trailing": TRAIL.params}, "trend", "trailing_tp")
-    assert not validated_for({"exit_policy": "trailing_tp"}, "trend", "trailing_tp")
-    assert not validated_for({"exit_policy": "trailing", "trailing": TRAIL.params}, "trend", "trailing_tp")
-    assert not validated_for({"exit_policy": "trailing_tp", "trailing": {**TRAIL.params, "activation_r": 2.0}}, "trend", "trailing_tp")
+    params = validation_params(
+        "trend", "trailing_tp", timeframes={"1h": {"passed": True}}, symbols=["BTC/USDT"], market_filter="off", hysteresis=True
+    )
+    assert params["trailing"] == TRAIL.params
+    assert validated_for(params, "trend", "trailing_tp")
+    assert not validated_for({key: value for key, value in params.items() if key != "trailing"}, "trend", "trailing_tp")
+    assert not validated_for({**params, "exit_policy": "trailing"}, "trend", "trailing_tp")
+    assert not validated_for({**params, "trailing": {**TRAIL.params, "activation_r": 2.0}}, "trend", "trailing_tp")
 
 
 def test_the_executor_keeps_the_entry_stop_until_activation(tmp_path, venue) -> None:
@@ -77,12 +81,13 @@ def test_the_replay_holds_the_entry_stop_before_activation(monkeypatch) -> None:
 
     never_activated = [100.0] * 61 + [102.0, 99.0, 98.0, 96.5]
     # The plain trail follows 102 at 3% and exits at 98; the activated one keeps the 97 stop.
-    assert replay(never_activated, "trailing") == pytest.approx(-0.02 - runner.ROUND_TRIP_COST)
-    assert replay(never_activated, "trailing_tp") == pytest.approx(-0.035 - runner.ROUND_TRIP_COST)
+    assert replay(never_activated, "trailing") == pytest.approx(-0.02 - runner.ROUND_TRIP_COST - 2 * runner.LEG_SLIPPAGE)
+    assert replay(never_activated, "trailing_tp") == pytest.approx(-0.035 - runner.ROUND_TRIP_COST - 2 * runner.LEG_SLIPPAGE)
     # Activated at 103: the stop then sits 1.5% under the highest close, so the drop to 108 exits at 108.
     activated = [100.0] * 61 + [103.0, 106.0, 110.0, 112.0, 108.0]
-    assert replay(activated, "trailing_tp") == pytest.approx(0.08 - runner.ROUND_TRIP_COST)
-    record = runner.promotion_record(runner.evaluate("trend", [runner.Trade(pd.Timestamp("2026-01-02", tz="UTC"), 0.01)], 1.0, exit_policy="trailing_tp"))
+    assert replay(activated, "trailing_tp") == pytest.approx(0.08 - runner.ROUND_TRIP_COST - 2 * runner.LEG_SLIPPAGE)
+    one = [runner.Trade(pd.Timestamp("2026-01-02", tz="UTC"), 0.01)]
+    record = runner.promotion_record(runner.evaluate("trend", one, 1.0, exit_policy="trailing_tp"))
     assert record["params"]["exit_policy"] == "trailing_tp" and record["params"]["trailing"] == TRAIL.params
 
 
@@ -97,3 +102,41 @@ def test_the_runtime_trails_activated_positions_and_never_sells_them_at_the_targ
     assert executor.events == [f"trail:{position_id}:2"]
     runtime._exits(snapshot, datetime.now(timezone.utc))
     assert executor.events == [f"trail:{position_id}:2"]
+
+
+def _trailing(tmp_path, policy: str) -> tuple[Executor, dict]:
+    executor = Executor(Store(tmp_path / "bot.sqlite"), PROFILE, exit_policy=policy)
+    executor.enter(_ready())
+    position = executor.store.open_positions()[0]
+    assert position["trail_pct"] == pytest.approx(0.02)
+    return executor, position
+
+
+def test_the_stop_does_not_trail_inside_the_clearance(tmp_path, venue) -> None:
+    executor, position = _trailing(tmp_path, "trailing")
+    # Peak 110: the new stop is 107.8 and needs 1% (half the 2% trail) under min(bid, last).
+    venue.bid = Decimal("108.8")
+    assert executor.trail(position["id"], Decimal("110"), reserve=2) == "novo stop sem folga de 1.0% do preço"
+    venue.bid = Decimal("110")
+    assert executor.trail(position["id"], Decimal("108.8"), reserve=2) == "novo stop sem folga de 1.0% do preço"
+    assert venue.cancelled == []
+    venue.bid = Decimal("109")
+    assert executor.trail(position["id"], Decimal("110"), reserve=2) == "movido"
+    assert executor.store.position(position["id"])["stop_price"] == 107.8  # type: ignore[index]
+
+
+def test_the_clearance_is_at_most_half_the_trail_distance_and_at_least_the_stop_gap() -> None:
+    assert trail_clearance(Decimal("100"), Decimal("98")) == Decimal("0.01")
+    assert trail_clearance(Decimal("100"), Decimal("98.6")) == Decimal("0.007")
+    assert trail_clearance(Decimal("100"), Decimal("99")) == STOP_LIMIT_GAP
+    assert trail_clearance(Decimal("100"), Decimal("99.5")) == STOP_LIMIT_GAP
+    assert trail_clearance(Decimal("100"), Decimal("90")) == TRAIL_CLEARANCE
+
+
+def test_trailing_tp_still_moves_with_a_small_callback(tmp_path, venue) -> None:
+    executor, position = _trailing(tmp_path, "trailing_tp")
+    # Active at peak 110: the callback is half the 2% trail, so the new stop 108.9 sits 1% under the
+    # peak and needs only the 0.5% stop gap. A flat 1% clearance (108.5) would freeze it here.
+    venue.bid = Decimal("109.6")
+    assert executor.trail(position["id"], Decimal("110"), reserve=2) == "movido"
+    assert executor.store.position(position["id"])["stop_price"] == 108.9  # type: ignore[index]

@@ -6,7 +6,7 @@ import { formatPct } from "../App";
 import { Help } from "../Help";
 import { strategyName } from "../labels";
 import { useBot } from "../store";
-import type { BotInstance, InstanceKind, InstancePreview } from "../types";
+import type { BotInstance, InstanceKind, InstanceOptions, InstancePreview, ReplayWindow } from "../types";
 
 /** [param, label, default, help, percent]: a percent field is typed in % and sent as a fraction. */
 type Field = [string, string, string, string, boolean?];
@@ -21,6 +21,7 @@ const fields: Record<InstanceKind, Field[]> = {
     ["take_profit_pct", "Take-profit (%)", "1.5", "Vende tudo quando o preço sobe isto acima do preço médio.", true],
     ["stop_pct", "Stop abaixo da última ordem (%)", "3", "O stop fica na corretora este tanto abaixo da última ordem de segurança.", true],
     ["max_orders_per_day", "Ordens por dia", "20", "Teto diário de ordens deste robô, contando os stops trocados."],
+    ["cooldown_minutes", "Pausa entre rodadas (min)", "1", "Com repetir ligado, a nova rodada só começa este tanto de minutos depois do take-profit da anterior, como o cooldown da Binance (1 minuto). De 0 a 1440."],
   ],
   grid: [
     ["lower", "Preço inferior", "", "Limite de baixo da faixa."],
@@ -30,6 +31,7 @@ const fields: Record<InstanceKind, Field[]> = {
     ["stop_price", "Stop", "", "Abaixo do preço inferior. Fica na corretora para tudo o que o grid tiver e encerra o grid."],
     ["take_profit_price", "Take-profit (opcional)", "", "Acima do preço superior: vende tudo e encerra o grid."],
     ["max_orders_per_day", "Ordens por dia", "20", "Teto diário de ordens deste robô, contando os stops trocados."],
+    ["cooldown_minutes", "Pausa para recomeçar (min)", "1", "Depois de vender todo o estoque acima do preço inferior, o grid espera este tanto de minutos antes de comprar de novo, como o cooldown da Binance (1 minuto). De 0 a 1440."],
   ],
 };
 
@@ -37,7 +39,7 @@ function initial(kind: InstanceKind): Record<string, string> {
   return Object.fromEntries(fields[kind].map(([name, , value]) => [name, value]));
 }
 
-function payload(kind: InstanceKind, values: Record<string, string>, extra: Record<string, unknown>): Record<string, unknown> {
+function payload(kind: InstanceKind, values: Record<string, string>, extra: InstanceOptions): Record<string, unknown> {
   const params: Record<string, unknown> = { ...extra };
   for (const [name, , , , percent] of fields[kind]) {
     const raw = values[name]?.trim() ?? "";
@@ -61,15 +63,17 @@ export function Bots() {
   const [symbol, setSymbol] = useState("");
   const [values, setValues] = useState<Record<InstanceKind, Record<string, string>>>({ dca: initial("dca"), grid: initial("grid") });
   const [repeat, setRepeat] = useState(false);
+  const [restingBuys, setRestingBuys] = useState(false);
   const [mode, setMode] = useState<"arithmetic" | "geometric">("arithmetic");
   const [preview, setPreview] = useState<InstancePreview | null>(null);
   const [previewKey, setPreviewKey] = useState("");
   const [rows, setRows] = useState<BotInstance[]>([]);
   const [reserved, setReserved] = useState<number | null>(null);
   const [reserveInput, setReserveInput] = useState("");
+  const [maxInput, setMaxInput] = useState("");
 
   const pair = symbol || status?.symbols[0] || "";
-  const extra = kind === "dca" ? { repeat } : { mode };
+  const extra: InstanceOptions = kind === "dca" ? { repeat, resting_buys: restingBuys } : { mode, resting_buys: restingBuys };
   const params = payload(kind, values[kind], extra);
   const key = JSON.stringify([kind, pair, params]);
 
@@ -90,30 +94,34 @@ export function Bots() {
   }, []);
 
   async function simulate() {
-    const result = await perform(`Simular ${kind.toUpperCase()} em ${pair}`, () => api.previewInstance(kind, pair, params), (body) =>
+    const outcome = await perform(`Simular ${kind.toUpperCase()} em ${pair}`, () => api.previewInstance(kind, pair, params), (body) =>
       body.problems.length ? `Simulação pronta: ${body.problems.length} problema(s) a resolver` : "Simulação pronta: o plano pode rodar",
     );
-    if (result) {
-      setPreview(result);
+    if (outcome.ok) {
+      setPreview(outcome.result);
       setPreviewKey(key);
     }
   }
 
   async function create() {
-    await perform(`Criar ${kind.toUpperCase()} em ${pair}`, () => api.createInstance(kind, pair, params), (body) =>
+    const outcome = await perform(`Criar ${kind.toUpperCase()} em ${pair}`, () => api.createInstance(kind, pair, params), (body) =>
       [`Robô ${kind.toUpperCase()} criado em ${pair}`, body.step, body.cycle_started ? "ciclo iniciado" : ""].filter(Boolean).join(" · "),
     );
-    setPreview(null);
+    // A refused robot keeps its simulation, so the operator can fix the cause and try again.
+    if (outcome.ok) setPreview(null);
     void refresh();
   }
 
   const canCreate = preview != null && previewKey === key && preview.problems.length === 0 && !busy;
+  const live = rows.filter((row) => row.status !== "stopped").length;
+  const maxInstances = status?.limits.max_instances;
+  const maxValue = /^\d+$/.test(maxInput.trim()) ? Number(maxInput.trim()) : null;
 
   return (
     <section className="space-y-6 text-sm">
       <p className="max-w-3xl text-neutral-600 dark:text-neutral-400">
         Robôs configurados por você, como o Spot DCA e o Spot Grid da Binance. Antes de criar, a simulação mostra o plano inteiro, a perda se o stop
-        for atingido e como o mesmo plano teria ido nos últimos 30 dias. O robô compra a mercado e vende com IOC a cada ciclo de 1 minuto, sempre com
+        for atingido e como o mesmo plano teria ido nos últimos 30, 90 e 180 dias. O robô compra a mercado e vende com IOC a cada ciclo de 1 minuto, sempre com
         um stop na corretora para tudo o que tiver. Ele ocupa o par: nenhuma estratégia entra nele enquanto o robô roda.
       </p>
 
@@ -130,6 +138,26 @@ export function Bots() {
           }
         >
           salvar e reconfirmar o mandato
+        </button>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        Robôs ativos: <strong>{live}</strong> de no máximo <strong>{maxInstances ?? "—"}</strong>
+        <Help text="Quantos robôs DCA ou Grid podem rodar ao mesmo tempo. Com o máximo atingido, a simulação aponta o problema e nenhum robô novo é criado; os que já rodam continuam. De 0 a 20." />
+        <input
+          className="w-16 border border-neutral-300 bg-transparent px-1 dark:border-neutral-700"
+          value={maxInput}
+          placeholder={String(maxInstances ?? 3)}
+          onChange={(event) => setMaxInput(event.target.value)}
+          aria-label="Máximo de robôs ativos"
+        />
+        <button
+          className="underline disabled:opacity-50"
+          type="button"
+          disabled={busy || maxValue == null || maxValue > 20}
+          onClick={() => void perform("Salvar máximo de robôs", () => api.updateConfig({ limits: { max_instances: maxValue ?? 0 } }), () => `Até ${maxValue} robôs ativos`)}
+        >
+          salvar máximo
         </button>
       </div>
 
@@ -163,6 +191,11 @@ export function Bots() {
               </select>
             </label>
           )}
+          <label className="inline-flex items-center">
+            <input type="checkbox" checked={restingBuys} onChange={(event) => setRestingBuys(event.target.checked)} />
+            &nbsp;compra limitada no livro
+            <Help text="Em vez de comprar a mercado quando o preço chega, o robô deixa uma ordem limitada (GTC) no livro: no DCA, na próxima ordem de segurança; no grid, no nível abaixo do mais baixo que ele tem. Só uma por robô. Ela executa no preço do nível, sem spread e sem perder um toque dentro do minuto; a taxa é a mesma (0,1%). A ordem trava USDT, não a moeda, então convive com o stop. Cada uma reserva 3 ordens do dia (a compra, o cancelamento e o stop refeito). Ela sai do livro antes de qualquer venda, no halt, ao parar o ciclo e em qualquer bloqueio de compra (pausa diária, modo só reduzir, relógio)." />
+          </label>
         </div>
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
           {fields[kind].map(([name, label, , help]) => (
@@ -295,14 +328,65 @@ function PreviewCard({ preview }: { preview: InstancePreview }) {
         </table>
       )}
       {plan.levels && <p className="text-neutral-500">Níveis: {plan.levels.map((level) => level.toFixed(4)).join(" · ")}</p>}
-      <p className="inline-flex items-center">
-        {replay.error
-          ? `Histórico: ${replay.error}`
-          : `Últimos ${replay.days} dias: ${formatPct(replay.pnl_pct ?? 0)} (US$ ${(replay.pnl_usd ?? 0).toFixed(2)}) · queda máxima ${formatPct(-(replay.max_drawdown_pct ?? 0))}` +
-            (replay.rounds != null ? ` · ${replay.wins}/${replay.rounds} rodadas no alvo` : ` · ${replay.grid_trades} vendas de grade`) +
-            (replay.ended === "stop" ? " · terminou no stop" : replay.ended === "take_profit" ? " · terminou no take-profit" : "")}
-        <Help align="end" text="O mesmo plano repetido em velas de 15 minutos, com as taxas e metade do spread em cada perna, e o stop pela mínima da vela. Rodadas de DCA se repetem no replay. Mostra o passado, não promete o futuro." />
-      </p>
+      <ReplayTable kind={preview.kind} interval={replay.interval ?? "1h"} error={replay.error} windows={replay.windows ?? []} />
+      {preview.kind === "grid" && (
+        <p className="text-amber-700 dark:text-amber-400">
+          O grid só rende em lateralização: numa tendência de alta o preço sai pela parte de cima e o robô fica sem estoque; numa de queda ele
+          acumula moeda até o stop.
+        </p>
+      )}
     </aside>
+  );
+}
+
+/** Where the replayed plan ended: at the stop, at the take-profit, or still running. */
+function endedText(ended: string | null | undefined): string {
+  return ended === "stop" ? "no stop" : ended === "take_profit" ? "no take-profit" : "—";
+}
+
+function ReplayTable({ kind, interval, error, windows }: { kind: string; interval: string; error?: string; windows: ReplayWindow[] }) {
+  if (error) return <p>Histórico: {error}</p>;
+  if (windows.length === 0) return <p className="text-neutral-500">Sem histórico para repetir o plano.</p>;
+  const grid = kind === "grid";
+  const warned = windows.filter((row) => row.warn);
+  return (
+    <div className="space-y-2">
+      <p className="inline-flex items-center font-medium">
+        O mesmo plano no passado (velas de {interval})
+        <Help align="end" text="O plano repetido nos últimos 30, 90 e 180 dias de velas de 1 hora, com as taxas e metade do spread em cada perna, e o stop pela mínima da vela. Rodadas de DCA se repetem no replay. No grid, fora da faixa é a parte do tempo em que o fechamento ficou abaixo do preço inferior ou acima do superior: acima de 30% fica em vermelho. Mostra o passado, não promete o futuro." />
+      </p>
+      <table className="text-left">
+        <thead className="text-neutral-500">
+          <tr>
+            <th className="pr-4 font-medium">Janela</th>
+            <th className="pr-4 font-medium">Resultado</th>
+            <th className="pr-4 font-medium">Queda máxima</th>
+            <th className="pr-4 font-medium">{grid ? "Vendas de grade" : "Rodadas no alvo"}</th>
+            <th className="pr-4 font-medium">Terminou</th>
+            {grid && <th className="font-medium">Fora da faixa</th>}
+          </tr>
+        </thead>
+        <tbody>
+          {windows.map((row) => (
+            <tr key={row.days} className="border-t border-neutral-200 dark:border-neutral-800">
+              <td className="pr-4">{row.days} dias</td>
+              <td className={`pr-4 ${(row.pnl_usd ?? 0) >= 0 ? "text-green-600" : "text-red-600"}`}>
+                {formatPct(row.pnl_pct ?? 0)} (US$ {(row.pnl_usd ?? 0).toFixed(2)})
+              </td>
+              <td className="pr-4">{formatPct(-(row.max_drawdown_pct ?? 0))}</td>
+              <td className="pr-4">{grid ? (row.grid_trades ?? 0) : `${row.wins ?? 0}/${row.rounds ?? 0}`}</td>
+              <td className="pr-4">{endedText(row.ended)}</td>
+              {grid && <td className={row.warn ? "font-semibold text-red-600" : ""}>{Math.round(row.out_of_range_share * 100)}%</td>}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {warned.length > 0 && (
+        <p className="font-medium text-red-600">
+          Atenção: o preço ficou fora da faixa mais de 30% do tempo em {warned.map((row) => `${row.days} dias`).join(", ")}. Nessas fases o grid não
+          compra nem vende; revise os preços inferior e superior.
+        </p>
+      )}
+    </div>
   );
 }

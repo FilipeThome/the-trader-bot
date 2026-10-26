@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from bot.evaluator import classify
 from bot.strategies.base import Setup
 
@@ -59,3 +61,29 @@ def test_classify_names_the_blocker() -> None:
     assert classify(_setup(regime="range", strategy_id="trend", direction=-1.0, market="spot")).blocker == "short"
     assert classify(_setup(regime="trend_down")).blocker == "regime"
     assert classify(_setup(), in_position=True).blocker == "in_position"
+
+
+def test_classify_uses_the_given_taker() -> None:
+    from bot.evaluator import SPOT_TAKER, round_trip_cost, score_setup
+
+    setup = _setup()
+    default = classify(setup)
+    dearer = classify(setup, taker=0.002)
+    assert dearer.cost == pytest.approx(default.cost + 2 * (0.002 - SPOT_TAKER))
+    assert dearer.net_return < default.net_return and dearer.score < default.score
+    assert round_trip_cost(setup, taker=0.002) == pytest.approx(dearer.cost)
+    assert score_setup(setup, taker=0.002) == pytest.approx(dearer.score, abs=1e-4)
+    assert classify(setup, taker=SPOT_TAKER) == default
+    # A wide enough fee turns a ready row into a cost blocker.
+    assert classify(setup, taker=0.007).blocker == "cost"
+    # USD-M legs keep the futures fee; the spot taker does not apply to them.
+    futures = _setup(market="usdm")
+    assert round_trip_cost(futures, taker=0.002) == round_trip_cost(futures)
+
+
+def test_new_opportunity_fields_default_and_come_last() -> None:
+    row = classify(_setup(), slippage=0.0007).to_dict()
+    added = ["size_limit", "size_caps", "signal_age_seconds", "entry_drift_r", "cluster", "slippage_est", "plan_target_pct"]
+    assert list(row)[-len(added):] == added
+    assert row["slippage_est"] == 0.0007
+    assert all(row[name] is None for name in added if name != "slippage_est")

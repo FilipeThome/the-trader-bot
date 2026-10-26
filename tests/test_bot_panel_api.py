@@ -94,3 +94,116 @@ def test_the_trade_chart_backs_off_under_weight_pressure(api_client, monkeypatch
 def test_performance_carries_the_calibration_report(api_client) -> None:
     body = api_client.get("/bot/performance").json()
     assert body["calibration"] == []
+
+
+def test_status_reports_stop_window_stats(api_client) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    assert ctx.runtime is not None
+    store = ctx.runtime.store
+    store.record_stop_window("trail", "BTC/USDT", 1, 100.0)
+    store.record_stop_window("tp1", "BTC/USDT", 1, 300.0)
+    # Older than the 30 days the status covers.
+    store.record_stop_window("trail", "BTC/USDT", 1, 9000.0, ts=(datetime.now(timezone.utc) - timedelta(days=31)).isoformat())
+    windows = api_client.get("/bot/status").json()["stop_windows"]
+    assert windows["count"] == 2 and windows["max_ms"] == 300.0 and windows["mean_ms"] == 200.0
+    assert set(windows["by_kind"]) == {"trail", "tp1"}
+
+
+def test_status_reports_the_risk_state_the_mandate_and_the_new_settings(api_client, monkeypatch) -> None:
+    from bot.api import app as module
+
+    monkeypatch.setattr(module, "_run_validation", lambda *_args: None)
+    assert ctx.runtime is not None
+    body = api_client.get("/bot/status").json()
+    assert body["risk_state"] is None and body["mandate"] is None
+    assert (body["market_filter"], body["exit_hysteresis"], body["flatten_day_on_daily_loss"]) == ("off", True, False)
+    assert (body["macro_events_utc"], body["macro_pause_minutes"]) == ([], 15)
+    saved = api_client.put(
+        "/bot/config",
+        json={
+            "market_filter": "btc_ema40d",
+            "exit_hysteresis": False,
+            "flatten_day_on_daily_loss": True,
+            "macro_events_utc": ["2026-11-05T19:00:00+01:00"],
+            "macro_pause_minutes": 30,
+            "reconfirm_mandate": True,
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    assert ctx.runtime is not None
+    ctx.runtime.store.set_state("risk_state", {"level": "cautious", "since": "x", "drawdown": 0.06, "reason": "r"})
+    body = api_client.get("/bot/status").json()
+    assert body["risk_state"]["level"] == "cautious"
+    assert (body["market_filter"], body["exit_hysteresis"], body["flatten_day_on_daily_loss"]) == ("btc_ema40d", False, True)
+    assert body["macro_events_utc"] == ["2026-11-05T18:00:00+00:00"] and body["macro_pause_minutes"] == 30
+    capital = body["capital_usd"]
+    assert body["mandate"] == {
+        "max_order_notional_usd": capital * body["limits"]["max_order_notional_pct"],
+        "max_total_exposure_usd": capital * body["limits"]["max_exposure_pct"],
+        "max_trades_per_day": 4 * body["limits"]["max_trades_per_day"] + body["limits"]["instance_orders_per_day"],
+        "flatten_on_halt": False,
+    }
+    assert api_client.put("/bot/config", json={"market_filter": "sp500"}).status_code == 422
+    assert api_client.put("/bot/config", json={"macro_events_utc": ["amanhã"]}).status_code == 422
+
+
+def test_a_new_drawdown_limit_rederives_only_the_steps_it_puts_out_of_order(api_client) -> None:
+    def limits(body: dict) -> dict:
+        response = api_client.put("/bot/config", json={"limits": body})
+        assert response.status_code == 200, response.text
+        return response.json()["config"]["limits"]
+
+    # From (5%, 10%, 15%): the halt at or below 20% is derived again, the reduce step still fits.
+    raised = limits({"max_drawdown_pct": 0.2})
+    assert (raised["dd_reduce_pct"], raised["halt_drawdown_pct"]) == (0.05, 0.3)
+    # The reduce step at or above 4% is derived again, the halt still fits.
+    lowered = limits({"max_drawdown_pct": 0.04})
+    assert (lowered["dd_reduce_pct"], lowered["halt_drawdown_pct"]) == (0.02, 0.3)
+    # Steps sent with the limit are kept as sent.
+    sent = limits({"max_drawdown_pct": 0.12, "dd_reduce_pct": 0.03, "halt_drawdown_pct": 0.2})
+    assert (sent["dd_reduce_pct"], sent["halt_drawdown_pct"]) == (0.03, 0.2)
+    # Another limit leaves the steps alone.
+    assert limits({"max_exposure_pct": 0.4})["halt_drawdown_pct"] == 0.2
+    # Custom steps that still fit a new limit survive it.
+    moved = limits({"max_drawdown_pct": 0.15})
+    assert (moved["dd_reduce_pct"], moved["halt_drawdown_pct"]) == (0.03, 0.2)
+    # A reduce step of 0 is "off" and stays off.
+    limits({"dd_reduce_pct": 0})
+    off = limits({"max_drawdown_pct": 0.3})
+    assert (off["dd_reduce_pct"], off["halt_drawdown_pct"]) == (0, 0.45)
+    # Steps sent out of order are still refused.
+    assert api_client.put("/bot/config", json={"limits": {"max_drawdown_pct": 0.2, "halt_drawdown_pct": 0.1}}).status_code == 422
+
+
+def test_performance_reports_slippage_per_pair(api_client, monkeypatch) -> None:
+    from bot import decay
+
+    assert ctx.runtime is not None
+    store = ctx.runtime.store
+    for entry, exit_ in ((0.001, 0.002), (0.003, 0.004), (None, 0.001)):
+        position = store.open_pending("SOL/USDT", "trend", stop_price=90.0)
+        store.update_position(position, status="open", qty=1.0, avg_price=100.0, entry_slippage=entry, exit_slippage=exit_)
+        store.close_position(position, exit_price=101.0, realized_pnl=1.0, fees=0.0)
+    blocked = {"SOL/USDT": "slippage realizado acima do orçamento"}
+    monkeypatch.setattr(decay, "pair_slippage_blocked", lambda _store, symbol, _budget, *, now: blocked.get(symbol))
+    pairs = {row["symbol"]: row for row in api_client.get("/bot/performance").json()["pairs"]}
+    assert set(ctx.runtime.config.symbols) <= set(pairs)
+    sol = pairs["SOL/USDT"]
+    # The trade without an entry slippage is counted but not averaged.
+    assert sol["trades"] == 3 and abs(sol["slippage_rt"] - 0.005) < 1e-12
+    assert sol["blocked"] is True and sol["blocked_reason"] == blocked["SOL/USDT"]
+    assert pairs["BTC/USDT"] == {"symbol": "BTC/USDT", "trades": 0, "slippage_rt": None, "blocked": False, "blocked_reason": None}
+
+
+def test_the_day_preset_preview_sizes_an_order_at_a_1pct_stop(api_client) -> None:
+    sizing = api_client.get("/bot/presets/day").json()["sizing"]
+    status = api_client.get("/bot/status").json()
+    capital, limits = status["capital_usd"], status["limits"]
+    # The preset sets 0.5% risk per trade: 1% stop -> 50% of capital, then the order cap less headroom.
+    risk_cap = capital * 0.005 / 0.01
+    safety = capital * limits["max_order_notional_pct"] * 0.90
+    assert sizing["stop_pct"] == 0.01
+    assert sizing["caps"]["risk"] == round(risk_cap, 2) and sizing["caps"]["safety"] == round(safety, 2)
+    assert sizing["size_usd"] == round(min(risk_cap, safety), 2)
+    assert (sizing["binding"], sizing["label"]) == ("safety", "teto por ordem")

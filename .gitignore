@@ -17,3 +17,4 @@ ruff-out.txt
 pytest-*.txt
 .token-optimizer/
 .claude/
+.idea/

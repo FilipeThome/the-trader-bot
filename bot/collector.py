@@ -115,9 +115,13 @@ class Collector:
 
     def sync_clock(self) -> bool:
         """Block writes when local time and Binance time differ by more than one second."""
+        sent = time.time()
         payload, _headers = self._fetch(f"{SPOT}/api/v3/time")
+        received = time.time()
         server_ms = float(payload["serverTime"])
-        skew = abs(time.time() - server_ms / 1000)
+        # Binance stamps the answer mid-flight: compare it with the middle of the round
+        # trip, or a 300 ms request alone eats a third of the tolerance.
+        skew = abs((sent + received) / 2 - server_ms / 1000)
         self.snapshot.clock_blocked = skew > 1
         return not self.snapshot.clock_blocked
 

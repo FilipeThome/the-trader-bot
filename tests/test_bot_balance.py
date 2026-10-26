@@ -79,3 +79,25 @@ def test_balance_route_caches_and_reports_missing_keys(api_client, account, monk
     monkeypatch.setattr(sdk, "build_config", lambda *_a, **_k: sdk.BinanceConfig(profile="paper"))
     missing = api_client.get("/bot/balance")
     assert missing.status_code == 503 and "chaves" in missing.json()["detail"]
+
+
+def test_a_testnet_quote_prices_on_the_live_book_at_the_time_it_was_read(monkeypatch) -> None:
+    import time
+
+    class Exchange:
+        def fetch_ticker(self, symbol: str) -> dict[str, Any]:
+            # The testnet's 24h ticker of a thin pair: a cached bid, minutes old.
+            return {"bid": 4.9, "ask": 5.1, "last": 5.0, "timestamp": 1_000}
+
+        def fetch_order_book(self, symbol: str, limit: int) -> dict[str, Any]:
+            return {"bids": [[5.006, 10.0]], "asks": [[5.007, 8.0]]}
+
+    monkeypatch.setattr(sdk, "_public_exchange", lambda _cfg: Exchange())
+    monkeypatch.setattr(sdk, "_assert_host", lambda _cfg: None)
+    before = int(time.time() * 1000)
+    quote = sdk.get_quote("NEAR/USDT", config=sdk.BinanceConfig(profile="paper"))["quote"]
+    assert (quote["bid"], quote["ask"], quote["last"]) == (5.006, 5.007, 5.0)
+    assert int(quote["time"]) >= before
+    live = sdk.get_quote("NEAR/USDT", config=sdk.BinanceConfig(profile="live-trade-bot"))["quote"]
+    # Production keeps the exchange's own ticker time and prices.
+    assert (live["bid"], live["time"]) == (4.9, "1000")

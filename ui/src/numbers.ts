@@ -19,3 +19,9 @@ export function parseWhole(text: string): number | null {
   const value = text.trim();
   return /^\d+$/.test(value) ? Number(value) : null;
 }
+
+/** "+1,25 R": a price move in units of the entry risk; a dash when unknown. */
+export function formatR(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "—";
+  return `${value > 0 ? "+" : ""}${value.toFixed(2).replace(".", ",")} R`;
+}

@@ -18,19 +18,18 @@ logger = logging.getLogger(__name__)
 
 _QUOTE_RANK = {"USDT": 0, "USDC": 1, "FDUSD": 2, "BTC": 3, "ETH": 4, "BNB": 5}
 #: Dollar-pegged or fiat bases: a USDT pair of these is not a trade.
-_DOLLAR_BASES = frozenset({"USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "PYUSD", "USDE", "USD1", "EUR", "EURI", "AEUR", "XUSD"})
+_DOLLAR_BASES = frozenset({"USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "PYUSD", "USDE", "USD1", "RLUSD", "EUR", "EURI", "AEUR", "XUSD"})
 _LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR")
 _MAX_AGE_SECONDS = 3600
 #: The Spot Testnet lists its own subset of pairs; testnet orders only reach those.
 TESTNET_SPOT = "https://testnet.binance.vision"
-#: Trades a testnet pair needs in 24h, about one every 6 seconds. The order gate
-#: refuses a ticker older than 15 seconds, and the ticker time is the last trade,
-#: so a thinner testnet book leaves stops and exits refused as ``quote_stale``.
-#: Measured 2026-10-16: BTC 73k, ETH 29k, SOL 18k; the next pair (DOGE) had 8.5k.
-TESTNET_MIN_TRADES = 15_000
 #: Liquid pairs ranked by momentum, and the days of the momentum return.
 RANK_POOL = 40
 MOMENTUM_DAYS = 28
+#: A pair listed less than ``MOMENTUM_DAYS`` ago is ranked on its day instead: the
+#: last ``YOUNG_HOURS`` closed 1h candles, and it needs at least ``YOUNG_MIN_HOURS``.
+YOUNG_HOURS = 24
+YOUNG_MIN_HOURS = 12
 
 
 def parse_exchange_info(payload: dict[str, Any]) -> list[dict[str, str]]:
@@ -64,10 +63,11 @@ def venue_symbols(collector: Collector, mode: str) -> frozenset[str] | None:
     """Pairs the order venue of ``mode`` can trade, or ``None`` when it is the live catalog.
 
     Analysis reads the live market, but Spot Testnet orders only reach the pairs
-    the testnet lists, and only an active testnet book (``TESTNET_MIN_TRADES``)
-    keeps quotes fresh enough for the stop and the exit. In testnet every chosen
-    pair must be one of those. The testnet has its own weight limit, so these
-    reads do not count against the live budget.
+    the testnet lists, so in testnet every chosen pair must be one of those. Any
+    listed pair counts, however thin its testnet book: there the order gate prices
+    stops and exits on the live book (``sdk.get_quote``), not on the ticker a thin
+    pair refreshes slowly. The testnet has its own weight limit, so this read does
+    not count against the live budget.
     """
     if mode != "testnet":
         return None
@@ -76,20 +76,9 @@ def venue_symbols(collector: Collector, mode: str) -> frozenset[str] | None:
     if cached is not None and (now - cached[0]).total_seconds() < _MAX_AGE_SECONDS:
         return cached[1]
     payload, _headers = collector._fetch(f"{TESTNET_SPOT}/api/v3/exchangeInfo")
-    pairs = {row["base"] + row["quote"]: row["symbol"] for row in parse_exchange_info(payload)}
-    tickers, _headers = collector._fetch(f"{TESTNET_SPOT}/api/v3/ticker/24hr")
-    active: set[str] = set()
-    for item in tickers if isinstance(tickers, list) else []:
-        pair = pairs.get(str(item.get("symbol") or ""))
-        try:
-            busy = int(item.get("count") or 0) >= TESTNET_MIN_TRADES
-        except (TypeError, ValueError):
-            busy = False
-        if pair is not None and busy:
-            active.add(pair)
-    if not active:
-        raise ValueError("the Spot Testnet has no active pair")
-    listed = frozenset(active)
+    listed = frozenset(row["symbol"] for row in parse_exchange_info(payload))
+    if not listed:
+        raise ValueError("the Spot Testnet lists no pair")
     collector.testnet_cache = (now, listed)
     return listed
 
@@ -186,7 +175,8 @@ def rank_promising(
     """The ``count`` liquid USDT pairs with the best risk-adjusted momentum.
 
     The score is the 28-day return over the standard deviation of the daily
-    returns, from closed daily candles of the ``pool`` most liquid pairs. Only
+    returns, from closed daily candles of the ``pool`` most liquid pairs. A pair
+    too young for 28 days is scored the same way on its day (``_day_score``). Only
     pairs with a positive score are returned, best first. ``listed`` limits the
     pool to the pairs the order venue lists. Momentum here only
     picks which pairs the strategies look at; it never buys by itself.
@@ -215,9 +205,30 @@ def _momentum_score(collector: Collector, pair: str) -> float | None:
     except Exception as exc:  # noqa: BLE001 - one unreadable pair leaves the ranking, not the cycle
         logger.warning("daily candles of %s failed: %s", pair, type(exc).__name__)
         return None
-    if len(closes) < MOMENTUM_DAYS + 1 or min(closes) <= 0:
+    if len(closes) < MOMENTUM_DAYS + 1:
+        # Listed less than a month ago: its day is the history there is.
+        return _day_score(collector, pair)
+    return _risk_adjusted(closes[-(MOMENTUM_DAYS + 1) :])
+
+
+def _day_score(collector: Collector, pair: str) -> float | None:
+    """The young pair's last 24h: return over the deviation of its closed 1h returns."""
+    query = urllib.parse.urlencode({"symbol": pair.replace("/", ""), "interval": "1h", "limit": YOUNG_HOURS + 1})
+    try:
+        payload = _read(collector, f"{SPOT}/api/v3/klines?{query}")
+        closes = [float(row[4]) for row in payload[:-1]]
+    except Exception as exc:  # noqa: BLE001 - one unreadable pair leaves the ranking, not the cycle
+        logger.warning("hourly candles of %s failed: %s", pair, type(exc).__name__)
         return None
-    window = closes[-(MOMENTUM_DAYS + 1) :]
+    if len(closes) < YOUNG_MIN_HOURS:
+        return None
+    return _risk_adjusted(closes[-YOUNG_HOURS:])
+
+
+def _risk_adjusted(window: list[float]) -> float | None:
+    """The window's return over the population deviation of its bar returns."""
+    if len(window) < 2 or min(window) <= 0:
+        return None
     returns = [later / earlier - 1 for earlier, later in zip(window, window[1:])]
     deviation = statistics.pstdev(returns)
     if deviation <= 0:
