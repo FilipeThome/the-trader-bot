@@ -256,16 +256,17 @@ def test_a_young_pair_is_ranked_on_its_last_24_hours() -> None:
 
 def test_the_panel_sets_and_clears_the_rule_and_validation_starts_by_itself(api_client, monkeypatch) -> None:
     from bot.api import app as api
+    from bot.api import validation
 
     started: list[str] = []
     gate = threading.Event()
 
     def run(key, strategy_id, config, root) -> None:
         started.append(strategy_id)
-        api._update_job(key, status="done", stage="pronto")
+        validation._update_job(key, status="done", stage="pronto")
         gate.set()
 
-    monkeypatch.setattr(api, "_run_validation", run)
+    monkeypatch.setattr(validation, "_run_validation", run)
     api_client.put("/bot/config", json={"strategies": {"trend": False, "mean_reversion": True}})
     gate.wait(5)
     started.clear()

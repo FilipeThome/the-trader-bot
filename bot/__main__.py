@@ -10,7 +10,8 @@ import time
 
 import uvicorn
 
-from bot.api.app import _runtime, app, revalidate_stale
+from bot.api.app import _runtime, app
+from bot.api.validation import revalidate_stale
 from bot.config import BotConfig
 from bot.logging_setup import UVICORN_LOGGERS, install_redaction
 from bot.runtime import MAX_FAILURES, Runtime

@@ -111,9 +111,9 @@ def test_status_reports_stop_window_stats(api_client) -> None:
 
 
 def test_status_reports_the_risk_state_the_mandate_and_the_new_settings(api_client, monkeypatch) -> None:
-    from bot.api import app as module
+    from bot.api import validation
 
-    monkeypatch.setattr(module, "_run_validation", lambda *_args: None)
+    monkeypatch.setattr(validation, "_run_validation", lambda *_args: None)
     assert ctx.runtime is not None
     body = api_client.get("/bot/status").json()
     assert body["risk_state"] is None and body["mandate"] is None

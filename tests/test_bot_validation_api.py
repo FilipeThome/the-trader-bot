@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from bot.api import app as module
+from bot.api import validation
 from bot.api.app import ctx
 from bot.collector import Series
 from bot.config import BotConfig
@@ -75,9 +76,9 @@ def runs(monkeypatch) -> list[str]:
 
     def run(key: tuple[str, str], strategy_id: str, config: BotConfig, root: Any) -> None:
         started.append(strategy_id)
-        module._update_job(key, status="done", stage="pronto", finished_at=datetime.now(timezone.utc).isoformat())
+        validation._update_job(key, status="done", stage="pronto", finished_at=datetime.now(timezone.utc).isoformat())
 
-    monkeypatch.setattr(module, "_run_validation", run)
+    monkeypatch.setattr(validation, "_run_validation", run)
     return started
 
 
@@ -116,13 +117,13 @@ def test_the_market_filter_refuses_to_validate_without_btc_history(api_client, m
 
 def test_each_run_logs_a_trial_and_dsr_counts_trials_since_the_last_pass(api_client, loader, monkeypatch) -> None:
     calls: list[tuple[str, int, list[float]]] = []
-    real = module.validate_strategy
+    real = validation.validate_strategy
 
     def spy(strategy_id: str, frames: Any, timeframe: str, **kwargs: Any) -> Any:
         calls.append((timeframe, kwargs["trials"], list(kwargs["trial_sharpes"])))
         return real(strategy_id, frames, timeframe, **kwargs)
 
-    monkeypatch.setattr(module, "validate_strategy", spy)
+    monkeypatch.setattr(validation, "validate_strategy", spy)
     store = ctx.runtime.store  # type: ignore[union-attr]
 
     def validate() -> None:
@@ -214,9 +215,9 @@ def test_pair_set_staleness_revalidates_at_most_daily(api_client, runs) -> None:
 
 def test_a_failed_revalidation_waits_before_trying_again(api_client, monkeypatch) -> None:
     def fail(key: tuple[str, str], *_args: Any) -> None:
-        module._update_job(key, status="error", error="x", finished_at=datetime.now(timezone.utc).isoformat())
+        validation._update_job(key, status="error", error="x", finished_at=datetime.now(timezone.utc).isoformat())
 
-    monkeypatch.setattr(module, "_run_validation", fail)
+    monkeypatch.setattr(validation, "_run_validation", fail)
     runtime = _use({"strategies": {**ctx.runtime.config.strategies, "momentum": True}})  # type: ignore[union-attr]
     stale = {**_params("momentum", {"4h": {"passed": True}}), "gate": GATE_VERSION - 1}
     runtime.store.save_strategy({"strategy_id": "momentum", "signal_only": False, "params": stale})
@@ -306,13 +307,13 @@ def test_positions_include_r_mae_mfe(api_client) -> None:
 
 def test_status_trials_n_is_the_n_the_next_validation_reaches(api_client, loader, monkeypatch) -> None:
     seen_n: list[int] = []
-    real = module.validate_strategy
+    real = validation.validate_strategy
 
     def spy(strategy_id: str, frames: Any, timeframe: str, **kwargs: Any) -> Any:
         seen_n.append(kwargs["trials"])
         return real(strategy_id, frames, timeframe, **kwargs)
 
-    monkeypatch.setattr(module, "validate_strategy", spy)
+    monkeypatch.setattr(validation, "validate_strategy", spy)
 
     def status() -> dict[str, Any]:
         return api_client.get("/bot/status").json()

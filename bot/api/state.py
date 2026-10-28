@@ -33,3 +33,7 @@ class BotContext:
         from bot.runtime import mode_root
 
         return Store(mode_root(config) / "bot.sqlite")
+
+
+#: The one context of the process; the app and the validation jobs share it.
+ctx = BotContext()
