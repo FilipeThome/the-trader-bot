@@ -53,7 +53,7 @@ def test_a_reached_trigger_waits_while_the_setup_is_not_ready(tmp_path, monkeypa
     _price(runtime, "BTC/USDT", 100.0)
     runtime.tick()
     runtime.arm_entry("BTC/USDT", "trend", 95.0, 24)
-    monkeypatch.setattr("bot.runtime._setup", lambda *_args: None)
+    monkeypatch.setattr("bot.cycle.scoring._setup", lambda *_args: None)
     _price(runtime, "BTC/USDT", 94.0)
     runtime.tick()
     row = runtime.store.armed_entries()[0]

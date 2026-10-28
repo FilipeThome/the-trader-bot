@@ -182,7 +182,7 @@ def test_a_fixed_position_leaves_only_at_its_target(tmp_path, monkeypatch) -> No
     assert position_id is not None
     runtime.store.update_position(position_id, status="open", qty=1.0, avg_price=100.0)
     # A strategy exit signal never closes a position under the operator's rule.
-    monkeypatch.setattr("bot.runtime._exit_reason", lambda *_a, **_k: "sinal da estratégia")
+    monkeypatch.setattr("bot.cycle.exits._exit_reason", lambda *_a, **_k: "sinal da estratégia")
     now = datetime.now(timezone.utc)
 
     def price(value: float) -> None:

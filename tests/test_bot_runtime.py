@@ -157,7 +157,7 @@ def test_the_cycle_syncs_the_clock_and_settles_positions_before_entries(tmp_path
 
 def test_a_drawdown_halts_once_per_cycle(tmp_path, monkeypatch) -> None:
     runtime, _collector, _executor = _runtime(tmp_path, monkeypatch, ["BTC/USDT", "ETH/USDT", "SOL/USDT"])
-    monkeypatch.setattr("bot.runtime._setup", _setup)
+    monkeypatch.setattr("bot.cycle.scoring._setup", _setup)
     runtime.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": _validated("trend", "trailing")})
     runtime.store.record_day("2026-01-01", net_pnl=-200.0)
     halts: list[str] = []
@@ -187,7 +187,7 @@ def test_a_lower_capital_is_not_a_drawdown(tmp_path, monkeypatch) -> None:
 
 def test_a_real_daily_loss_pauses_until_the_next_utc_day(tmp_path, monkeypatch) -> None:
     runtime, _collector, _executor = _runtime(tmp_path, monkeypatch)
-    monkeypatch.setattr("bot.runtime._setup", _setup)
+    monkeypatch.setattr("bot.cycle.scoring._setup", _setup)
     runtime.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": _validated("trend", "trailing")})
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     runtime.store.record_day(today, net_pnl=-40.0)
@@ -289,7 +289,7 @@ def test_a_manual_close_while_halted_is_refused(tmp_path, monkeypatch) -> None:
 
 def _ready_cycle(tmp_path, monkeypatch, **overrides: Any) -> tuple[Runtime, FakeExecutor]:
     runtime, _collector, executor = _runtime(tmp_path, monkeypatch, **overrides)
-    monkeypatch.setattr("bot.runtime._setup", _setup)
+    monkeypatch.setattr("bot.cycle.scoring._setup", _setup)
     runtime.store.save_strategy(
         {"strategy_id": "trend", "signal_only": False, "params": _validated("trend", "trailing", wins=30, trades=40)}
     )
@@ -354,7 +354,7 @@ def test_a_halt_keeps_the_cycle_off_after_a_manual_trade(tmp_path, monkeypatch) 
 
 
 def test_trailing_skips_the_fixed_target_and_reserves_one_order_per_position(tmp_path, monkeypatch) -> None:
-    from bot.runtime import _exit_reason
+    from bot.cycle.exits import _exit_reason
 
     runtime, _collector, executor = _runtime(tmp_path, monkeypatch)
     for symbol in ("BTC/USDT", "ETH/USDT"):
@@ -408,7 +408,7 @@ def _weak_setup(strategy: Any, symbol: str, *_args: Any) -> Setup:
 @pytest.mark.parametrize(("mode", "flag", "expected"), [("testnet", True, True), ("testnet", False, False), ("production", True, False)])
 def test_test_rows_exist_only_in_the_spot_testnet_test_mode(tmp_path, monkeypatch, mode: str, flag: bool, expected: bool) -> None:
     runtime, _collector, executor = _runtime(tmp_path, monkeypatch, mode=mode, testnet_test_mode=flag, entry_mode="auto")
-    monkeypatch.setattr("bot.runtime._setup", _weak_setup)
+    monkeypatch.setattr("bot.cycle.scoring._setup", _weak_setup)
     runtime.store.set_state("running", True)
     runtime.tick()
     row = runtime.store.opportunities()[0]
@@ -477,10 +477,10 @@ def test_auto_select_runs_hourly_and_keeps_pairs_with_positions(tmp_path, monkey
     )
     calls: list[int] = []
     monkeypatch.setattr(
-        "bot.runtime.rank_promising",
+        "bot.cycle.market.rank_promising",
         lambda _collector, count, listed: calls.append(count) or ["SOL/USDT", "XRP/USDT", "AVAX/USDT"],
     )
-    monkeypatch.setattr("bot.runtime.venue_symbols", lambda _collector, mode: frozenset({"SOL/USDT"}))
+    monkeypatch.setattr("bot.cycle.market.venue_symbols", lambda _collector, mode: frozenset({"SOL/USDT"}))
     start = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
     runtime.tick(now=start)
     runtime.tick(now=start.replace(minute=30))
@@ -497,8 +497,8 @@ def test_a_failing_pair_ranking_never_halts_the_bot(tmp_path, monkeypatch) -> No
     def broken(_collector: Any, _count: int, listed: Any) -> list[str]:
         raise TimeoutError("binance")
 
-    monkeypatch.setattr("bot.runtime.rank_promising", broken)
-    monkeypatch.setattr("bot.runtime.venue_symbols", lambda _collector, mode: None)
+    monkeypatch.setattr("bot.cycle.market.rank_promising", broken)
+    monkeypatch.setattr("bot.cycle.market.venue_symbols", lambda _collector, mode: None)
     start = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
     for hour in range(4):
         assert runtime.tick(now=start.replace(hour=12 + hour))["status"] == "ok"
@@ -507,8 +507,8 @@ def test_a_failing_pair_ranking_never_halts_the_bot(tmp_path, monkeypatch) -> No
 
 def test_auto_select_drops_pairs_the_testnet_cannot_trade_when_nothing_rises(tmp_path, monkeypatch) -> None:
     runtime, _collector, _executor = _runtime(tmp_path, monkeypatch, ["BTC/USDT", "STRK/USDT"], auto_select=True)
-    monkeypatch.setattr("bot.runtime.rank_promising", lambda _collector, count, listed: [])
-    monkeypatch.setattr("bot.runtime.venue_symbols", lambda _collector, mode: frozenset({"BTC/USDT", "ETH/USDT"}))
+    monkeypatch.setattr("bot.cycle.market.rank_promising", lambda _collector, count, listed: [])
+    monkeypatch.setattr("bot.cycle.market.venue_symbols", lambda _collector, mode: frozenset({"BTC/USDT", "ETH/USDT"}))
     runtime.tick()
     assert runtime.config.symbols == ["BTC/USDT"]
 
@@ -557,12 +557,12 @@ def test_the_cycle_exits_a_momentum_position_when_ema20_falls_under_ema50(tmp_pa
 def test_auto_select_waits_out_weight_pressure_and_survives_a_bad_timestamp(tmp_path, monkeypatch) -> None:
     runtime, _collector, _executor = _runtime(tmp_path, monkeypatch, auto_select=True)
     calls: list[int] = []
-    monkeypatch.setattr("bot.runtime.rank_promising", lambda _collector, count, listed: calls.append(count) or ["SOL/USDT"])
-    monkeypatch.setattr("bot.runtime.venue_symbols", lambda _collector, mode: None)
-    monkeypatch.setattr("bot.runtime.weight_pressure", lambda: True)
+    monkeypatch.setattr("bot.cycle.market.rank_promising", lambda _collector, count, listed: calls.append(count) or ["SOL/USDT"])
+    monkeypatch.setattr("bot.cycle.market.venue_symbols", lambda _collector, mode: None)
+    monkeypatch.setattr("bot.cycle.market.weight_pressure", lambda: True)
     runtime.tick()
     assert calls == []
-    monkeypatch.setattr("bot.runtime.weight_pressure", lambda: False)
+    monkeypatch.setattr("bot.cycle.market.weight_pressure", lambda: False)
     runtime.store.set_state("auto_select_at", "not a time")
     assert runtime.tick()["status"] == "ok" and runtime.failures == 0
 
@@ -571,7 +571,7 @@ def test_auto_select_waits_out_weight_pressure_and_survives_a_bad_timestamp(tmp_
 def test_testnet_auto_trading_takes_test_rows_only_with_the_test_mode(tmp_path, monkeypatch, test_mode: bool, expected: str) -> None:
     runtime, _collector, executor = _runtime(tmp_path, monkeypatch, entry_mode="auto", testnet_test_mode=test_mode)
     # No validated strategy: the ready setup is a test row in test mode, signal only otherwise.
-    monkeypatch.setattr("bot.runtime._setup", _setup)
+    monkeypatch.setattr("bot.cycle.scoring._setup", _setup)
     runtime.store.set_state("running", True)
     runtime.tick()
     assert expected in executor.events
@@ -604,7 +604,7 @@ def test_a_restart_after_a_halt_counts_failures_from_zero(tmp_path, monkeypatch)
 
 
 def test_strategies_decide_on_closed_bars_only(tmp_path, monkeypatch) -> None:
-    from bot.runtime import _setup
+    from bot.cycle.scoring import _setup
 
     seen: list[int] = []
 
@@ -635,8 +635,8 @@ def test_auto_select_keeps_hand_edits_of_bot_json_and_writes_it_whole(tmp_path, 
     raw["gates"]["g1"] = True
     raw["entry_mode"] = "auto"
     path.write_text(json.dumps(raw), encoding="utf-8")
-    monkeypatch.setattr("bot.runtime.rank_promising", lambda _collector, count, listed: ["SOL/USDT"])
-    monkeypatch.setattr("bot.runtime.venue_symbols", lambda _collector, mode: None)
+    monkeypatch.setattr("bot.cycle.market.rank_promising", lambda _collector, count, listed: ["SOL/USDT"])
+    monkeypatch.setattr("bot.cycle.market.venue_symbols", lambda _collector, mode: None)
     runtime.tick()
     saved = BotConfig.load()
     assert saved.symbols == ["SOL/USDT"] and saved.gates["g1"] is True and saved.entry_mode == "auto"
@@ -708,8 +708,8 @@ def test_a_ranking_that_finishes_after_the_panel_changed_the_pairs_writes_nothin
             runtime.retired = True
         return ["SOL/USDT"]
 
-    monkeypatch.setattr("bot.runtime.rank_promising", rank_while_the_panel_rebinds)
-    monkeypatch.setattr("bot.runtime.venue_symbols", lambda _collector, mode: None)
+    monkeypatch.setattr("bot.cycle.market.rank_promising", rank_while_the_panel_rebinds)
+    monkeypatch.setattr("bot.cycle.market.venue_symbols", lambda _collector, mode: None)
     assert runtime.tick()["status"] == "skipped"
     assert BotConfig.load().symbols == ["ETH/USDT"]
 
@@ -722,7 +722,7 @@ def _failing(snapshot: MarketSnapshot, symbols: set[str]) -> MarketSnapshot:
 
 def test_a_failed_pair_without_a_position_only_skips_that_pair(tmp_path, monkeypatch) -> None:
     runtime, collector, _executor = _runtime(tmp_path, monkeypatch, ["BTC/USDT", "ETH/USDT"])
-    monkeypatch.setattr("bot.runtime._setup", _setup)
+    monkeypatch.setattr("bot.cycle.scoring._setup", _setup)
     inner = collector.refresh
     collector.refresh = lambda symbols: _failing(inner(symbols), {"ETH/USDT"})  # type: ignore[method-assign]
     runtime.store.set_state("running", True)
@@ -754,9 +754,9 @@ def test_a_setup_seen_every_cycle_is_recorded_once_until_it_changes(tmp_path, mo
     rows = [row for row in runtime.store.decisions() if row.get("strategy") == "trend" and row.get("symbol") == "BTC/USDT"]
     assert len(rows) == 1
     # The setup disappears, then comes back: that is a new decision.
-    monkeypatch.setattr("bot.runtime._setup", lambda *_args: None)
+    monkeypatch.setattr("bot.cycle.scoring._setup", lambda *_args: None)
     runtime.tick()
-    monkeypatch.setattr("bot.runtime._setup", _setup)
+    monkeypatch.setattr("bot.cycle.scoring._setup", _setup)
     runtime.tick()
     rows = [row for row in runtime.store.decisions() if row.get("strategy") == "trend" and row.get("symbol") == "BTC/USDT"]
     assert len(rows) == 2
@@ -865,9 +865,9 @@ def _day_ready(tmp_path, monkeypatch, wins: int) -> tuple[Runtime, FakeExecutor]
     index = pd.DatetimeIndex([pd.Timestamp(now).floor("15min")])
     bars = pd.DataFrame({"open": [100.0], "high": [101.0], "low": [99.0], "close": [100.0], "volume": [10.0]}, index=index)
     collector.snapshot.candles[("BTC/USDT", "15m")] = Series(bars, now, "test")
-    monkeypatch.setattr("bot.runtime.in_quiet_hours", lambda *_a: False)
+    monkeypatch.setattr("bot.cycle.scoring.in_quiet_hours", lambda *_a: False)
     monkeypatch.setattr(
-        "bot.runtime._setup",
+        "bot.cycle.scoring._setup",
         lambda *_a: Setup(
             "intraday_momentum", "BTC/USDT", "15m", "Comprar", 1.0, 0.015, 0.004, 0.01, 0.015, "rompimento", "trend_up",
             confidence=0.9,
@@ -915,7 +915,7 @@ def _count_limits(monkeypatch) -> list[int]:
 def _three_ready(tmp_path, monkeypatch, **overrides: Any) -> tuple[Runtime, FakeExecutor]:
     """Three pairs validated together, each with a ready trend row."""
     runtime, _collector, executor = _runtime(tmp_path, monkeypatch, _THREE, **overrides)
-    monkeypatch.setattr("bot.runtime._setup", _setup)
+    monkeypatch.setattr("bot.cycle.scoring._setup", _setup)
     params = _validated("trend", "trailing", symbols=_THREE, wins=30, trades=40)
     runtime.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": params})
     runtime.store.set_state("running", True)
@@ -942,7 +942,7 @@ def test_one_tick_reads_the_mandate_once_in_manual_mode_with_three_ready_rows(tm
 def test_score_writes_nothing_and_its_effects_carry_the_scored_decision(tmp_path, monkeypatch) -> None:
     # Validated on BTC only: the ETH row is refused as signal only and counted as a violation avoided.
     runtime, _collector, _executor = _runtime(tmp_path, monkeypatch, ["BTC/USDT", "ETH/USDT"])
-    monkeypatch.setattr("bot.runtime._setup", _setup)
+    monkeypatch.setattr("bot.cycle.scoring._setup", _setup)
     params = _validated("trend", "trailing", wins=30, trades=40)
     runtime.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": params})
     # A slippage block left from an earlier cycle: this cycle lifts it.
