@@ -218,4 +218,44 @@ Segurança (S), arquitetura (R) e validade quantitativa (Q), todos com decisão 
 
 ## 10. Status da implementação
 
-A preencher depois da implementação.
+Data: 2026-10-28. Todas as ondas foram implementadas, cada uma por um implementador, com um test engineer e dois ou três reviewers independentes antes do commit. Todas foram aceitas na primeira rodada, menos a onda 1, que precisou de uma correção (um erro de compra parada que devolvia a URL assinada sem redação). A suíte passou de 812 para 869 testes; o mypy estrito cobre `bot.cycle`, `bot.advisor` e `bot.logging_setup`.
+
+| Onda | Commit | Status |
+|---|---|---|
+| Desenho | `f58fb62` | aprovado com mudanças (seção 9) |
+| 1 | `74e48c1` | implementado |
+| 2 | `23ed701`, `203620c`, `d218ba1` | implementado (`runtime.py` de 2264 para 776 linhas, `app.py` de 1543 para 1088) |
+| 3 | `0dbc8cb` | implementado, `GATE_VERSION` 3 |
+| 4 | `a738ec7`, `ac77a2d` | implementado; painel conferido num par API e Vite de rascunho |
+| Revisão final | `64845d6` | 6 defeitos confirmados e corrigidos |
+
+### Desvios em relação ao desenho
+
+- **1.4.** O texto do modo só reduzir passou de "10.0%" para "10%": as duas formas viraram uma.
+- **4.3.** A extração para `bot/cycle` saiu num commit só, não um por módulo: é uma mudança mecânica, com a suíte verde e sem asserção alterada. `CycleContext` e os tipos dos efeitos ficam em `bot/cycle/context.py`, para não haver import circular. Os robôs são uma dataclass `Robots` montada a cada chamada com os colaboradores do `Runtime`.
+- **4.2.** `_score` também devolve um efeito `forget` para o `_decided` em memória, então não muda estado nenhum do `Runtime`.
+- **4.4.** `ctx` foi para `bot/api/state.py`, para `validation.py` não importar `app.py`.
+- **3.2.** Os trades que `classify` recusaria ficam na população geral do gate como replay, sem disputar vaga; só os aceitos disputam e alimentam a pausa e a trava. Assim 3.5 continua sem mudar o gate.
+- **3.4.** O universo líquido vem do ranking horário (`bot_state.auto_select_universe`); sem ranking ainda, a validação lê o universo ela mesma.
+- **6.2.** O prompt leva um resumo dos indicadores (últimos valores, níveis relativos, 12 retornos de 1 h), não as 120 velas, para caber nos ~2.500 tokens de 6.8. A tabela de preços usa os preços de pico da página oficial lidos em 2026-10-28.
+- **6.4.** Ligar `require_verdict` pede confirmação no painel.
+- **6.5.** As linhas de calibração também mostram `abstain` e quantas aguardam.
+
+### Revisão final da branch
+
+Uma revisão independente de toda a diferença, em seis frentes, teve cada achado testado por dois verificadores que tentavam refutá-lo. Dos 13 achados, 9 sobreviveram, num total de 6 defeitos distintos. Nenhum dimensionava ou enviava uma ordem; todos foram corrigidos com teste de regressão em `64845d6`:
+
+1. **Olhar o futuro no prompt.** Uma consulta atrasada via velas depois do sinal, e a calibração mede o R a partir do sinal. O prompt agora usa só velas fechadas até o fechamento do sinal.
+2. **Cache entre modos.** Um veredito do testnet podia valer em produção depois da troca de modo. A chave do cache leva a identidade do store, e o executor só liga um `advice_log` do próprio store.
+3. **Pergunta repetida depois de reiniciar.** `advice_log` é único por sinal; o veredito gravado é relido, sem nova chamada, e a calibração o conta uma vez.
+4. **Orçamento por modo.** O orçamento soma os dois stores e toda tentativa cobrada, inclusive a resposta vazia.
+5. **Linhas que nunca resolviam.** Um par que saiu do snapshot resolve com velas buscadas por tempo; sem dado depois de um dia de folga, a linha expira e é contada à parte.
+6. **Limiares fora da chave.** Mudar `score_threshold`, `cost_multiple` ou `min_reward_risk` deixa a validação velha.
+
+Quatro achados foram refutados, entre eles que o reenvio do -1021 pularia a checagem do mandato.
+
+### Para o operador
+
+- Ao reiniciar com este código, toda validação fica velha (gate v3) e roda de novo na partida; até lá as linhas ficam só sinal.
+- O consultor vem desligado. Para usar: grave a chave com `python -m bot.ops advisor-key`, ligue `shadow` em Controles e acompanhe a calibração em Desempenho antes de ligar `filter`.
+- O bot no Docker continua com o código antigo até ser reconstruído.
