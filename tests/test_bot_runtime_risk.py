@@ -82,7 +82,7 @@ def test_10pct_drawdown_enters_reducing_exits_still_run_no_entries(tmp_path, mon
     changes = _kinds(events, "risk_state")
     assert [(event["from"], event["to"]) for event in changes] == [("normal", "reducing")]
     # The executor reads the same record: every buy is refused at the choke point.
-    assert "modo só reduzir: drawdown de 10.0%" in str(Executor(runtime.store, profile_for(runtime.config))._reducing())
+    assert "modo só reduzir: drawdown de 10%" in str(Executor(runtime.store, profile_for(runtime.config))._buy_block())
 
 
 def test_15pct_drawdown_halts(tmp_path, monkeypatch) -> None:

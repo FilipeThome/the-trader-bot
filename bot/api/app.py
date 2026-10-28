@@ -40,6 +40,7 @@ from bot.exchange.weight import weight_pressure
 from bot.features import build_features, ensure_chart_data
 from bot.instances import DcaParams, GridParams, Kind
 from bot.live.mandate.store import load_mandate
+from bot.logging_setup import redact
 from bot.mandate_io import commit_mandate_for, mandate_caps_for, mandate_is_restricted
 from bot.strategies.day import DAY, DAY_WIN_RATE_MARGIN
 from bot.strategies.trailing import TRAIL
@@ -1051,7 +1052,7 @@ def _run_validation(key: tuple[str, str], strategy_id: str, config: BotConfig, r
             finished_at=datetime.now(timezone.utc).isoformat(),
         )
     except (WeightPressure, _HistoryMissing) as exc:
-        _update_job(key, status="error", error=str(exc), finished_at=datetime.now(timezone.utc).isoformat())
+        _update_job(key, status="error", error=redact(exc), finished_at=datetime.now(timezone.utc).isoformat())
     except Exception as exc:  # noqa: BLE001 - a failed job is reported in /bot/status and the log
         logger.exception("validation of %s failed", strategy_id)
         _update_job(

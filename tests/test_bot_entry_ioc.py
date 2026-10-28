@@ -218,9 +218,12 @@ def test_executor_refuses_buys_in_reducing(tmp_path, venue) -> None:
     executor = _executor(tmp_path)
     assert executor.open_instance(1, "grid", "BTC/USDT", Decimal("20"), Decimal("90"))["status"] == "ok"
     held = executor.store.open_positions()[0]
-    executor.store.set_state("risk_state", {"level": "reducing", "since": "2026-10-20T00:00:00+00:00", "drawdown": 0.1, "reason": "dd"})
+    # The stored reason is the canonical refusal (risk.buy_block), the same words the cycle shows.
+    reason = "modo só reduzir: drawdown de 10% desde o pico (limite de 10%); só saídas"
+    executor.store.set_state(
+        "risk_state", {"level": "reducing", "since": "2026-10-20T00:00:00+00:00", "drawdown": 0.1, "reason": reason}
+    )
     sent = len(venue.calls)
-    reason = "modo só reduzir: drawdown de 10.0%"
     decision = executor.enter(_ready(symbol="ETH/USDT"))
     assert decision["decision"] == "bloqueado" and decision["reason"] == reason
     manual = executor.enter(_ready(symbol="ETH/USDT"), manual=True)

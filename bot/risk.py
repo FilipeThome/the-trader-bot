@@ -96,6 +96,46 @@ class RiskState:
     pause_day: bool = False
 
 
+#: ``buy_block`` reasons. The clock one is also the executor's for a single robot buy.
+CLOCK_BUY_BLOCK = "relógio fora de 1s — só cancelamentos e saídas"
+PAUSE_BUY_BLOCK = "pausado até o próximo dia UTC"
+REDUCING_BUY_BLOCK = "modo só reduzir"
+
+
+def buy_block(
+    stored_state: RiskState | Mapping[str, Any] | None,
+    paused_until: Any,
+    now: datetime,
+    *,
+    clock_blocked: bool = False,
+) -> str | None:
+    """Why no buy of any kind may go now, or None. Sales, stops and the sync go on regardless.
+
+    The one answer to "may the bot buy now?", so the cycle, the robots and the executor's
+    choke point refuse with the same words. ``stored_state`` is the cycle's ``RiskState`` or the
+    ``bot_state.risk_state`` record the last cycle stored (it stores a halt as reducing);
+    ``paused_until`` is ``bot_state.paused_until``, compared with ``now`` (the cycle's moment
+    in the runtime, the wall clock at order time in the executor). First match wins: the clock,
+    then the level (halt or reducing, and a cycle's daily-loss pause), then a stored pause.
+    """
+    if clock_blocked:
+        return CLOCK_BUY_BLOCK
+    if isinstance(stored_state, RiskState):
+        if stored_state.level in ("halt", "reducing") or stored_state.pause_day:
+            return stored_state.reason or REDUCING_BUY_BLOCK
+    elif isinstance(stored_state, Mapping) and stored_state.get("level") in ("halt", "reducing"):
+        reason = stored_state.get("reason")
+        if isinstance(reason, str) and reason:
+            return reason
+        drawdown = stored_state.get("drawdown")
+        if isinstance(drawdown, (int, float)) and not isinstance(drawdown, bool) and math.isfinite(drawdown):
+            return f"{REDUCING_BUY_BLOCK}: drawdown de {drawdown:.1%}"
+        return REDUCING_BUY_BLOCK
+    if isinstance(paused_until, str) and paused_until > now.isoformat():
+        return PAUSE_BUY_BLOCK
+    return None
+
+
 def correlation(left: list[float], right: list[float]) -> float:
     n = min(len(left), len(right))
     if n < 5:

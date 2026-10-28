@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import math
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -10,10 +11,13 @@ import pytest
 from bot.config import RiskLimits
 from bot.evaluator import Opportunity
 from bot.risk import (
+    CLOCK_BUY_BLOCK,
+    PAUSE_BUY_BLOCK,
     SIZE_LIMITS,
     RiskManager,
     RiskState,
     allocate,
+    buy_block,
     mc_drawdown,
     mc_drawdown_ok,
     planned_notional,
@@ -581,3 +585,54 @@ def test_without_returns_allocation_is_unchanged() -> None:
     assert [row.symbol for row in first] == [row.symbol for row in second] == ["ETH/USDT", "SOL/USDT", "DOGE/USDT"]
     assert all(row.cluster is None for row in plain + explicit)
     assert [row.size_usd for row in plain] == [row.size_usd for row in explicit] == [500.0, 500.0, 500.0]
+
+
+# -- buy_block: the one answer to "may the bot buy now?" -------------------------------------
+
+_NOW = datetime(2026, 10, 28, 12, 0, tzinfo=timezone.utc)
+_REDUCING = "modo só reduzir: drawdown de 11% desde o pico (limite de 10%); só saídas"
+_HALT = "drawdown de 15% desde o pico: parada no limite de 15%"
+_LEVELS: dict[str, Any] = {
+    "none": None,
+    "normal": {"level": "normal", "drawdown": 0.02, "reason": ""},
+    "cautious": {"level": "cautious", "drawdown": 0.06, "reason": "modo cauteloso: drawdown de 6%"},
+    "reducing": {"level": "reducing", "drawdown": 0.11, "reason": _REDUCING},
+    "reducing_unlabelled": {"level": "reducing", "drawdown": 0.12},
+    "reducing_bare": {"level": "reducing"},
+    "halt": {"level": "halt", "drawdown": 0.15, "reason": _HALT},
+    "cycle_normal": RiskState("normal", 0.0, 1.0, None, ""),
+    "cycle_reducing": RiskState("reducing", 0.11, 0.0, 0, _REDUCING),
+    "cycle_halt": RiskState("halt", 0.15, 0.0, 0, _HALT),
+    "cycle_daily_loss": RiskState("normal", 0.0, 1.0, None, "perda diária de 2% — pausa até o próximo dia UTC", pause_day=True),
+}
+#: The block each level gives on its own (no pause, clock in sync).
+_LEVEL_BLOCK: dict[str, str | None] = {
+    "none": None,
+    "normal": None,
+    "cautious": None,
+    "reducing": _REDUCING,
+    "reducing_unlabelled": "modo só reduzir: drawdown de 12.0%",
+    "reducing_bare": "modo só reduzir",
+    "halt": _HALT,
+    "cycle_normal": None,
+    "cycle_reducing": _REDUCING,
+    "cycle_halt": _HALT,
+    "cycle_daily_loss": "perda diária de 2% — pausa até o próximo dia UTC",
+}
+_PAUSES = {"none": None, "past": "2026-10-28T00:00:00+00:00", "running": "2026-10-29T00:00:00+00:00", "garbage": 3}
+
+
+@pytest.mark.parametrize("clock", [False, True])
+@pytest.mark.parametrize("pause", list(_PAUSES))
+@pytest.mark.parametrize("level", list(_LEVELS))
+def test_buy_block_is_the_clock_then_the_level_then_the_pause(level: str, pause: str, clock: bool) -> None:
+    reason = buy_block(_LEVELS[level], _PAUSES[pause], _NOW, clock_blocked=clock)
+    if clock:
+        expected = CLOCK_BUY_BLOCK
+    elif _LEVEL_BLOCK[level] is not None:
+        expected = _LEVEL_BLOCK[level]
+    elif pause == "running":
+        expected = PAUSE_BUY_BLOCK
+    else:
+        expected = None
+    assert reason == expected

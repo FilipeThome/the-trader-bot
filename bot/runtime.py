@@ -75,6 +75,7 @@ from bot.instances import (
 )
 from bot.live.halt import clear_halt, halt_flag_set, trip_halt
 from bot.live.mandate.store import load_mandate
+from bot.logging_setup import redact
 from bot.markets import merge_symbols, rank_promising, venue_symbols
 from bot.paths import base_runtime_root
 from bot.reports import append_ledger
@@ -85,6 +86,7 @@ from bot.risk import (
     RiskState,
     allocate,
     breakeven_win_rate,
+    buy_block,
     mc_drawdown,
     mc_drawdown_ok,
     open_risk,
@@ -304,8 +306,10 @@ class Runtime:
         """Stop the cycle, flatten when asked, then write the sticky HALT flag.
 
         Without ``flatten``, the committed mandate's ``flatten_on_halt`` decides when a
-        mandate is on file, else the config's (D23).
+        mandate is on file, else the config's (D23). The reason is redacted first: it may carry
+        an exception's text (a signed URL), and it reaches the flag, the store, the ledger and the panel.
         """
+        reason = redact(reason)
         with self.lock:
             self.store.set_state("running", False)
             # Resting buys come off the book before the flag, while the gate still lets the stop
@@ -347,7 +351,7 @@ class Runtime:
             results = self.executor.cancel_resting_buys()
         except Exception as exc:  # noqa: BLE001 - the stop or the halt must go on
             logger.exception("cancel of the resting buys failed")
-            results = [{"status": "error", "error": f"{type(exc).__name__}: {exc}"}]
+            results = [{"status": "error", "error": redact(f"{type(exc).__name__}: {exc}")}]
         if results:
             failed = [item for item in results if item.get("status") != "ok"]
             self._ledger("resting_buy", {"event": "cancel_all", "cause": cause, "results": results, "failed": len(failed)})
@@ -381,11 +385,14 @@ class Runtime:
             except UnprotectedPosition as exc:
                 logger.error("unprotected position: %s", exc)
                 self.halt(f"posição sem proteção: {exc}", flatten=False)
-                return {"status": "error", "error": str(exc)}
+                return {"status": "error", "error": redact(exc)}
             except Exception as exc:  # noqa: BLE001 - counted, logged and halted on repeat
                 logger.exception("cycle failed")
                 self.failures += 1
-                self._ledger("tick_error", {"error": type(exc).__name__, "failures": self.failures})
+                self._ledger(
+                    "tick_error",
+                    {"error": type(exc).__name__, "detail": redact(exc)[:300], "failures": self.failures},
+                )
                 if self.failures >= MAX_FAILURES:
                     self.halt(f"{MAX_FAILURES} falhas seguidas no ciclo: {type(exc).__name__}")
                 return {"status": "error", "error": type(exc).__name__}
@@ -434,7 +441,7 @@ class Runtime:
             )
         except UnprotectedPosition as exc:
             self.halt(f"posição sem proteção: {exc}", flatten=False)
-            return {"results": [{"decision": "bloqueado", "reason": str(exc)}], "cycle_started": False}
+            return {"results": [{"decision": "bloqueado", "reason": redact(exc)}], "cycle_started": False}
         started = False
         entered = any(item.get("decision") in ("operar", "pendente") for item in results)
         if entered and self.config.entry_mode == "manual" and not self.running:
@@ -523,7 +530,7 @@ class Runtime:
                 step = self._step_instance(instance, price, now)
             except UnprotectedPosition as exc:
                 self.halt(f"posição sem proteção: {exc}", flatten=False)
-                return {"status": "error", "error": str(exc), "id": instance_id}
+                return {"status": "error", "error": redact(exc), "id": instance_id}
             started = False
             if self.config.entry_mode == "manual" and not self.running:
                 started = self.start().get("status") == "ok"
@@ -546,7 +553,7 @@ class Runtime:
             outcome = self._wind_down(instance_id, reason)
         except UnprotectedPosition as exc:
             self.halt(f"posição sem proteção: {exc}", flatten=False)
-            return {"status": "error", "error": str(exc)}
+            return {"status": "error", "error": redact(exc)}
         current = self.store.instance(instance_id) or {}
         return {"status": "ok", "instance_status": current.get("status"), "outcome": outcome}
 
@@ -711,17 +718,8 @@ class Runtime:
         pause the last cycle stored are read and nothing is written: only the cycle, on its
         priced snapshot, measures and stores the risk level and the day's start.
         """
-        if clock_blocked:
-            return "relógio fora de 1s — só cancelamentos e saídas"
-        if state is not None:
-            if state.level in ("halt", "reducing") or state.pause_day:
-                return state.reason
-        else:
-            stored = self.store.get_state("risk_state")
-            if isinstance(stored, dict) and stored.get("level") in ("halt", "reducing"):
-                reason = stored.get("reason")
-                return reason if isinstance(reason, str) and reason else "modo só reduzir"
-        return self._paused(moment)
+        level = state if state is not None else self.store.get_state("risk_state")
+        return buy_block(level, self.store.get_state("paused_until"), moment, clock_blocked=clock_blocked)
 
     def _trade_limit(self, moment: datetime) -> str | None:
         """New inventory (a DCA round, a grid restart) counts as a trade, like a strategy entry."""
@@ -1091,7 +1089,7 @@ class Runtime:
                 return self.executor.exit_position(position_id, "fechamento manual")
             except UnprotectedPosition as exc:
                 self.halt(f"posição sem proteção: {exc}", flatten=False)
-                return {"status": "error", "error": str(exc)}
+                return {"status": "error", "error": redact(exc)}
 
     # -- cycle ---------------------------------------------------------------
 
@@ -1880,10 +1878,7 @@ class Runtime:
 
     def _paused(self, moment: datetime) -> str | None:
         """The daily-loss pause still running at ``moment``, as its reason, or None."""
-        until = self.store.get_state("paused_until")
-        if isinstance(until, str) and until > moment.isoformat():
-            return "pausado até o próximo dia UTC"
-        return None
+        return buy_block(None, self.store.get_state("paused_until"), moment)
 
     def _ledger(self, kind: str, payload: dict[str, Any]) -> None:
         try:
