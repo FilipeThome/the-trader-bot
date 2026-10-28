@@ -550,7 +550,7 @@ class Runtime:
         self._decay(moment)
         # Read after the robots acted, so scoring sees the book they left.
         context = self._context(
-            moment, snapshot, cash, state=state, takers=collected.takers, limits=limits, advice=self._advice_snapshot()
+            moment, snapshot, cash, state=state, takers=collected.takers, limits=limits, advice=self._advice_snapshot(moment)
         )
         opportunities, effects = self._score(context)
         # Written before protect, the hit-rate floor and allocation change the rows: the
@@ -644,10 +644,17 @@ class Runtime:
         """The advisor when the config turns it on, else None."""
         return self.advisor if self.config.advisor.mode != "off" else None
 
-    def _advice_snapshot(self) -> dict[AdviceKey, AdviceState]:
-        """The advisor's cache, copied under the cycle's lock: a dict copy, no wait and no network."""
+    def _advice_snapshot(self, moment: datetime) -> dict[AdviceKey, AdviceState]:
+        """The advisor's cache, copied under the cycle's lock: a dict copy, no wait and no network.
+
+        The verdicts this store logged before a restart are seeded first (``Advisor.recall``, one
+        local read per process), so scoring sizes them; the entry gate and the size then read the
+        same verdict."""
         advisor = self._advising()
-        return advisor.snapshot() if advisor is not None else {}
+        if advisor is None:
+            return {}
+        advisor.recall(self.store, moment)
+        return advisor.snapshot()
 
     def _consult(self, opportunities: list[Opportunity], context: CycleContext) -> dict[AdviceKey, AdviceState]:
         """Queue a request for each ready strategy row whose signal bar was not judged yet.

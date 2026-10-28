@@ -29,7 +29,9 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # Binance's HMAC of a signed request, in a URL or a form body.
     (re.compile(r"(?i)\b(signature=)" + _VALUE), r"\1" + _REDACTED),
     # Any ``...api_key``/``...apikey`` label, prefixed or not: deepseek_api_key=, X-MBX-APIKEY: ...
-    (re.compile(r"(?i)([A-Za-z0-9_]*api[_-]?key[\"']?\s*[:=]\s*[\"']?)" + _VALUE), r"\1" + _REDACTED),
+    # The match starts at ``api``: only the value is replaced, so the prefix needs no class of
+    # its own, and an unbounded class before the literal backtracks quadratically on a long word.
+    (re.compile(r"(?i)(api[_-]?key[\"']?\s*[:=]\s*[\"']?)" + _VALUE), r"\1" + _REDACTED),
     # ``Bearer <token>``, whatever label precedes it.
     (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/-]+=*"), r"\1" + _REDACTED),
     # An ``sk-`` key (DeepSeek, OpenAI) shorter than ``redact_text``'s bound.
@@ -39,13 +41,37 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 #: Loggers uvicorn configures with handlers of their own (``propagate`` off for access).
 UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access")
 
+#: Longest text ``redact`` scans. An access line carries the request path a client chose, so the
+#: patterns never run on more than this: a longer text keeps its head and the whole lines of its
+#: tail (where a traceback ends), with a marker of what was left out between them.
+MAX_REDACT_CHARS = 8192
+_HEAD_CHARS = 4000
+_TAIL_CHARS = 4000
+
 
 def redact(text: object) -> str:
-    """``text`` as a string with every credential-shaped value replaced. Never raises on input."""
-    clean = redact_text(text)
+    """``text`` as a string with every credential-shaped value replaced, at most about
+    ``MAX_REDACT_CHARS`` long (``_bounded``). Never raises on input."""
+    clean = redact_text(_bounded("" if text is None else str(text)))
     for pattern, replacement in _PATTERNS:
         clean = pattern.sub(replacement, clean)
     return clean
+
+
+def _bounded(text: str) -> str:
+    """``text`` cut to its head, a marker and its tail from the tail's first line break on.
+
+    A value cut at the head's end is followed by the marker's space, so the patterns still see
+    its label and redact what is left of it. The tail starts at a line boundary, never inside a
+    value whose label was cut away; a single line longer than the bound keeps only its head.
+    """
+    if len(text) <= MAX_REDACT_CHARS:
+        return text
+    head = text[:_HEAD_CHARS]
+    tail = text[-_TAIL_CHARS:]
+    newline = tail.find("\n")
+    tail = tail[newline:] if newline >= 0 else ""
+    return f"{head} [... {len(text) - len(head) - len(tail)} caracteres omitidos ...]{tail}"
 
 
 class RedactingFormatter(logging.Formatter):

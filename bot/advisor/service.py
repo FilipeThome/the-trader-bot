@@ -10,7 +10,9 @@ one call per signal and mode, not per cycle. The store (``Store.identity``) is i
 one advisor serves both modes: a testnet verdict never gates or links a production row. Each
 request carries the ``Store`` and the ledger writer of the runtime that asked, so a verdict lands
 in the database of the mode that asked even after a mode switch. A signal that store already
-logged (asked before a restart) is read back from ``advice_log`` instead of asked again.
+logged (asked before a restart) is read back from ``advice_log`` instead of asked again: the
+cycle seeds the cache with the store's recent verdicts before it copies it (``recall``), so
+scoring sizes a logged ``reduce`` exactly as one that arrived in this process.
 
 The daily budget is per DeepSeek key, so it sums ``advisor_usage_daily`` over both mode stores
 (``combined_usage``) before each call, under a lock of its own: it survives a restart and a mode
@@ -50,6 +52,8 @@ QUEUE_SIZE = 32
 CACHE_TTL = timedelta(days=2)
 #: The counterfactual labels are refreshed at most this often.
 RESOLVE_EVERY = timedelta(hours=1)
+#: The ``advice_log`` fields of one signal, in ``AdviceKey`` order after the store identity.
+_SIGNAL_FIELDS = ("symbol", "strategy", "timeframe", "signal_close_at", "prompt_version", "model")
 
 
 def advice_key(scope: str, symbol: str, strategy: str, timeframe: str, signal_close_at: str, model: str) -> AdviceKey:
@@ -145,7 +149,8 @@ class Advisor:
         self._cache: dict[AdviceKey, AdviceState] = {}
         self._outstanding = 0
         self._thread: threading.Thread | None = None
-        self._closed = False
+        #: Stores (``Store.identity``) whose recent ``advice_log`` rows were read into the cache.
+        self._recalled: set[str] = set()
         self._resolved_at: datetime | None = None
         self.last_ok: str | None = None
         self.last_error: str | None = None
@@ -162,21 +167,17 @@ class Advisor:
 
     def request(self, request: AdviceRequest) -> AdviceState | None:
         """Queue ``request`` without waiting. Returns its key's state (pending, or what is already
-        known), or None when the queue is full or the advisor closed: that row has no verdict.
+        known), or None when the queue is full: that row has no verdict.
 
         A signal the request's store already logged (asked before a restart) seeds the cache from
         that row: no call and no budget. The read is one indexed row, outside the advisor's lock.
         """
         with self._lock:
-            if self._closed:
-                return None
             known = self._cache.get(request.key)
             if known is not None:
                 return known
         logged = self._logged(request)
         with self._lock:
-            if self._closed:
-                return None
             known = self._cache.get(request.key)
             if known is not None:
                 return known
@@ -195,6 +196,29 @@ class Advisor:
                 self._thread = threading.Thread(target=self._run, name="advisor", daemon=True)
                 self._thread.start()
             return state
+
+    def recall(self, store: Store, now: datetime) -> None:
+        """Seed the cache with the verdicts ``store`` logged within ``CACHE_TTL``, once per store.
+
+        After a restart the cache is empty. Scoring sizes a ``reduce`` from the cycle's cache copy,
+        so a logged verdict read back only when its row is queued (``request``) would gate the row
+        without shrinking it. One local read, under the cycle's lock like the cache copy; a failed
+        read is tried again on the next cycle.
+        """
+        scope = store.identity
+        with self._lock:
+            if scope in self._recalled:
+                return
+        try:
+            rows = store.advice_since((now - CACHE_TTL).isoformat())
+        except sqlite3.Error:
+            logger.exception("advice_log read failed")
+            return
+        with self._lock:
+            self._recalled.add(scope)
+            for row in rows:
+                key = cast(AdviceKey, (scope, *(str(row[name]) for name in _SIGNAL_FIELDS)))
+                self._cache.setdefault(key, _done(row, scope))
 
     def maybe_resolve(self, store: Store, snapshot: MarketSnapshot, moment: datetime) -> int:
         """Label the unresolved ``advice_log`` rows (``calibration.resolve_pending``) at most once
@@ -224,26 +248,16 @@ class Advisor:
         }
 
     def wait_idle(self, timeout: float) -> bool:
-        """Wait until every queued request was processed. For tests and shutdown, never the cycle."""
+        """Wait until every queued request was processed. For tests only: the cycle never waits,
+        and the worker is a daemon thread that ends with the process."""
         with self._idle:
             return self._idle.wait_for(lambda: self._outstanding == 0, timeout)
-
-    def close(self) -> None:
-        """Stop taking requests; the worker ends after the one it is on."""
-        with self._lock:
-            self._closed = True
 
     # -- the worker's side ------------------------------------------------------
 
     def _run(self) -> None:
         while True:
-            try:
-                request = self._queue.get(timeout=1.0)
-            except queue.Empty:
-                with self._lock:
-                    if self._closed:
-                        return
-                continue
+            request = self._queue.get()
             try:
                 self.process(request)
             except Exception as exc:  # noqa: BLE001 - one bad request never stops the worker
@@ -350,17 +364,7 @@ class Advisor:
         except sqlite3.Error:
             logger.exception("advice_log read failed")
             return None
-        if row is None:
-            return None
-        advice = Advice(
-            cast(Verdict, str(row["verdict"])),
-            float(row["confidence"]),
-            float(row["size_factor"]),
-            row["regime"],
-            tuple(str(flag) for flag in row["risk_flags"]),
-            str(row["rationale"] or ""),
-        )
-        return AdviceState("done", _utc(str(row["ts"])), advice, log_id=int(row["id"]), scope=scope)
+        return _done(row, scope) if row is not None else None
 
     def _fail(self, request: AdviceRequest, message: str) -> AdviceState:
         """Record a failure for this key: the row goes on without a verdict (or waits, with
@@ -378,6 +382,19 @@ class Advisor:
         cutoff = now - CACHE_TTL
         for key in [key for key, state in self._cache.items() if state.requested_at < cutoff]:
             del self._cache[key]
+
+
+def _done(row: dict[str, Any], scope: str) -> AdviceState:
+    """The ``done`` state of a logged ``advice_log`` row of the store ``scope``."""
+    advice = Advice(
+        cast(Verdict, str(row["verdict"])),
+        float(row["confidence"]),
+        float(row["size_factor"]),
+        row["regime"],
+        tuple(str(flag) for flag in row["risk_flags"]),
+        str(row["rationale"] or ""),
+    )
+    return AdviceState("done", _utc(str(row["ts"])), advice, log_id=int(row["id"]), scope=scope)
 
 
 def _billed(model: str, usage: Completion | None, moment: datetime) -> dict[str, float]:

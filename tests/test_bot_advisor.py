@@ -850,3 +850,141 @@ def test_a_pair_outside_the_snapshot_resolves_from_the_klines_and_one_without_da
     lines = {line["group"]: line for line in calibration.calibration(store.advice_rows(), min_veto_confidence=0.6, now=end)}
     assert lines["all"]["n"] == 1 and lines["all"]["expired"] == 1 and lines["all"]["waiting"] == 1
     assert lines["veto"]["n"] == 0 and lines["veto"]["mean_r"] is None and lines["veto"]["expired"] == 1
+
+
+# -- rigorous review fixes -------------------------------------------------------------------------
+
+
+def test_a_reduce_logged_before_a_restart_shrinks_the_first_automatic_entry_after_it(tmp_path, monkeypatch) -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json=_completion(_verdict("reduce", 0.9, 0.5)))
+
+    runtime, executor = _advised(tmp_path, monkeypatch, handler, mode="filter")
+    runtime.tick(now=MOMENT)
+    base = runtime.store.opportunities()[0]["size_usd"]
+    assert runtime.advisor.wait_idle(5) and len(calls) == 1 and _acted(executor) == ["act:0"]
+    # A new process: the verdict is only in advice_log.
+    runtime.advisor = Advisor(transport=httpx.MockTransport(handler))
+    runtime.tick(now=MOMENT + timedelta(seconds=60))
+    row = runtime.store.opportunities()[0]
+    assert row["advice"]["verdict"] == "reduce" and row["size_limit"] == "advice"
+    assert row["size_usd"] == pytest.approx(round(base * 0.5, 2))
+    assert _acted(executor) == ["act:1"] and len(calls) == 1
+
+
+def _resolvable(runtime: Any, bar: int) -> int:
+    """Log an ETH/USDT verdict on ``_replay_frame``'s ``bar``, whose window the snapshot holds."""
+    frame = _replay_frame()
+    signal_close = (frame.index[bar] + pd.Timedelta(hours=1)).isoformat()
+    return runtime.store.add_advice(_logged_row(symbol="ETH/USDT", signal_close_at=signal_close))
+
+
+def test_the_tick_labels_logged_verdicts_hourly_and_never_fails_on_it(tmp_path, monkeypatch) -> None:
+    from bot.advisor import service
+
+    runtime, _executor = _advised(tmp_path, monkeypatch, _answer(_verdict()), mode="shadow")
+    candles = dict(runtime.collector.snapshot.candles)
+    candles[("ETH/USDT", "1h")] = Series(_replay_frame(), MOMENT, "test")
+    runtime.collector.snapshot = MarketSnapshot(candles=candles)
+    passes: list[datetime] = []
+    real = calibration.resolve_pending
+
+    def counted(store: Store, snapshot: MarketSnapshot, moment: datetime) -> int:
+        passes.append(moment)
+        return real(store, snapshot, moment)
+
+    monkeypatch.setattr(service.calibration, "resolve_pending", counted)
+    first = _resolvable(runtime, 70)
+    assert runtime.tick(now=MOMENT)["status"] == "ok"
+    labelled = {row["id"]: row for row in runtime.store.advice_rows()}[first]
+    assert labelled["counterfactual_r"] == pytest.approx((0.035 - COST) / 0.01) and passes == [MOMENT]
+    # Within RESOLVE_EVERY the next tick reads nothing.
+    second = _resolvable(runtime, 61)
+    runtime.tick(now=MOMENT + service.RESOLVE_EVERY - timedelta(minutes=1))
+    assert passes == [MOMENT]
+    assert {row["id"]: row for row in runtime.store.advice_rows()}[second]["counterfactual_r"] is None
+    # A retired runtime resolves nothing, however long since the last pass.
+    runtime.retired = True
+    assert runtime.tick(now=MOMENT + 2 * service.RESOLVE_EVERY)["status"] == "skipped"
+    assert passes == [MOMENT]
+    runtime.retired = False
+
+    def broken(*_args: Any) -> int:
+        raise RuntimeError("advice_log locked")
+
+    monkeypatch.setattr(runtime.advisor, "maybe_resolve", broken)
+    result = runtime.tick(now=MOMENT + 3 * service.RESOLVE_EVERY)
+    assert result["status"] == "ok" and runtime.failures == 0
+
+
+def test_an_answer_that_trickles_past_the_total_deadline_is_a_timeout(monkeypatch) -> None:
+    from bot.advisor import client as module
+
+    monkeypatch.setattr(module, "TOTAL_SECONDS", 0.05)
+    sent: list[int] = []
+
+    def blank_lines() -> Any:
+        # A long queue: blank lines, each well inside the read timeout, before any body.
+        for _line in range(500):
+            sent.append(1)
+            time.sleep(0.01)
+            yield b"\n"
+        yield json.dumps(_completion(_verdict())).encode()
+
+    transport = httpx.MockTransport(lambda _request: httpx.Response(200, content=blank_lines()))
+    started = time.monotonic()
+    with DeepSeekClient(KEY, BASE, transport=transport) as client:
+        with pytest.raises(AdvisorError) as raised:
+            client.complete("deepseek-flash", "system json", "{}")
+    assert raised.value.kind == "timeout" and time.monotonic() - started < 2.0
+    assert len(sent) < 500
+
+
+def test_a_failed_klines_read_after_the_grace_leaves_the_row_for_a_later_pass(tmp_path) -> None:
+    frame = _replay_frame()
+    store = Store(tmp_path / "bot.sqlite")
+    signal_close = (frame.index[70] + pd.Timedelta(hours=1)).isoformat()
+    row_id = store.add_advice(_logged_row(symbol="ETH/USDT", signal_close_at=signal_close))
+    snapshot = MarketSnapshot(candles={("BTC/USDT", "1h"): Series(frame, MOMENT, "test")})
+    late = frame.index[-1].to_pydatetime() + timedelta(days=5)
+
+    def failing(*_args: Any) -> pd.DataFrame | None:
+        raise httpx.ReadTimeout("klines")
+
+    assert resolve_pending(store, snapshot, late, fetch=failing) == 0
+    (row,) = store.advice_rows()
+    assert row["expired_at"] is None and row["counterfactual_r"] is None
+    assert resolve_pending(store, snapshot, late + timedelta(hours=1), fetch=lambda *_args: frame) == 1
+    (row,) = store.advice_rows()
+    assert row["id"] == row_id and row["counterfactual_r"] == pytest.approx((0.035 - COST) / 0.01) and row["expired_at"] is None
+    # A pair Binance never serves again expires after MAX_FETCH_FAILURES failed reads, never one.
+    other = store.add_advice(_logged_row(symbol="SOL/USDT", signal_close_at=signal_close))
+    for attempt in range(calibration.MAX_FETCH_FAILURES):
+        resolve_pending(store, snapshot, late + timedelta(hours=2 + attempt), fetch=failing)
+        expired = {item["id"]: item for item in store.advice_rows()}[other]["expired_at"]
+        assert (expired is not None) == (attempt == calibration.MAX_FETCH_FAILURES - 1)
+
+
+def test_one_pass_reads_the_klines_of_at_most_max_fetches_rows(tmp_path) -> None:
+    frame = _replay_frame()
+    store = Store(tmp_path / "bot.sqlite")
+    signal_close = (frame.index[70] + pd.Timedelta(hours=1)).isoformat()
+    symbols = [f"P{index}/USDT" for index in range(calibration.MAX_FETCHES + 2)]
+    for symbol in symbols:
+        store.add_advice(_logged_row(symbol=symbol, signal_close_at=signal_close))
+    snapshot = MarketSnapshot(candles={("BTC/USDT", "1h"): Series(frame, MOMENT, "test")})
+    reads: list[str] = []
+
+    def fetch(symbol: str, *_args: Any) -> pd.DataFrame:
+        reads.append(symbol)
+        return frame
+
+    late = frame.index[-1].to_pydatetime() + timedelta(days=5)
+    assert resolve_pending(store, snapshot, late, fetch=fetch) == calibration.MAX_FETCHES
+    assert reads == symbols[: calibration.MAX_FETCHES]
+    rows = {row["symbol"]: row for row in store.advice_rows()}
+    for symbol in symbols[calibration.MAX_FETCHES :]:
+        assert rows[symbol]["counterfactual_r"] is None and rows[symbol]["expired_at"] is None

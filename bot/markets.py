@@ -180,8 +180,8 @@ def liquid_pool(collector: Collector, pool: int = RANK_POOL, *, listed: frozense
 
 def rank_promising(
     collector: Collector, count: int, *, pool: int = RANK_POOL, listed: frozenset[str] | None = None
-) -> list[str]:
-    """The ``count`` liquid USDT pairs with the best risk-adjusted momentum.
+) -> tuple[list[str], list[str]]:
+    """The ``count`` liquid USDT pairs with the best risk-adjusted momentum, and the pool ranked.
 
     The score is the 28-day return over the standard deviation of the daily
     returns, from closed daily candles of the ``pool`` most liquid pairs. A pair
@@ -189,17 +189,17 @@ def rank_promising(
     pairs with a positive score are returned, best first. ``listed`` limits the
     pool to the pairs the order venue lists. Momentum here only
     picks which pairs the strategies look at; it never buys by itself. The pool
-    read is kept in ``collector.universe_cache`` for the validation universe.
+    read comes back with the choice (the validation universe): one collector serves
+    every runtime, so it must not travel through state on it.
     """
     candidates = liquid_pool(collector, pool, listed=listed)
-    collector.universe_cache = list(candidates)
     with ThreadPoolExecutor(max_workers=8) as executor:
         scores = list(executor.map(lambda pair: _momentum_score(collector, pair), candidates))
     ranked = sorted(
         ((score, pair) for score, pair in zip(scores, candidates) if score is not None and score > 0),
         reverse=True,
     )
-    return [pair for _score, pair in ranked[:count]]
+    return [pair for _score, pair in ranked[:count]], list(candidates)
 
 
 def merge_symbols(live: list[str], chosen: list[str]) -> list[str]:

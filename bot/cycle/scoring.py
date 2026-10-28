@@ -46,6 +46,7 @@ from bot.strategies import (
     Strategy,
     VwapPullback,
     exit_policy_for,
+    live_thresholds,
     timeframe_passed,
     timeframe_result,
     validated_for,
@@ -116,6 +117,8 @@ def _score(
     blocks: dict[str, str] = dict(saved) if isinstance(saved, dict) else {}
     enabled = {key: value for key, value in STRATEGIES.items() if config.strategies.get(key, False)}
     stats_by_id = {strategy_id: store.strategy(strategy_id) for strategy_id in enabled}
+    # Part of the validation's key: a pass under other thresholds is signal-only until re-validated.
+    thresholds = live_thresholds(config.score_threshold, config.cost_multiple, config.min_reward_risk, config.exit_policy)
     ranked: list[Opportunity] = []
     for symbol in config.symbols:
         if symbol in snapshot.failed:
@@ -126,13 +129,15 @@ def _score(
         for strategy_id, strategy in enabled.items():
             stats = stats_by_id[strategy_id]
             params = stats["params"] if stats is not None else None
-            # A validation run under other rules (exit, market filter, hysteresis) does not validate these.
+            # A validation run under other rules (exit, market filter, hysteresis, classify
+            # thresholds) does not validate these.
             keyed = stats is not None and validated_for(
                 params,
                 strategy_id,
                 config.exit_policy,
                 market_filter=config.market_filter,
                 hysteresis=config.exit_hysteresis,
+                thresholds=thresholds,
             )
             passed = tuple(tf for tf in strategy.timeframes if keyed and timeframe_passed(params, tf))
             setup = _setup(strategy, symbol, snapshot, config.funding_annualized_threshold, moment, passed)

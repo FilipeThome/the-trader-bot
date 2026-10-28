@@ -203,7 +203,8 @@ CREATE TABLE IF NOT EXISTS advice_log (
     position_id INTEGER,
     counterfactual_r REAL,
     resolved_at TEXT,
-    expired_at TEXT
+    expired_at TEXT,
+    fetch_failures INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS advice_log_open ON advice_log(resolved_at);
 CREATE TABLE IF NOT EXISTS advisor_usage_daily (
@@ -300,7 +301,8 @@ _ADDED_POSITION_COLUMNS = (
 
 #: Columns added to ``advice_log`` after it shipped. ``expired_at``: the row's window and its
 #: grace passed without the candles to label it (``calibration.resolve_pending``).
-_ADDED_ADVICE_COLUMNS = (("expired_at", "TEXT"),)
+#: ``fetch_failures``: klines reads that failed after that grace.
+_ADDED_ADVICE_COLUMNS = (("expired_at", "TEXT"), ("fetch_failures", "INTEGER NOT NULL DEFAULT 0"))
 #: One verdict per signal: a restart that asks again finds the logged row instead.
 _ADVICE_SIGNAL_KEY = ("symbol", "strategy", "timeframe", "signal_close_at", "prompt_version", "model")
 
@@ -1095,6 +1097,12 @@ class Store:
         return _advice_item(row) if row is not None else None
 
     @_locked
+    def advice_since(self, ts: str) -> list[dict[str, Any]]:
+        """The verdicts logged at or after ``ts`` (an ISO time in UTC), oldest first."""
+        rows = self._conn.execute("SELECT * FROM advice_log WHERE ts >= ? ORDER BY id", (ts,)).fetchall()
+        return [_advice_item(row) for row in rows]
+
+    @_locked
     def advice_rows(self, *, unresolved: bool = False) -> list[dict[str, Any]]:
         """Logged verdicts, oldest first, with the closed position's result in R (``realized_r``)
         when the row entered one. ``unresolved`` keeps the rows without a counterfactual yet that
@@ -1114,6 +1122,14 @@ class Store:
                 "UPDATE advice_log SET expired_at=? WHERE id=? AND resolved_at IS NULL AND expired_at IS NULL",
                 (expired_at, advice_id),
             )
+
+    @_locked
+    def note_advice_fetch_failure(self, advice_id: int) -> int:
+        """Count one failed klines read of an unresolved row; returns its count so far."""
+        with self._conn:
+            self._conn.execute("UPDATE advice_log SET fetch_failures = fetch_failures + 1 WHERE id=?", (advice_id,))
+        row = self._conn.execute("SELECT fetch_failures FROM advice_log WHERE id=?", (advice_id,)).fetchone()
+        return int(row["fetch_failures"]) if row is not None else 0
 
     @_locked
     def resolve_advice(self, advice_id: int, counterfactual_r: float, resolved_at: str) -> None:

@@ -1,6 +1,7 @@
 """Strategy families. Each one is code the backtest and the live engine share."""
 
 import hashlib
+import math
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -46,6 +47,8 @@ GATE_VERSION = 3
 STRATEGY_VERSIONS: dict[str, int] = {key: 1 for key in STRATEGIES}
 #: Strategies whose own exit (EMA 20/50 cross) has the hysteresis switch.
 HYSTERESIS_STRATEGIES = frozenset({"trend", "momentum"})
+#: The ``classify`` thresholds a replay marks its trades with, in this order.
+THRESHOLD_KEYS = ("score_threshold", "cost_multiple", "min_reward_risk")
 
 
 def pairset_hash(symbols: Iterable[str]) -> str:
@@ -95,6 +98,33 @@ def validation_params(
     }
 
 
+def live_thresholds(score_threshold: float, cost_multiple: float, min_reward_risk: float, swing_policy: str) -> dict[str, float]:
+    """The ``classify`` thresholds the live cycle judges with under ``swing_policy``: a fixed
+    rule's payoff is the operator's choice, so its reward-to-risk floor is 0 (as in scoring)."""
+    floor = 0.0 if is_fixed(swing_policy) else min_reward_risk
+    return {"score_threshold": float(score_threshold), "cost_multiple": float(cost_multiple), "min_reward_risk": float(floor)}
+
+
+def stored_thresholds(params: Mapping[str, Any] | None) -> dict[str, float] | None:
+    """The thresholds a stored validation ran with: its ``thresholds``, or, for a record from
+    before that key, those of any timeframe result. None when it never recorded them."""
+    params = params or {}
+    results = params.get("timeframes")
+    candidates = [params.get("thresholds"), *(results.values() if isinstance(results, Mapping) else ())]
+    for found in candidates:
+        if isinstance(found, Mapping) and all(isinstance(found.get(name), (int, float)) for name in THRESHOLD_KEYS):
+            return {name: float(found[name]) for name in THRESHOLD_KEYS}
+    return None
+
+
+def thresholds_hold(params: Mapping[str, Any] | None, thresholds: Mapping[str, float]) -> bool:
+    """Whether a stored validation ran with ``thresholds`` (``live_thresholds``). They decide
+    which trades compete for the portfolio slots, so they change the verdict. A record that
+    never stored them holds, like an unknown universe."""
+    stored = stored_thresholds(params)
+    return stored is None or all(math.isclose(stored[name], float(thresholds[name]), abs_tol=1e-9) for name in THRESHOLD_KEYS)
+
+
 def timeframe_result(params: Mapping[str, Any] | None, timeframe: str) -> dict[str, Any] | None:
     """The stored result of one timeframe, or None when that timeframe was not replayed."""
     results = (params or {}).get("timeframes")
@@ -118,15 +148,18 @@ def validated_for(
     hysteresis: bool = True,
     timeframe: str | None = None,
     symbol: str | None = None,
+    thresholds: Mapping[str, float] | None = None,
 ) -> bool:
     """Whether a backtest's ``params`` replayed the rules this strategy trades with now.
 
     The key is the gate and strategy versions, the exit rule (with the day or
     trailing parameters it depends on), the market filter, the exit hysteresis
-    of trend and momentum, and, when given, the setup's timeframe (it must have
-    been replayed; ``timeframe_passed`` says whether it passed) and the pair
-    (it must belong to the validated set). Whether the gate passed is not part
-    of the key.
+    of trend and momentum, and, when given, the ``classify`` thresholds
+    (``thresholds_hold``), the setup's timeframe (it must have been replayed;
+    ``timeframe_passed`` says whether it passed) and the pair (it must belong to
+    the validated set). Whether the gate passed is not part of the key. The
+    validation's staleness, the cycle and ``/bot/status`` all pass the config's
+    thresholds, so a pass under other thresholds is signal-only until re-validated.
     """
     if not params:
         return False
@@ -144,6 +177,8 @@ def validated_for(
         return False
     if uses_hysteresis(strategy_id, policy) and params.get("hysteresis") != bool(hysteresis):
         return False
+    if thresholds is not None and not thresholds_hold(params, thresholds):
+        return False
     if timeframe is not None and timeframe_result(params, timeframe) is None:
         return False
     if symbol is not None and symbol not in (params.get("symbols") or ()):
@@ -156,8 +191,12 @@ __all__ = [
     "GATE_VERSION",
     "HYSTERESIS_STRATEGIES",
     "STRATEGY_VERSIONS",
+    "THRESHOLD_KEYS",
     "exit_policy_for",
+    "live_thresholds",
     "pairset_hash",
+    "stored_thresholds",
+    "thresholds_hold",
     "timeframe_passed",
     "timeframe_result",
     "uses_hysteresis",

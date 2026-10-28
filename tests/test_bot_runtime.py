@@ -478,7 +478,7 @@ def test_auto_select_runs_hourly_and_keeps_pairs_with_positions(tmp_path, monkey
     calls: list[int] = []
     monkeypatch.setattr(
         "bot.cycle.market.rank_promising",
-        lambda _collector, count, listed: calls.append(count) or ["SOL/USDT", "XRP/USDT", "AVAX/USDT"],
+        lambda _collector, count, listed: (calls.append(count) or ["SOL/USDT", "XRP/USDT", "AVAX/USDT"], []),
     )
     monkeypatch.setattr("bot.cycle.market.venue_symbols", lambda _collector, mode: frozenset({"SOL/USDT"}))
     start = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
@@ -494,7 +494,7 @@ def test_auto_select_runs_hourly_and_keeps_pairs_with_positions(tmp_path, monkey
 def test_a_failing_pair_ranking_never_halts_the_bot(tmp_path, monkeypatch) -> None:
     runtime, _collector, _executor = _runtime(tmp_path, monkeypatch, auto_select=True)
 
-    def broken(_collector: Any, _count: int, listed: Any) -> list[str]:
+    def broken(_collector: Any, _count: int, listed: Any) -> tuple[list[str], list[str]]:
         raise TimeoutError("binance")
 
     monkeypatch.setattr("bot.cycle.market.rank_promising", broken)
@@ -507,7 +507,7 @@ def test_a_failing_pair_ranking_never_halts_the_bot(tmp_path, monkeypatch) -> No
 
 def test_auto_select_drops_pairs_the_testnet_cannot_trade_when_nothing_rises(tmp_path, monkeypatch) -> None:
     runtime, _collector, _executor = _runtime(tmp_path, monkeypatch, ["BTC/USDT", "STRK/USDT"], auto_select=True)
-    monkeypatch.setattr("bot.cycle.market.rank_promising", lambda _collector, count, listed: [])
+    monkeypatch.setattr("bot.cycle.market.rank_promising", lambda _collector, count, listed: ([], []))
     monkeypatch.setattr("bot.cycle.market.venue_symbols", lambda _collector, mode: frozenset({"BTC/USDT", "ETH/USDT"}))
     runtime.tick()
     assert runtime.config.symbols == ["BTC/USDT"]
@@ -557,7 +557,7 @@ def test_the_cycle_exits_a_momentum_position_when_ema20_falls_under_ema50(tmp_pa
 def test_auto_select_waits_out_weight_pressure_and_survives_a_bad_timestamp(tmp_path, monkeypatch) -> None:
     runtime, _collector, _executor = _runtime(tmp_path, monkeypatch, auto_select=True)
     calls: list[int] = []
-    monkeypatch.setattr("bot.cycle.market.rank_promising", lambda _collector, count, listed: calls.append(count) or ["SOL/USDT"])
+    monkeypatch.setattr("bot.cycle.market.rank_promising", lambda _collector, count, listed: (calls.append(count) or ["SOL/USDT"], []))
     monkeypatch.setattr("bot.cycle.market.venue_symbols", lambda _collector, mode: None)
     monkeypatch.setattr("bot.cycle.market.weight_pressure", lambda: True)
     runtime.tick()
@@ -635,7 +635,7 @@ def test_auto_select_keeps_hand_edits_of_bot_json_and_writes_it_whole(tmp_path, 
     raw["gates"]["g1"] = True
     raw["entry_mode"] = "auto"
     path.write_text(json.dumps(raw), encoding="utf-8")
-    monkeypatch.setattr("bot.cycle.market.rank_promising", lambda _collector, count, listed: ["SOL/USDT"])
+    monkeypatch.setattr("bot.cycle.market.rank_promising", lambda _collector, count, listed: (["SOL/USDT"], []))
     monkeypatch.setattr("bot.cycle.market.venue_symbols", lambda _collector, mode: None)
     runtime.tick()
     saved = BotConfig.load()
@@ -701,12 +701,12 @@ def test_a_ranking_that_finishes_after_the_panel_changed_the_pairs_writes_nothin
     runtime, _collector, _executor = _runtime(tmp_path, monkeypatch, auto_select=True)
     runtime.config.save()
 
-    def rank_while_the_panel_rebinds(_collector: Any, count: int, listed: Any) -> list[str]:
+    def rank_while_the_panel_rebinds(_collector: Any, count: int, listed: Any) -> tuple[list[str], list[str]]:
         # The operator picks a preset meanwhile: the API saves its pairs and retires this runtime.
         with runtime.lock:
             BotConfig.load().model_copy(update={"symbols": ["ETH/USDT"], "auto_select": False}).save()
             runtime.retired = True
-        return ["SOL/USDT"]
+        return ["SOL/USDT"], []
 
     monkeypatch.setattr("bot.cycle.market.rank_promising", rank_while_the_panel_rebinds)
     monkeypatch.setattr("bot.cycle.market.venue_symbols", lambda _collector, mode: None)
@@ -1016,12 +1016,64 @@ def test_auto_select_saves_the_liquid_pool_it_ranked(tmp_path, monkeypatch) -> N
 
     runtime, collector, _executor = _runtime(tmp_path, monkeypatch, auto_select=True)
 
-    def rank(ranked_from: Any, count: int, listed: Any) -> list[str]:
-        ranked_from.universe_cache = ["SOL/USDT", "BTC/USDT", "ADA/USDT"]
-        return ["SOL/USDT"]
+    def rank(_collector: Any, count: int, listed: Any) -> tuple[list[str], list[str]]:
+        return ["SOL/USDT"], ["SOL/USDT", "BTC/USDT", "ADA/USDT"]
 
     monkeypatch.setattr("bot.cycle.market.rank_promising", rank)
     monkeypatch.setattr("bot.cycle.market.venue_symbols", lambda _collector, mode: None)
     runtime.tick(now=datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc))
     assert runtime.config.symbols == ["SOL/USDT"]
     assert runtime.store.get_state(UNIVERSE_STATE) == ["ADA/USDT", "BTC/USDT", "SOL/USDT"]
+
+
+# -- rigorous review: the filtered hit rate and the thresholds in the live key -----------------------
+
+
+def _marked(policy: str, *, cost_multiple: float = 2.0, min_reward_risk: float = 1.5, **extra: Any) -> dict[str, Any]:
+    """A pass of 30 wins in 40 trades whose replay marked 12 wins in 30 accepted trades with these thresholds."""
+    marks = {"score_threshold": 0.3, "cost_multiple": cost_multiple, "min_reward_risk": min_reward_risk}
+    return {**_validated("trend", policy, wins=30, trades=40, filtered_trades=30, filtered_wins=12, **marks), **extra}
+
+
+def test_the_cycle_takes_the_lower_filtered_hit_rate_only_with_the_same_thresholds(tmp_path, monkeypatch) -> None:
+    from bot.strategies import live_thresholds
+
+    general, filtered = 31 / 42, 13 / 32
+    runtime, _executor = _ready_cycle(tmp_path, monkeypatch)
+    runtime.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": _marked("trailing")})
+    runtime.tick()
+    row = runtime.store.opportunities()[0]
+    assert row["status"] == "pronta" and row["win_rate"] == pytest.approx(filtered) and row["win_rate_n"] == 40
+    # Under a fixed rule the replay stored a reward-to-risk floor of 0, as scoring judges it.
+    fixed, _fixed_executor = _ready_cycle(tmp_path / "fixed", monkeypatch, take_profit_pct=0.03, stop_loss_pct=0.015, min_reward_risk=5.0)
+    record = _marked("fixed:300:150", min_reward_risk=0.0)
+    fixed.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": record})
+    fixed.tick()
+    row = fixed.store.opportunities()[0]
+    assert row["status"] == "pronta" and row["win_rate"] == pytest.approx(filtered)
+    # The key's thresholds hold, but the timeframe's filtered counts were marked with others: the general rate.
+    other, _other_executor = _ready_cycle(tmp_path / "other", monkeypatch)
+    config = other.config
+    key = live_thresholds(config.score_threshold, config.cost_multiple, config.min_reward_risk, config.exit_policy)
+    marked = _marked("trailing", cost_multiple=3.0, thresholds=key)
+    other.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": marked})
+    other.tick()
+    row = other.store.opportunities()[0]
+    assert row["status"] == "pronta" and row["win_rate"] == pytest.approx(general)
+
+
+def test_a_pass_under_other_thresholds_is_signal_only_until_revalidated(tmp_path, monkeypatch) -> None:
+    from bot.strategies import live_thresholds
+
+    runtime, executor = _ready_cycle(tmp_path, monkeypatch, entry_mode="auto")
+    config = runtime.config
+    current = live_thresholds(config.score_threshold, config.cost_multiple, config.min_reward_risk, config.exit_policy)
+    stale = {**_validated("trend", "trailing", wins=30, trades=40), "thresholds": {**current, "cost_multiple": 3.0}}
+    runtime.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": stale})
+    runtime.tick()
+    row = runtime.store.opportunities()[0]
+    assert row["status"] == "bloqueada" and "somente sinal" in row["reason"] and "act:0" in executor.events
+    executor.events.clear()
+    runtime.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": {**stale, "thresholds": current}})
+    runtime.tick()
+    assert runtime.store.opportunities()[0]["status"] == "pronta" and "act:1" in executor.events

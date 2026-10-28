@@ -115,10 +115,12 @@ MARKET_BAR = pd.Timedelta(hours=4)
 class BacktestResult:
     """One timeframe's validation.
 
-    ``trades``, ``wins`` and ``net_return`` cover every replayed trade (the
-    hit-rate estimate); ``sharpe``, ``max_drawdown``, ``dsr`` and
-    ``gate_trades`` the in-sample trades the gate judged. The other metrics
-    describe the whole sample. R is a trade's net return over its entry stop.
+    ``trades``, ``wins`` and ``net_return`` cover the replayed trades left after
+    the portfolio limits (the hit-rate estimate; the ones the limits refused are
+    counted in ``skipped_by_limits``, and without limits it is every replayed
+    trade); ``sharpe``, ``max_drawdown``, ``dsr`` and ``gate_trades`` the
+    in-sample trades the gate judged. The other metrics describe the whole
+    sample. R is a trade's net return over its entry stop.
     """
 
     strategy_id: str
@@ -157,8 +159,8 @@ class BacktestResult:
     #: In-sample per-trade Sharpe, not annualised: the trial's entry in the deflated Sharpe.
     sharpe_trade: float = 0.0
     days: int = 0
-    #: The trades ``classify`` would have made ready (``Trade.accepted``), their wins and their
-    #: daily Sharpe over the whole span, comparable with ``daily_sharpe``.
+    #: The trades ``classify`` would have made ready (``Trade.accepted``) among ``trades``, their
+    #: wins and their daily Sharpe over the whole span, comparable with ``daily_sharpe``.
     filtered_trades: int = 0
     filtered_wins: int = 0
     filtered_sharpe: float = 0.0

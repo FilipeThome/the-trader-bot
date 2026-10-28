@@ -6,6 +6,7 @@ import math
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from bot.strategies import THRESHOLD_KEYS
 from bot.strategies.base import Setup
 
 SPOT_TAKER = 0.001
@@ -129,8 +130,6 @@ class Opportunity:
         return asdict(self)
 
 
-#: The ``classify`` thresholds a replay stored with its filtered counts, in this order.
-THRESHOLD_KEYS = ("score_threshold", "cost_multiple", "min_reward_risk")
 
 
 def estimate_win_rate(
@@ -143,8 +142,9 @@ def estimate_win_rate(
 ) -> tuple[float | None, int]:
     """Laplace estimate (wins + 1) / (trades + 2) over backtest and live trades.
 
-    Backtest trades count only when they were replayed with ``exit_policy``,
-    and ``live`` must already hold only positions opened under it (see
+    Backtest trades count only when they were replayed with ``exit_policy``
+    (``trades`` and ``wins``: the replayed trades left after the portfolio
+    limits), and ``live`` must already hold only positions opened under it (see
     ``Store.strategy_outcomes``): a different exit rule describes a different
     trade. Returns ``(None, n)`` below ``min_sample`` trades. This is a
     historical hit rate of the strategy, not a probability for one setup.

@@ -407,7 +407,7 @@ function StrategyValidation({
         </span>
       );
     }],
-    ["Filtro de entrada", "Os trades que o robô aceitaria ao vivo (nota, custo e ganho/risco com os limiares usados no teste), com a taxa de acerto, comparados a todos os setups. Com amostra suficiente e os mesmos limiares de hoje, a menor das duas taxas vale no piso de acerto e no Kelly.", (r) =>
+    ["Filtro de entrada", "Os trades que o robô aceitaria ao vivo (nota, custo e ganho/risco com os limiares usados no teste), com a taxa de acerto, comparados a todos os trades do teste que os limites da carteira deixaram entrar. Com amostra suficiente e os mesmos limiares de hoje, a menor das duas taxas vale no piso de acerto e no Kelly.", (r) =>
       r.filtered_trades == null ? "—" : (
         <span>
           {r.filtered_trades} de {r.trades ?? "—"} · acerto {pct(r.filtered_trades ? (r.filtered_wins ?? 0) / r.filtered_trades : null, 0)}

@@ -407,3 +407,55 @@ def test_a_strategy_without_a_replay_lists_every_validatable_one(api_client) -> 
     assert reply.status_code == 422
     assert reply.json()["detail"] == f"só {', '.join(VALIDATABLE)} têm teste histórico"
     assert all(strategy_id in reply.json()["detail"] for strategy_id in ("intraday_momentum", "vwap_pullback"))
+
+
+# -- rigorous review: thresholds in the live key, the universe read by the validation ---------------
+
+
+def test_a_threshold_change_leaves_a_pass_unvalidated_in_the_status(api_client) -> None:
+    runtime = _use({"strategies": {**ctx.runtime.config.strategies, "momentum": True}})  # type: ignore[union-attr]
+    passed = {**_params("momentum", {"4h": {"passed": True, "mc_p95_dd_r": 5.0}}), "thresholds": validation._thresholds(runtime.config)}
+    runtime.store.save_strategy({"strategy_id": "momentum", "signal_only": False, "params": passed})
+    assert api_client.get("/bot/status").json()["validated"]["momentum"] is True
+    # As the cycle reads it: until the re-validation passes, the old pass is signal-only.
+    _use({"cost_multiple": 3.0})
+    assert api_client.get("/bot/status").json()["validated"]["momentum"] is False
+    _use({"cost_multiple": runtime.config.cost_multiple, "score_threshold": 0.6})
+    assert api_client.get("/bot/status").json()["validated"]["momentum"] is False
+
+
+def _auto_trend() -> Runtime:
+    strategies = {**ctx.runtime.config.strategies, "trend": True}  # type: ignore[union-attr]
+    return _use({"auto_select": True, "symbols": ["SOL/USDT"], "strategies": strategies})
+
+
+def test_auto_select_without_a_saved_universe_reads_the_liquid_pool_and_saves_it(api_client, loader, monkeypatch) -> None:
+    from bot.cycle.market import UNIVERSE_STATE
+
+    read: list[Any] = []
+    monkeypatch.setattr(validation, "venue_symbols", lambda _collector, mode: None)
+    pool = ["SOL/USDT", "ADA/USDT", "BTC/USDT"]
+    monkeypatch.setattr(validation, "liquid_pool", lambda collector, listed=None: read.append(collector) or list(pool))
+    runtime = _auto_trend()
+    assert runtime.store.get_state(UNIVERSE_STATE) is None
+    assert api_client.post("/bot/strategies/trend/validate").status_code == 202
+    _join()
+    universe = ["ADA/USDT", "BTC/USDT", "SOL/USDT"]
+    assert read == [ctx.collector] and loader.reads[0] == ("1h", tuple(universe), 240)
+    params = runtime.store.strategy("trend")["params"]  # type: ignore[index]
+    assert params["symbols"] == universe and params["pairset"] == pairset_hash(universe) and params["universe"] == "liquid"
+    assert runtime.store.get_state(UNIVERSE_STATE) == universe
+
+
+def test_auto_select_with_no_liquid_pool_ends_the_validation_with_an_error(api_client, loader, monkeypatch) -> None:
+    from bot.cycle.market import UNIVERSE_STATE
+
+    monkeypatch.setattr(validation, "venue_symbols", lambda _collector, mode: None)
+    monkeypatch.setattr(validation, "liquid_pool", lambda _collector, listed=None: [])
+    runtime = _auto_trend()
+    assert api_client.post("/bot/strategies/trend/validate").status_code == 202
+    _join()
+    job = api_client.get("/bot/status").json()["validations"]["trend"]
+    assert job["status"] == "error" and job["error"] == "universo de pares líquidos indisponível para a seleção automática"
+    assert loader.reads == [] and runtime.store.strategy("trend") is None
+    assert runtime.store.get_state(UNIVERSE_STATE) is None

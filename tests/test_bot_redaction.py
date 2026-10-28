@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import io
 import logging
+import time
 from typing import Any
 
 import pytest
+from uvicorn.logging import AccessFormatter
 
 from bot.executor import REST_PLACED, UnprotectedPosition
-from bot.logging_setup import RedactingFormatter, install_redaction, redact
+from bot.logging_setup import UVICORN_LOGGERS, RedactingFormatter, install_redaction, redact
 from test_bot_executor_review import _instance, _rest
 from test_bot_runtime import _runtime
 
@@ -119,3 +121,61 @@ def test_an_unprotected_resting_buy_keeps_the_stop_response_clean(tmp_path, venu
     assert runtime.halted is True and result["error"].startswith("posição sem proteção: BTC/USDT: stop recusado")
     assert "abc123def" not in result["error"] and "abc123def" not in str(result["resting"])
     assert all("abc123def" not in str(event) for event in events)
+
+
+# -- rigorous review: bounded redaction and the entry point's handlers ------------------------------
+
+
+def test_a_long_word_run_or_request_path_is_redacted_within_a_small_budget(root_output, monkeypatch) -> None:
+    started = time.perf_counter()
+    assert redact("a" * 100_000).startswith("a" * 100)
+    assert time.perf_counter() - started < 0.5
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(AccessFormatter('%(client_addr)s - "%(request_line)s" %(status_code)s'))
+    monkeypatch.setattr(logging.getLogger("uvicorn.access"), "handlers", [handler])
+    monkeypatch.setattr(logging.getLogger("uvicorn.access"), "propagate", False)
+    monkeypatch.setattr(logging.getLogger("uvicorn.access"), "level", logging.INFO)
+    install_redaction(["uvicorn.access"])
+    path = "/" + "apikey" * 20_000
+    started = time.perf_counter()
+    logging.getLogger("uvicorn.access").info('%s - "%s %s HTTP/%s" %d', "127.0.0.1:5000", "GET", path, "1.1", 404)
+    assert time.perf_counter() - started < 0.5
+    line = stream.getvalue()
+    assert "caracteres omitidos" in line and len(line) < 10_000
+    # The bound keeps a cut secret redacted, and a short text is left whole.
+    assert "abc123" not in redact("x" * 3990 + " signature=abc123abc123abc123")
+    assert redact(f"ok {SIGNED_URL}").startswith("ok GET https://api.binance.com")
+
+
+def test_main_wraps_every_root_and_uvicorn_handler_after_the_uvicorn_config(monkeypatch) -> None:
+    import logging.config
+
+    import uvicorn
+
+    import bot.__main__ as entry
+
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "handlers", [])
+    monkeypatch.setattr(root, "level", root.level)
+    for name in UVICORN_LOGGERS:
+        logger = logging.getLogger(name)
+        monkeypatch.setattr(logger, "handlers", [])
+        monkeypatch.setattr(logger, "level", logger.level)
+        monkeypatch.setattr(logger, "propagate", logger.propagate)
+    # uvicorn's dictConfig would close every handler of the process, pytest's own included.
+    monkeypatch.setattr(logging.config, "_clearExistingHandlers", lambda: None)
+    monkeypatch.setattr(entry, "_loop", lambda: None)
+    monkeypatch.setattr(uvicorn.Server, "run", lambda self, sockets=None: setattr(self, "started", True))
+    entry.main()
+    loggers = [root, *(logging.getLogger(name) for name in UVICORN_LOGGERS)]
+    assert root.handlers and logging.getLogger("uvicorn").handlers and logging.getLogger("uvicorn.access").handlers
+    for logger in loggers:
+        assert all(isinstance(handler.formatter, RedactingFormatter) for handler in logger.handlers), logger.name
+    stream = io.StringIO()
+    for handler in logging.getLogger("uvicorn").handlers:
+        assert isinstance(handler, logging.StreamHandler)
+        handler.setStream(stream)
+    logging.getLogger("uvicorn.error").error("request failed: %s", "GET /api/v3/order?symbol=BTCUSDT&signature=abc123")
+    text = stream.getvalue()
+    assert "request failed" in text and "abc123" not in text and "[redacted]" in text

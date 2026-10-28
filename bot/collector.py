@@ -112,8 +112,6 @@ class Collector:
         #: Pairs the Spot Testnet lists, read at most once an hour.
         self.testnet_cache: tuple[datetime, frozenset[str]] | None = None
         self.recommendation_cache: tuple[datetime, list[dict[str, Any]]] | None = None
-        #: The liquid pool the last automatic ranking read (``markets.rank_promising``).
-        self.universe_cache: list[str] | None = None
 
     def sync_clock(self) -> bool:
         """Block writes when local time and Binance time differ by more than one second."""

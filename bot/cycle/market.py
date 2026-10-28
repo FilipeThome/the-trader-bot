@@ -159,8 +159,7 @@ def _choose_pairs(
             return None
         store.set_state("auto_select_at", moment.isoformat())
         listed = venue_symbols(collector, config.mode)
-        chosen = rank_promising(collector, config.auto_select_count, listed=listed)
-        universe = getattr(collector, "universe_cache", None)
+        chosen, universe = rank_promising(collector, config.auto_select_count, listed=listed)
         if universe:
             store.set_state(UNIVERSE_STATE, sorted(universe))
         if not chosen:

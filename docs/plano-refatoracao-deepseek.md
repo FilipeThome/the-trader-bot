@@ -254,6 +254,26 @@ Uma revisão independente de toda a diferença, em seis frentes, teve cada achad
 
 Quatro achados foram refutados, entre eles que o reenvio do -1021 pularia a checagem do mandato.
 
+### Revisão rigorosa
+
+Uma segunda revisão da branch, com cada achado confirmado por dois refutadores, deixou 15 correções, cada uma com o teste que pedia:
+
+1. **ReDoS na redação.** O padrão de `api_key` começa no literal, sem a classe ilimitada antes dele, e `redact` lê no máximo 8 KiB (começo, marcador e as linhas finais).
+2. **Redação do uvicorn.** Um teste roda `main()` e confere o `RedactingFormatter` em todo handler da raiz e do uvicorn, com `signature=` limpo em `uvicorn.error`.
+3. **Veredito gravado antes do reinício.** O cache recebe os vereditos recentes do store antes da cópia do ciclo (`Advisor.recall`): um `reduce` gravado reduz a primeira entrada depois do reinício.
+4. **Rótulos no `tick`.** Teste do `_resolve_advice`: rotula, respeita `RESOLVE_EVERY`, nada num runtime aposentado, e uma falha não derruba o ciclo.
+5. **Taxa filtrada no ciclo.** Testes de `_score` com limiares iguais, com saída fixa (`min_reward_risk` 0) e com marcas diferentes.
+6. **Universo sem canal lateral.** `rank_promising` devolve a escolha e o universo; sai `Collector.universe_cache`, que dois runtimes podiam trocar.
+7. **Limiares na chave ao vivo.** `validated_for(thresholds=...)` é a única comparação, usada por `_stale_cause`, pelo ciclo e por `/bot/status`: um aprovado com outros limiares fica só sinal até validar de novo, como uma troca de regra de saída.
+8. **Universo lido pela validação.** Testes do caminho sem universo gravado: lê o universo líquido e o grava; universo vazio termina em erro com o motivo.
+9. **Marcas do replay de saída fixa.** Teste em que o alvo da estratégia passa e o alvo fixo reprova.
+10. **Marcas do replay day.** Teste com setups que alternam aprovação e reprovação.
+11. **População da taxa de acerto.** O texto de `BacktestResult`, de `estimate_win_rate` e do painel diz que `trades` e `wins` são os trades que sobraram depois dos limites da carteira.
+12. **Prazo total da DeepSeek.** A resposta é lida em stream e para em `TOTAL_SECONDS` (45 s): linhas em branco de uma fila longa não prendem o consultor.
+13. **`Advisor.close` removido.** Ninguém o chamava; a thread é daemon. `wait_idle` diz que é só para testes.
+14. **Leitura de velas que falha.** Uma falha não conta como tentativa: a linha só expira quando a leitura deu certo sem a vela ou com a janela incompleta, ou depois de três falhas após a folga (`fetch_failures`).
+15. **Teto de leituras por passada.** Teste com mais de `MAX_FETCHES` linhas fora do snapshot: só `MAX_FETCHES` leituras, e as demais ficam sem rótulo e sem expirar.
+
 ### Para o operador
 
 - Ao reiniciar com este código, toda validação fica velha (gate v3) e roda de novo na partida; até lá as linhas ficam só sinal.

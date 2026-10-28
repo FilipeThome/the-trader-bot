@@ -44,7 +44,7 @@ from bot.recommend import recommendations
 from bot.reports import build_daily_report, verify_ledger
 from bot.runtime import Runtime, mode_root, profile_for
 from bot.store import Store
-from bot.strategies import STRATEGIES, timeframe_result, validated_for
+from bot.strategies import STRATEGIES, live_thresholds, timeframe_result, validated_for
 
 logger = logging.getLogger(__name__)
 hub = EventHub()
@@ -318,15 +318,21 @@ def _advisor(runtime: Runtime) -> Advisor:
 
 def _validated(row: dict[str, Any], config: BotConfig) -> bool:
     """Executable by the cycle's signal-only rule: not signal-only, the result replayed today's
-    rules, and an operated timeframe passed with a readable Monte Carlo p95 drawdown under the
-    drawdown limit at today's risk per trade (``risk.mc_drawdown_ok``)."""
+    rules and ``classify`` thresholds, and an operated timeframe passed with a readable Monte
+    Carlo p95 drawdown under the drawdown limit at today's risk per trade (``risk.mc_drawdown_ok``)."""
     params = row["params"]
     strategy = STRATEGIES.get(row["strategy_id"])
     timeframes = strategy.timeframes if strategy is not None else ()
+    thresholds = live_thresholds(config.score_threshold, config.cost_multiple, config.min_reward_risk, config.exit_policy)
     return (
         not row["signal_only"]
         and validated_for(
-            params, row["strategy_id"], config.exit_policy, market_filter=config.market_filter, hysteresis=config.exit_hysteresis
+            params,
+            row["strategy_id"],
+            config.exit_policy,
+            market_filter=config.market_filter,
+            hysteresis=config.exit_hysteresis,
+            thresholds=thresholds,
         )
         and any(_operable(timeframe_result(params, timeframe), config) for timeframe in timeframes)
     )

@@ -555,3 +555,28 @@ def test_the_replay_marks_the_setups_classify_would_refuse(monkeypatch) -> None:
     )
     assert limited.skipped_by_limits == 10 and limited.trades == 30 and limited.filtered_trades == 10
     assert limited.limits == {"max_positions": 1, "pair_cooldown_minutes": 0, "loss_guard_trades": 3, "loss_guard_r": 2.0}
+
+
+class Rich:
+    """Buys at every flat bar; the setup clears ``classify`` with its own 5% target."""
+
+    def evaluate(self, symbol: str, timeframe: str, frame: pd.DataFrame) -> Setup | None:
+        return Setup("trend", symbol, timeframe, "Comprar", 1.0, 0.05, 0.01, 0.03, 0.05, "t", "trend_up", confidence=1.0)
+
+
+def test_a_fixed_replay_marks_each_trade_with_the_fixed_stop_and_target(monkeypatch) -> None:
+    from bot.strategies.fixed import FixedExit
+
+    marks = runner.EntryFilter(min_reward_risk=0.0)
+    setup = Rich().evaluate("BTC/USDT", "1h", _seesaw())
+    assert setup is not None and marks.accepts(setup)
+    # A 0.5% take-profit caps the expected return below what the score and cost filters want.
+    narrow, wide = FixedExit(take_profit_pct=0.005, stop_loss_pct=0.01), FixedExit(take_profit_pct=0.03, stop_loss_pct=0.01)
+    assert not marks.accepts(narrow.apply(setup)) and marks.accepts(wide.apply(setup))
+    refused = runner.simulate_fixed(Rich(), "BTC/USDT", _seesaw(), "1h", narrow)  # type: ignore[arg-type]
+    assert refused and not any(trade.accepted for trade in refused)
+    taken = runner.simulate_fixed(Rich(), "BTC/USDT", _seesaw(), "1h", wide)  # type: ignore[arg-type]
+    assert taken and all(trade.accepted for trade in taken)
+    monkeypatch.setattr(runner, "_strategy", lambda _id: Rich())
+    result = runner.validate_strategy("trend", {"BTC/USDT": _seesaw()}, "1h", exit_policy=narrow.policy)
+    assert result.trades == len(refused) and result.filtered_trades == 0 and result.min_reward_risk == 0.0

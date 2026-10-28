@@ -10,8 +10,11 @@ The candles come from the collector's snapshot (closed bars of the row's timefra
 signal bar is not in it (the pair left the analysed list, or the bar scrolled out) reads its
 window by time through the backtest loader's weight-accounted klines read, a few rows per pass and
 never under weight pressure. A row still without a label once its window and ``EXPIRY_GRACE``
-passed is marked expired: never tried again, out of every mean, counted apart. Leaving it
-waiting would keep only the fast stops and targets of the pairs that rotate out.
+passed, though a read of its candles succeeded, is marked expired: never tried again, out of
+every mean, counted apart. Leaving it waiting would keep only the fast stops and targets of the
+pairs that rotate out. A failed read proves nothing about the data, so it never expires a row by
+itself; only ``MAX_FETCH_FAILURES`` failed reads after the grace do, so a pair Binance no longer
+serves cannot hold a read slot forever.
 
 A row joins an average only once its whole window has passed since the signal bar, whatever its
 result: counting it as soon as it resolves would bring the fast stops and targets first. One row
@@ -30,7 +33,7 @@ from typing import Any
 import pandas as pd
 
 from bot.advisor.client import PRICES_AS_OF
-from bot.backtest.loaders.binance_loader import BinanceLoader
+from bot.backtest.loaders.binance_loader import BinanceLoader, WeightPressure
 from bot.backtest.runner import LEG_SLIPPAGE, ROUND_TRIP_COST, _prices, fixed_leg
 from bot.collector import MarketSnapshot
 from bot.cycle import market
@@ -47,9 +50,12 @@ COST = ROUND_TRIP_COST + 2 * LEG_SLIPPAGE
 MAX_FETCHES = 5
 #: How long after its window a row may still be labelled before it expires.
 EXPIRY_GRACE = timedelta(days=1)
+#: Failed klines reads after the grace (one per pass, an hour apart at least) that expire a row.
+MAX_FETCH_FAILURES = 3
 #: The fields that name one signal: a duplicate of them counts once.
 _SIGNAL_KEY = ("symbol", "strategy", "timeframe", "signal_close_at", "prompt_version", "model")
-#: Reads the closed candles of (symbol, timeframe) opened from ``start`` and closed by ``end``.
+#: Reads the closed candles of (symbol, timeframe) opened from ``start`` and closed by ``end``;
+#: None when the read found none, an exception when the read itself failed.
 KlinesFetch = Callable[[str, str, datetime, datetime], pd.DataFrame | None]
 #: Each verdict's calibration line, in the panel's order, with its label.
 _VERDICT_LABELS = {"confirm": "confirmar", "reduce": "reduzir", "veto": "vetar", "abstain": "sem veredito"}
@@ -74,12 +80,8 @@ def counterfactual_r(
 def fetch_closed(symbol: str, timeframe: str, start: datetime, end: datetime) -> pd.DataFrame | None:
     """The closed candles of ``symbol`` on ``timeframe`` from ``start`` to ``end``, through the
     backtest loader (``BinanceLoader``: weight accounted, stops under pressure, closed bars only);
-    None when the read failed or came back empty."""
-    try:
-        frame = BinanceLoader().fetch([symbol], start.isoformat(), end.isoformat(), interval=timeframe).get(symbol)
-    except Exception as exc:  # noqa: BLE001 - the row is tried again on a later pass
-        logger.warning("advice resolution: klines of %s %s unavailable (%s)", symbol, timeframe, type(exc).__name__)
-        return None
+    None when the read came back empty. A failed read raises: it must not read as "no data"."""
+    frame = BinanceLoader().fetch([symbol], start.isoformat(), end.isoformat(), interval=timeframe).get(symbol)
     return frame if frame is not None and not frame.empty else None
 
 
@@ -89,8 +91,9 @@ def resolve_pending(store: Store, snapshot: MarketSnapshot, moment: datetime, *,
     A row reads its window from ``snapshot``. When its signal bar is not there, the window
     (the signal bar to ``COUNTERFACTUAL_BARS`` bars after it, by time) is read with ``fetch``
     (``fetch_closed`` by default), at most ``MAX_FETCHES`` times per pass and never under weight
-    pressure. A row that was tried and is still without a label once its window and
-    ``EXPIRY_GRACE`` passed is marked expired.
+    pressure. A row whose candles were read and that is still without a label once its window
+    and ``EXPIRY_GRACE`` passed is marked expired. A failed read leaves the row for a later pass;
+    after the grace it is counted, and ``MAX_FETCH_FAILURES`` of them expire the row.
     """
     read = fetch or fetch_closed
     resolved = fetched = 0
@@ -110,17 +113,27 @@ def resolve_pending(store: Store, snapshot: MarketSnapshot, moment: datetime, *,
         if frame is not None and position is not None:
             value = counterfactual_r(frame, position, stop, target)
         tried = position is not None
+        late = now >= window_end + EXPIRY_GRACE
         if position is None and fetched < MAX_FETCHES and not weight_pressure():
             fetched += 1
+            try:
+                history = read(symbol, timeframe, opened.to_pydatetime(), min(now, window_end).to_pydatetime())
+            except WeightPressure:
+                # Back-pressure, not a missing pair: nothing is counted.
+                continue
+            except Exception as exc:  # noqa: BLE001 - a failed read says nothing about the data: tried again later
+                logger.warning("advice resolution: klines of %s %s unavailable (%s)", symbol, timeframe, type(exc).__name__)
+                if late and store.note_advice_fetch_failure(int(row["id"])) >= MAX_FETCH_FAILURES:
+                    store.expire_advice(int(row["id"]), moment.isoformat())
+                continue
             tried = True
-            history = read(symbol, timeframe, opened.to_pydatetime(), min(now, window_end).to_pydatetime())
             found = _locate(history, opened) if history is not None and not history.empty else None
             if history is not None and found is not None:
                 value = counterfactual_r(history, found, stop, target)
         if value is not None and math.isfinite(value):
             store.resolve_advice(int(row["id"]), value, moment.isoformat())
             resolved += 1
-        elif tried and now >= window_end + EXPIRY_GRACE:
+        elif tried and late:
             store.expire_advice(int(row["id"]), moment.isoformat())
     return resolved
 

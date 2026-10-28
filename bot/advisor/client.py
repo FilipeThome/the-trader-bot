@@ -22,6 +22,10 @@ ErrorKind = Literal["auth", "rate_limited", "timeout", "server", "empty", "inval
 
 #: Connect within 5 s, read within 30 s: the call runs on the advisor's thread, never the cycle's.
 TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=5.0)
+#: Longest one attempt may take, start to last byte. The read timeout bounds the wait for one
+#: chunk only, and a long queue sends blank lines before the body, each resetting it: without
+#: this bound one call could hold the advisor's single worker (and its budget lock) for minutes.
+TOTAL_SECONDS = 45.0
 #: Low temperature: the same data should get the same verdict.
 TEMPERATURE = 0.1
 #: The verdict is a small JSON object; this bounds the cost of a runaway answer.
@@ -141,23 +145,24 @@ class DeepSeekClient:
     def _post(self, body: dict[str, Any]) -> Completion:
         started = time.monotonic()
         try:
-            response = self._client.post("/chat/completions", json=body)
+            with self._client.stream("POST", "/chat/completions", json=body) as response:
+                status = response.status_code
+                if status in (401, 402, 403):
+                    raise AdvisorError("auth", f"HTTP {status}")
+                if status == 429:
+                    raise AdvisorError("rate_limited", "HTTP 429")
+                if status >= 400:
+                    raise AdvisorError("server", f"HTTP {status}")
+                raw = _read_within(response, started)
         except httpx.TimeoutException:
             raise AdvisorError("timeout", "sem resposta no prazo") from None
         except httpx.HTTPError as exc:
             # Only the class name: a transport error's text may carry the request.
             raise AdvisorError("server", f"falha de rede ({type(exc).__name__})") from None
         latency = (time.monotonic() - started) * 1000
-        status = response.status_code
-        if status in (401, 402, 403):
-            raise AdvisorError("auth", f"HTTP {status}")
-        if status == 429:
-            raise AdvisorError("rate_limited", "HTTP 429")
-        if status >= 400:
-            raise AdvisorError("server", f"HTTP {status}")
         try:
             # Long queues send blank lines before the body; json.loads skips the whitespace.
-            payload = json.loads(response.text)
+            payload = json.loads(raw)
             content = payload["choices"][0]["message"].get("content") or ""
             usage = payload.get("usage") or {}
         except (ValueError, KeyError, IndexError, TypeError, AttributeError):
@@ -176,6 +181,18 @@ class DeepSeekClient:
             # Answered, so billed: the error carries the usage.
             raise AdvisorError("invalid_json", "conteúdo da resposta não é texto", usage=completion)
         return completion
+
+
+def _read_within(response: httpx.Response, started: float) -> bytes:
+    """The body, read chunk by chunk until ``TOTAL_SECONDS`` after ``started``; past it, a
+    ``timeout``. A chunk still waits up to the read timeout, so one attempt ends by
+    ``TOTAL_SECONDS`` plus one read timeout at worst."""
+    chunks: list[bytes] = []
+    for chunk in response.iter_bytes():
+        chunks.append(chunk)
+        if time.monotonic() - started > TOTAL_SECONDS:
+            raise AdvisorError("timeout", "resposta além do prazo total")
+    return b"".join(chunks)
 
 
 def _count(value: object) -> int:

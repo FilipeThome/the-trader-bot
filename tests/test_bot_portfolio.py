@@ -248,8 +248,8 @@ def test_ranking_keeps_positive_risk_adjusted_momentum_best_first() -> None:
     falling = [100 * 0.99**i * (1 + 0.002 * math.sin(i)) for i in range(31)]
     series = {"SOL/USDT": steady, "DOGE/USDT": jumpy, "ADA/USDT": falling}
     collector = Collector(_ranking_fetch(series, {}))
-    assert rank_promising(collector, 5) == ["SOL/USDT", "DOGE/USDT"]
-    assert rank_promising(collector, 1) == ["SOL/USDT"]
+    assert rank_promising(collector, 5)[0] == ["SOL/USDT", "DOGE/USDT"]
+    assert rank_promising(collector, 1)[0] == ["SOL/USDT"]
 
 
 def test_merge_keeps_live_pairs_first_and_the_symbol_cap() -> None:
@@ -277,8 +277,8 @@ def test_testnet_picks_only_pairs_the_spot_testnet_lists() -> None:
     listed = venue_symbols(collector, "testnet")
     assert listed == frozenset({"DOGE/USDT", "SOL/USDT"})
     assert venue_symbols(collector, "testnet") == listed and len(testnet_reads) == 1
-    assert rank_promising(collector, 5, listed=listed) == ["SOL/USDT", "DOGE/USDT"]
-    assert set(rank_promising(collector, 5)) == {"SOL/USDT", "DOGE/USDT", "ADA/USDT"}
+    assert rank_promising(collector, 5, listed=listed)[0] == ["SOL/USDT", "DOGE/USDT"]
+    assert set(rank_promising(collector, 5)[0]) == {"SOL/USDT", "DOGE/USDT", "ADA/USDT"}
 
 
 
@@ -331,5 +331,7 @@ def test_the_ranking_keeps_the_liquid_pool_it_read(monkeypatch) -> None:
     collector = Collector()
     monkeypatch.setattr(markets, "top_liquid_usdt", lambda _collector, count, listed=None: ["BTC/USDT", "ETHBTC", "SOL/USDT"][:count])
     monkeypatch.setattr(markets, "_momentum_score", lambda _collector, pair: 1.0 if pair == "SOL/USDT" else -1.0)
-    assert markets.rank_promising(collector, 5) == ["SOL/USDT"]
-    assert collector.universe_cache == ["BTC/USDT", "SOL/USDT"]
+    chosen, pool = markets.rank_promising(collector, 5)
+    assert chosen == ["SOL/USDT"] and pool == ["BTC/USDT", "SOL/USDT"]
+    # The pool comes back with the choice, never through the process-wide collector.
+    assert not hasattr(collector, "universe_cache")

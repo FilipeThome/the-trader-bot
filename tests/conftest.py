@@ -75,6 +75,4 @@ def api_client(tmp_path, monkeypatch) -> Iterator[TestClient]:
 
 def _reset_advisor(ctx) -> None:
     """The advisor is process-wide like the collector: each API test starts with none."""
-    if ctx.advisor is not None:
-        ctx.advisor.close()
     ctx.advisor = None
