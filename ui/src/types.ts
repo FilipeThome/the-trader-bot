@@ -28,6 +28,24 @@ export type Opportunity = {
   /** Estimated slippage, a share of the price, inside the round-trip cost. */
   slippage_est?: number | null;
   plan_target_pct?: number | null;
+  /** The setup's market regime (trend_up, trend_down, range...). */
+  regime?: string | null;
+  /** The DeepSeek advisor's verdict on the row, when it was consulted. */
+  advice?: Advice | null;
+};
+
+/** Opportunity.advice: pending while the call runs, done with the verdict, failed with a redacted error. */
+export type Advice = {
+  status: "pending" | "done" | "failed";
+  requested_at?: string;
+  verdict?: "confirm" | "reduce" | "veto" | "abstain";
+  confidence?: number;
+  size_factor?: number;
+  regime?: string | null;
+  risk_flags?: string[];
+  rationale?: string;
+  id?: number | null;
+  error?: string;
 };
 
 export type ValidationJob = {

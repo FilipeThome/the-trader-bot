@@ -47,6 +47,7 @@ def api_client(tmp_path, monkeypatch) -> Iterator[TestClient]:
     ctx.config = None
     ctx.collector = None
     ctx.balance_cache = None
+    _reset_advisor(ctx)
     with ctx.validation_lock:
         ctx.validations.clear()
 
@@ -63,3 +64,11 @@ def api_client(tmp_path, monkeypatch) -> Iterator[TestClient]:
     ctx.runtime = None
     ctx.config = None
     ctx.collector = None
+    _reset_advisor(ctx)
+
+
+def _reset_advisor(ctx) -> None:
+    """The advisor is process-wide like the collector: each API test starts with none."""
+    if ctx.advisor is not None:
+        ctx.advisor.close()
+    ctx.advisor = None

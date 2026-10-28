@@ -8,13 +8,17 @@ same reason; ``bot.runtime`` still exposes it.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from bot.collector import MarketSnapshot
 from bot.config import BotConfig, RiskLimits
 from bot.risk import RiskState
+
+if TYPE_CHECKING:
+    # Types only: ``bot.advisor.service`` reaches ``bot.cycle.market``, which imports this module.
+    from bot.advisor.service import AdviceKey, AdviceState
 
 #: How a cycle module writes the ledger: the ``Runtime._ledger`` it is given, never ``append_ledger``.
 Ledger = Callable[[str, dict[str, Any]], None]
@@ -59,6 +63,9 @@ class CycleContext:
     state: RiskState | None
     takers: Mapping[str, float]
     limits: RiskLimits
+    #: A copy of the advisor's verdict cache taken for this cycle (``Advisor.snapshot``); empty
+    #: with the advisor off. Scoring reads it, so it stays free of side effects.
+    advice: Mapping[AdviceKey, AdviceState] = field(default_factory=dict)
 
 
 #: What a ``ScoreEffect`` writes: an equity point, the pair blocks with their ledger event, a

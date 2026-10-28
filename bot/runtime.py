@@ -28,6 +28,12 @@ its Monte Carlo drawdown fits the limit, and the pair is neither demoted nor ove
 its slippage budget; the market filter, the macro calendar and the signal age
 can hold entries back too.
 
+With the DeepSeek advisor on (``bot.advisor``), the cycle copies its verdict cache into the
+context before scoring and queues the new ready rows without waiting after the score effects
+are written; in ``filter`` a confident veto keeps a row out of automatic trading and a
+``reduce`` verdict shrinks its size. The calls run on the advisor's own thread, never under
+this lock.
+
 The steps themselves live in ``bot.cycle`` (market reads, exits, the risk level, scoring,
 the DCA and grid robots). The runtime keeps the lock, the halt, the ledger, the config and
 the order of the steps, and hands its collaborators to each step on every call.
@@ -37,11 +43,13 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from bot.advisor import prompt
+from bot.advisor.service import AdviceKey, AdviceRequest, AdviceState, Advisor
 from bot.collector import Collector, MarketSnapshot
 from bot.config import BotConfig, RiskLimits
 from bot.cycle import exits, instances, market, risk_state, scoring
@@ -53,6 +61,7 @@ from bot.evaluator import Opportunity
 from bot.exchange import service
 from bot.exchange.weight import weight_pressure
 from bot.executor import Executor, UnprotectedPosition
+from bot.features import build_features
 from bot.instances import DcaParams, GridParams
 from bot.live.halt import clear_halt, halt_flag_set, trip_halt
 from bot.live.mandate.store import load_mandate
@@ -89,10 +98,13 @@ class Runtime:
         *,
         publish: Publish | None = None,
         lock: threading.RLock | None = None,
+        advisor: Advisor | None = None,
     ) -> None:
         self.config = config
         self.store = store
         self.collector = collector or Collector()
+        #: The process's DeepSeek advisor (``BotContext.advisor``); None turns it off whatever the config says.
+        self.advisor = advisor
         self.publish = publish or (lambda _event: None)
         self.lock = lock or threading.RLock()
         self.failures = 0
@@ -271,6 +283,8 @@ class Runtime:
             collected = self._collect(moment)
         except Exception as exc:  # noqa: BLE001 - raised again under the lock, where failures are counted
             collected = exc
+        if not isinstance(collected, BaseException):
+            self._resolve_advice(collected.snapshot, moment)
         with self.lock:
             if self.retired:
                 return {"status": "skipped", "reason": "runtime substituído durante a coleta"}
@@ -533,11 +547,15 @@ class Runtime:
             self._instances(snapshot, moment, clock_blocked=snapshot.clock_blocked, state=state, limits=limits)
         self._decay(moment)
         # Read after the robots acted, so scoring sees the book they left.
-        context = self._context(moment, snapshot, cash, state=state, takers=collected.takers, limits=limits)
+        context = self._context(
+            moment, snapshot, cash, state=state, takers=collected.takers, limits=limits, advice=self._advice_snapshot()
+        )
         opportunities, effects = self._score(context)
         # Written before protect, the hit-rate floor and allocation change the rows: the
         # history keeps each decision as it was scored.
         self._apply_effects(effects)
+        # Queued without waiting; the verdicts reach a later cycle through the cache.
+        queued = self._consult(opportunities, context)
         self._protect([item for item in opportunities if item.status == "pronta"], context)
         ready = [item for item in opportunities if item.status == "pronta"]
         entries: list[Opportunity] = []
@@ -545,7 +563,11 @@ class Runtime:
         # best score first, so the whole flow can be exercised without validated strategies.
         test_auto = self.config.test_mode_active
         if self.config.entry_mode == "auto":
-            eligible = [item for item in ready if scoring._auto_eligible(item, test_auto, self.config)]
+            eligible = [
+                item
+                for item in ready
+                if scoring._auto_eligible(item, test_auto, self.config) and self._advice_allows(item, context, queued)
+            ]
             entries = self._allocate(eligible, context)
         else:
             # The operator picks one row at a time, so each row is checked on its own.
@@ -590,8 +612,10 @@ class Runtime:
         state: RiskState | None,
         takers: Mapping[str, float],
         limits: RiskLimits,
+        advice: Mapping[AdviceKey, AdviceState] | None = None,
     ) -> CycleContext:
-        """Read the book, equity and capital once (``CycleContext``). Reads only; writes nothing."""
+        """Read the book, equity and capital once (``CycleContext``). Reads only; writes nothing.
+        ``advice`` is the advisor's cache copy for the cycle (none outside it)."""
         positions = self.store.open_positions()
         return CycleContext(
             moment=moment,
@@ -608,7 +632,105 @@ class Runtime:
             state=state,
             takers=takers,
             limits=limits,
+            advice=advice or {},
         )
+
+    # -- DeepSeek advisor (``bot.advisor``) ---------------------------------
+
+    def _advising(self) -> Advisor | None:
+        """The advisor when the config turns it on, else None."""
+        return self.advisor if self.config.advisor.mode != "off" else None
+
+    def _advice_snapshot(self) -> dict[AdviceKey, AdviceState]:
+        """The advisor's cache, copied under the cycle's lock: a dict copy, no wait and no network."""
+        advisor = self._advising()
+        return advisor.snapshot() if advisor is not None else {}
+
+    def _consult(self, opportunities: list[Opportunity], context: CycleContext) -> dict[AdviceKey, AdviceState]:
+        """Queue a request for each ready strategy row whose signal bar was not judged yet.
+
+        Test rows, robots and armed entries are never asked about. The request is built here
+        from numbers and enums (``prompt.user_data``) and queued with ``put_nowait``: a full
+        queue is no verdict. Returns the states of the keys queued now, which the cycle's cache
+        copy does not have yet.
+        """
+        advisor = self._advising()
+        rows = [item for item in opportunities if item.status == "pronta" and not item.test_only and item.direction > 0]
+        if advisor is None or not rows or not advisor.configured():
+            return {}
+        settings = self.config.advisor
+        snapshot, moment = context.snapshot, context.moment
+        btc = market._closed(snapshot, market.MARKET_SYMBOL, "4h", moment)
+        btc_trend = prompt.btc_trend(btc["close"].to_numpy() if btc is not None else None)
+        state = context.state
+        ledger = self._advice_ledger()
+        queued: dict[AdviceKey, AdviceState] = {}
+        for item in rows:
+            found = scoring.advice_request_key(item, snapshot, moment, settings.model)
+            if found is None or found[0] in context.advice:
+                continue
+            key, signal_close = found
+            try:
+                data = prompt.user_data(
+                    item,
+                    features=_features(snapshot, item.symbol),
+                    btc_trend=btc_trend,
+                    risk_level=state.level if state is not None else "normal",
+                    drawdown=state.drawdown if state is not None else 0.0,
+                    open_positions=len(context.positions),
+                )
+            except ValueError as exc:
+                logger.warning("advisor: %s skipped: %s", item.symbol, exc)
+                continue
+            request = AdviceRequest(
+                key=key,
+                store=self.store,
+                ledger=ledger,
+                mode=settings.mode,
+                model=settings.model,
+                daily_budget_usd=settings.daily_budget_usd,
+                data=data,
+                entry_price=signal_close,
+                stop_pct=item.risk_pct,
+                target_pct=item.plan_target_pct or 0.0,
+                requested_at=moment,
+            )
+            known = advisor.request(request)
+            if known is not None:
+                queued[key] = known
+                item.advice = known.public()
+        return queued
+
+    def _advice_allows(self, item: Opportunity, context: CycleContext, queued: Mapping[AdviceKey, AdviceState]) -> bool:
+        """Whether the advisor lets automatic trading take ``item`` (``scoring._advice_allows``).
+        Test rows were never asked, so the advisor holds none of them back."""
+        settings = self.config.advisor
+        if item.test_only or settings.mode != "filter" or self.advisor is None:
+            return True
+        found = scoring.advice_request_key(item, context.snapshot, context.moment, settings.model)
+        entry = None if found is None else context.advice.get(found[0]) or queued.get(found[0])
+        return scoring._advice_allows(item, entry, context.moment, settings)
+
+    def _advice_ledger(self) -> Callable[[dict[str, Any]], None]:
+        """The ``advice`` event writer of this runtime's mode: its ledger sits beside its store,
+        so a verdict that arrives after a mode switch is still recorded where it was asked."""
+        mode = self.config.mode
+        path = self.store.path.parent / "bot-ledger.jsonl"
+
+        def write(payload: dict[str, Any]) -> None:
+            append_ledger({"kind": "advice", "mode": mode, **payload}, path=path)
+
+        return write
+
+    def _resolve_advice(self, snapshot: MarketSnapshot, moment: datetime) -> None:
+        """Label logged verdicts with their counterfactual R (``Advisor.maybe_resolve``), before the
+        lock: housekeeping that never fails the cycle."""
+        if self.advisor is None or self.retired:
+            return
+        try:
+            self.advisor.maybe_resolve(self.store, snapshot, moment)
+        except Exception:  # noqa: BLE001
+            logger.exception("advice resolution failed")
 
     def _protect(self, rows: list[Opportunity], context: CycleContext) -> None:
         """Cooldown and loss guard (``bot.risk.protect``) on rows about to be allocated."""
@@ -768,6 +890,14 @@ class Runtime:
             # A ledger failure must not send or block an order. It is visible in the store and the log.
             logger.exception("ledger append failed (%s)", kind)
             self.store.set_state("ledger_error", kind)
+
+
+def _features(snapshot: MarketSnapshot, symbol: str) -> dict[str, Any] | None:
+    """The panel's feature series of a pair (``build_features``), or None without its 1h and 15m bars."""
+    try:
+        return build_features(snapshot, symbol)
+    except (KeyError, IndexError, ValueError):
+        return None
 
 
 def mode_root(config: BotConfig) -> Path:

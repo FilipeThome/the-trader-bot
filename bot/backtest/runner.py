@@ -497,55 +497,93 @@ def simulate_fixed(
     closes = (hourly.index + pd.Timedelta(hours=1)).values if day_style and hourly is not None else None
     cost = ROUND_TRIP_COST + 2 * LEG_SLIPPAGE
     gate_filter = entry_filter or EntryFilter(min_reward_risk=0.0)
-    opens, lows, highs, bar_closes = _prices(frame)
+    prices = _prices(frame)
     trades: list[Trade] = []
-    holding = False
-    accepted = True
-    entry = stop = target = worst = best = 0.0
-    entered = 0
-    for end in range(_WARMUP_BARS, len(frame)):
+    end = _WARMUP_BARS
+    while end < len(frame):
         window = frame.iloc[max(0, end + 1 - LIVE_WINDOW) : end + 1]
-        close = bar_closes[end]
-        if not holding:
-            decided_at = window.index[-1] + bar
-            if isinstance(strategy, (IntradayMomentum, VwapPullback)) and closes is not None and hourly is not None:
-                if in_quiet_hours(decided_at, day):
-                    continue
-                if gate is not None and not gate.allows(decided_at):
-                    continue
-                seen = int(np.searchsorted(closes, decided_at.to_datetime64(), side="right"))
-                setup = strategy.evaluate(symbol, "15m", window, hourly=hourly.iloc[max(0, seen - LIVE_WINDOW) : seen])
-            else:
-                if gate is not None and not gate.allows(decided_at):
-                    continue
-                setup = strategy.evaluate(symbol, timeframe, window)
-            if setup is not None and setup.direction > 0:
-                holding = True
-                entry = worst = best = close
-                stop = entry * (1 - fixed.stop_loss_pct)
-                target = entry * (1 + fixed.take_profit_pct)
-                entered = end
-                accepted = gate_filter.accepts(fixed.apply(setup))
-            continue
-        opened = opens[end]
-        low = lows[end]
-        if low <= stop:
-            fill = min(opened, stop)
-            worst, best = min(worst, fill), max(best, opened)
-        else:
-            worst, best = min(worst, low), max(best, highs[end])
-            if close >= target:
-                fill = close
-            else:
+        decided_at = window.index[-1] + bar
+        setup: Setup | None
+        if isinstance(strategy, (IntradayMomentum, VwapPullback)) and closes is not None and hourly is not None:
+            if in_quiet_hours(decided_at, day) or (gate is not None and not gate.allows(decided_at)):
+                end += 1
                 continue
-        net = (fill - entry) / entry - cost
+            seen = int(np.searchsorted(closes, decided_at.to_datetime64(), side="right"))
+            setup = strategy.evaluate(symbol, "15m", window, hourly=hourly.iloc[max(0, seen - LIVE_WINDOW) : seen])
+        else:
+            if gate is not None and not gate.allows(decided_at):
+                end += 1
+                continue
+            setup = strategy.evaluate(symbol, timeframe, window)
+        if setup is None or setup.direction <= 0:
+            end += 1
+            continue
+        accepted = gate_filter.accepts(fixed.apply(setup))
+        leg = fixed_leg(prices, end, fixed.stop_loss_pct, fixed.take_profit_pct)
+        if leg is None:
+            # Still open when the history ends: no trade to count.
+            break
+        net = (leg.fill - leg.entry) / leg.entry - cost
         trades.append(
             _trade(
-                frame.index[entered], window.index[-1], net, fixed.stop_loss_pct, entry, worst, best, end - entered, symbol, accepted
+                frame.index[end], frame.index[leg.end], net, fixed.stop_loss_pct, leg.entry, leg.worst, leg.best,
+                leg.end - end, symbol, accepted,
             )
         )
-        holding = False
+        # The exit bar decides nothing: the next setup is read on the bar after it.
+        end = leg.end + 1
     return trades
+
+
+@dataclass(frozen=True)
+class FixedLeg:
+    """How a fixed stop and target position ended (``fixed_leg``): the bar index of the exit,
+    the entry and fill prices, the worst and best prices while held, and whether the bar
+    limit closed it at that bar's close (``marked``)."""
+
+    end: int
+    entry: float
+    fill: float
+    worst: float
+    best: float
+    marked: bool = False
+
+
+def fixed_leg(
+    prices: tuple[list[float], list[float], list[float], list[float]],
+    entered: int,
+    stop_pct: float,
+    target_pct: float,
+    *,
+    max_bars: int | None = None,
+) -> FixedLeg | None:
+    """The fill rules of the operator's fixed exit, from the close of bar ``entered``.
+
+    ``prices`` is ``_prices(frame)``. From the next bar on: the stop is checked on the low
+    first and fills at ``min(open, stop)``, so a gap through it costs more than the stop;
+    the target counts only when a bar closes at or above it, and fills at that close (a wick
+    above it that closes below is no exit). With ``max_bars``, a position still open that
+    many bars after the entry is closed at that bar's close. None while the bars run out
+    first. ``simulate_fixed`` and the advisor's counterfactual (``bot.advisor.calibration``)
+    both use this, so the counterfactual follows the replay's rules by construction.
+    """
+    opens, lows, highs, closes = prices
+    entry = closes[entered]
+    stop = entry * (1 - stop_pct)
+    target = entry * (1 + target_pct)
+    worst = best = entry
+    last = len(closes) - 1 if max_bars is None else min(len(closes) - 1, entered + max_bars)
+    for end in range(entered + 1, last + 1):
+        opened = opens[end]
+        if lows[end] <= stop:
+            fill = min(opened, stop)
+            return FixedLeg(end, entry, fill, min(worst, fill), max(best, opened))
+        worst, best = min(worst, lows[end]), max(best, highs[end])
+        if closes[end] >= target:
+            return FixedLeg(end, entry, closes[end], worst, best)
+    if max_bars is not None and entered + max_bars <= len(closes) - 1:
+        return FixedLeg(last, entry, closes[last], worst, best, marked=True)
+    return None
 
 
 def _strategy_exit(strategy: Any, window: pd.DataFrame, hysteresis: bool = True) -> bool:

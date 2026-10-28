@@ -173,6 +173,50 @@ CREATE TABLE IF NOT EXISTS stop_windows (
     ms REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS stop_windows_ts ON stop_windows(ts);
+CREATE TABLE IF NOT EXISTS advice_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    prompt_sha256 TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    signal_close_at TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    size_factor REAL NOT NULL,
+    regime TEXT,
+    risk_flags TEXT NOT NULL DEFAULT '[]',
+    rationale TEXT NOT NULL DEFAULT '',
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0,
+    latency_ms REAL,
+    entry_price REAL NOT NULL,
+    stop_pct REAL NOT NULL,
+    target_pct REAL NOT NULL,
+    taken INTEGER NOT NULL DEFAULT 0,
+    position_id INTEGER,
+    counterfactual_r REAL,
+    resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS advice_log_open ON advice_log(resolved_at);
+CREATE TABLE IF NOT EXISTS advisor_usage_daily (
+    day TEXT PRIMARY KEY,
+    calls INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0,
+    confirm INTEGER NOT NULL DEFAULT 0,
+    reduce INTEGER NOT NULL DEFAULT 0,
+    veto INTEGER NOT NULL DEFAULT 0,
+    abstain INTEGER NOT NULL DEFAULT 0,
+    errors INTEGER NOT NULL DEFAULT 0
+);
 """
 
 #: Columns ``update_position`` may change. Identity and timestamps stay with the store.
@@ -247,6 +291,22 @@ _ADDED_POSITION_COLUMNS = (
     ("entry_slippage", "REAL"),
     ("exit_slippage", "REAL"),
     ("r_multiple", "REAL"),
+    # The DeepSeek advisor's verdict and confidence on the row the position entered from.
+    ("entry_advice_verdict", "TEXT"),
+    ("entry_advice_confidence", "REAL"),
+)
+
+#: Counters of ``advisor_usage_daily`` that ``record_advisor_usage`` adds to.
+_USAGE_COLUMNS = (
+    "calls", "prompt_tokens", "cache_hit_tokens", "completion_tokens", "cost_usd",
+    "confirm", "reduce", "veto", "abstain", "errors",
+)
+#: Columns of ``advice_log`` that ``add_advice`` writes; the rest start empty.
+_ADVICE_COLUMNS = (
+    "ts", "mode", "model", "prompt_version", "prompt_sha256", "symbol", "strategy", "timeframe",
+    "signal_close_at", "verdict", "confidence", "size_factor", "regime", "risk_flags", "rationale",
+    "prompt_tokens", "cache_hit_tokens", "completion_tokens", "cost_usd", "latency_ms",
+    "entry_price", "stop_pct", "target_pct",
 )
 
 #: Columns of ``validation_trials`` a trial row must give; ``ts`` and ``payload`` are optional.
@@ -516,13 +576,16 @@ class Store:
         plan_stop_pct: float | None = None,
         plan_target_pct: float | None = None,
         exit_hysteresis: bool | None = None,
+        entry_advice_verdict: str | None = None,
+        entry_advice_confidence: float | None = None,
     ) -> int | None:
         """Reserve a live slot before the entry order. ``None`` when one already exists.
 
         ``entry_win_rate`` is the hit rate the strategy was estimated at when it
         entered; ``calibration`` compares it with how the trades ended.
         ``plan_stop_pct`` and ``plan_target_pct`` are the setup's distances from the
-        entry, for the stop and target set on the average fill.
+        entry, for the stop and target set on the average fill. ``entry_advice_*`` is the
+        DeepSeek advisor's verdict on the row, when it had one.
         """
         stamp = _now()
         hysteresis = None if exit_hysteresis is None else int(bool(exit_hysteresis))
@@ -532,12 +595,14 @@ class Store:
                     """INSERT INTO positions
                     (symbol, strategy, side, qty, avg_price, stop_price, target_price,
                      opened_at, updated_at, status, exit_policy, test_only, entry_win_rate, exit_deadline, instance_id,
-                     timeframe, plan_stop_pct, plan_target_pct, exit_hysteresis)
-                    VALUES (?, ?, 'buy', 0, 0, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     timeframe, plan_stop_pct, plan_target_pct, exit_hysteresis,
+                     entry_advice_verdict, entry_advice_confidence)
+                    VALUES (?, ?, 'buy', 0, 0, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         symbol, strategy, stop_price, target_price, stamp, stamp, exit_policy,
                         1 if test_only else 0, entry_win_rate, exit_deadline, instance_id,
                         timeframe, plan_stop_pct, plan_target_pct, hysteresis,
+                        entry_advice_verdict, entry_advice_confidence,
                     ),
                 )
         except sqlite3.IntegrityError:
@@ -915,6 +980,82 @@ class Store:
                 for kind, items in sorted(by_kind.items())
             },
         }
+
+    # -- DeepSeek advisor ----------------------------------------------------
+
+    @_locked
+    def add_advice(self, row: dict[str, Any]) -> int:
+        """Log one verdict (``_ADVICE_COLUMNS``; ``latency_ms`` optional); returns its id."""
+        missing = [name for name in _ADVICE_COLUMNS if name not in row and name != "latency_ms"]
+        if missing:
+            raise ValueError(f"missing advice fields: {missing}")
+        values = [json.dumps(list(row["risk_flags"])) if name == "risk_flags" else row.get(name) for name in _ADVICE_COLUMNS]
+        columns = ", ".join(_ADVICE_COLUMNS)
+        marks = ", ".join("?" for _ in _ADVICE_COLUMNS)
+        with self._conn:
+            cursor = self._conn.execute(f"INSERT INTO advice_log ({columns}) VALUES ({marks})", values)
+        return int(cursor.lastrowid or 0)
+
+    @_locked
+    def advice_rows(self, *, unresolved: bool = False) -> list[dict[str, Any]]:
+        """Logged verdicts, oldest first, with the closed position's result in R (``realized_r``)
+        when the row entered one. ``unresolved`` keeps the rows without a counterfactual yet."""
+        query = """SELECT a.*, p.r_multiple AS realized_r FROM advice_log a
+            LEFT JOIN positions p ON p.id = a.position_id AND p.status = 'closed'"""
+        if unresolved:
+            query += " WHERE a.resolved_at IS NULL"
+        out = []
+        for row in self._conn.execute(query + " ORDER BY a.id").fetchall():
+            item = dict(row)
+            item["risk_flags"] = json.loads(item["risk_flags"] or "[]")
+            item["taken"] = bool(item["taken"])
+            out.append(item)
+        return out
+
+    @_locked
+    def resolve_advice(self, advice_id: int, counterfactual_r: float, resolved_at: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                "UPDATE advice_log SET counterfactual_r=?, resolved_at=? WHERE id=? AND resolved_at IS NULL",
+                (counterfactual_r, resolved_at, advice_id),
+            )
+
+    @_locked
+    def link_advice(self, advice_id: int, position_id: int) -> None:
+        """Record that the row a verdict judged was sent as ``position_id``."""
+        with self._conn:
+            self._conn.execute("UPDATE advice_log SET taken=1, position_id=? WHERE id=?", (position_id, advice_id))
+
+    @_locked
+    def record_advisor_usage(self, day: str, **counts: float) -> None:
+        """Add to the day's advisor counters (``_USAGE_COLUMNS``): calls, tokens, cost, verdicts, errors."""
+        unknown = set(counts) - set(_USAGE_COLUMNS)
+        if unknown:
+            raise ValueError(f"unknown usage fields: {sorted(unknown)}")
+        if not counts:
+            return
+        names = list(counts)
+        columns = ", ".join(names)
+        marks = ", ".join("?" for _ in names)
+        updates = ", ".join(f"{name}={name}+excluded.{name}" for name in names)
+        with self._conn:
+            self._conn.execute(
+                f"INSERT INTO advisor_usage_daily(day, {columns}) VALUES (?, {marks}) ON CONFLICT(day) DO UPDATE SET {updates}",
+                (day, *counts.values()),
+            )
+
+    @_locked
+    def advisor_usage(self, since: str, until: str | None = None) -> dict[str, Any]:
+        """The advisor counters summed over the UTC days ``since`` to ``until``, both included
+        (``until`` None: every day from ``since``). Zeros without a row."""
+        sums = ", ".join(f"COALESCE(SUM({name}), 0) AS {name}" for name in _USAGE_COLUMNS)
+        query = f"SELECT {sums} FROM advisor_usage_daily WHERE day >= ?"
+        values: list[Any] = [since]
+        if until is not None:
+            query += " AND day <= ?"
+            values.append(until)
+        row = self._conn.execute(query, values).fetchone()
+        return {name: (float(row[name]) if name == "cost_usd" else int(row[name])) for name in _USAGE_COLUMNS}
 
     # -- armed entries -----------------------------------------------------
 

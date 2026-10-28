@@ -119,6 +119,11 @@ class Opportunity:
     slippage_est: float | None = None
     #: Target distance above the entry; the executor re-applies it on the average fill.
     plan_target_pct: float | None = None
+    #: The setup's market regime (``Setup.regime``: trend_up, trend_down, range, funding...).
+    regime: str | None = None
+    #: The DeepSeek advisor's verdict on this row, for the panel and the position it opens
+    #: (``bot.advisor.service.AdviceState.public``); None when the row was not consulted.
+    advice: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -245,4 +250,5 @@ def classify(
         alphas=setup.alphas,
         blocker=blocker,
         slippage_est=slippage,
+        regime=setup.regime,
     )

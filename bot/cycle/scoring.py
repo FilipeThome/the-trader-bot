@@ -18,8 +18,9 @@ from typing import Any
 
 import pandas as pd
 
+from bot.advisor.service import AdviceKey, AdviceState, advice_key
 from bot.collector import MarketSnapshot
-from bot.config import BotConfig, RiskLimits
+from bot.config import AdvisorConfig, BotConfig, RiskLimits
 from bot.cycle import market
 from bot.cycle.context import CycleContext, ScoreEffect, profile_for
 from bot.decay import pair_demoted, pair_slippage_blocked
@@ -80,10 +81,14 @@ def _score(
     """Every enabled strategy's setup on every analysed pair: classified, checked and sized.
 
     Reads the cycle's context (risk level, account taker fee per pair, closed hourly
-    returns with BTC/USDT, book, equity) and writes nothing: the equity point, the pair
-    blocks, the refusals counted and the decisions come back as effects, each with the
-    row's status and reason at score time, for ``_apply_effects``. ``decided`` is the last
-    decision recorded per (symbol, strategy), read only.
+    returns with BTC/USDT, book, equity, the advisor's verdicts) and writes nothing: the
+    equity point, the pair blocks, the refusals counted and the decisions come back as
+    effects, each with the row's status and reason at score time, for ``_apply_effects``.
+    ``decided`` is the last decision recorded per (symbol, strategy), read only.
+
+    A row the advisor judged shows the verdict (``Opportunity.advice``). In ``filter`` a
+    ``reduce`` verdict's factor goes into ``RiskManager.assess``, which applies it last and
+    only downwards (``_advice_factor``).
     """
     state = context.state
     assert state is not None, "the cycle scores on its own risk level"
@@ -197,6 +202,9 @@ def _score(
                     draft, venue_cap_usd=inputs.venue_cap, atr_daily_pct=inputs.atr_daily, throttle=inputs.throttle
                 )
                 vol_cap = vol_target_cap(limits, sizing_capital, held_usd, symbol, planned.size_usd, returns)
+            advice = _advice_entry(context, symbol, strategy_id, setup.timeframe, config.advisor)
+            if advice is not None:
+                draft.advice = advice.public()
             verdict = risk.assess(
                 draft,
                 open_positions=positions,
@@ -210,6 +218,7 @@ def _score(
                 atr_daily_pct=inputs.atr_daily,
                 throttle=inputs.throttle,
                 vol_target_cap_usd=vol_cap,
+                advice_factor=_advice_factor(advice, config.advisor),
             )
             if draft.status == "pronta" and not verdict.allowed:
                 draft.status = "bloqueada"
@@ -376,6 +385,65 @@ def _auto_eligible(item: Opportunity, test_auto: bool, config: BotConfig) -> boo
     return False
 
 
+def _advice_entry(
+    context: CycleContext, symbol: str, strategy_id: str, timeframe: str, settings: AdvisorConfig
+) -> AdviceState | None:
+    """The verdict cached for this setup's signal bar, or None (advisor off, or never asked)."""
+    if settings.mode == "off" or not context.advice:
+        return None
+    bar = _signal_bar(context.snapshot, symbol, timeframe, context.moment)
+    if bar is None:
+        return None
+    return context.advice.get(advice_key(symbol, strategy_id, timeframe, bar[0], settings.model))
+
+
+def _advice_factor(entry: AdviceState | None, settings: AdvisorConfig) -> float:
+    """The size factor scoring passes to ``RiskManager.assess``: a ``reduce`` verdict's in
+    ``filter``, 1 otherwise. Only the factor goes in, never the verdict (S-A3)."""
+    if settings.mode != "filter" or entry is None or entry.advice is None or entry.advice.verdict != "reduce":
+        return 1.0
+    return entry.advice.size_factor
+
+
+def advice_request_key(item: Opportunity, snapshot: MarketSnapshot, moment: datetime, model: str) -> tuple[AdviceKey, float] | None:
+    """The advisor's cache key of a ready row and its signal bar's close (the counterfactual's
+    entry); None without a closed bar of the row's timeframe."""
+    bar = _signal_bar(snapshot, item.symbol, item.timeframe, moment)
+    if bar is None:
+        return None
+    return advice_key(item.symbol, item.strategy, item.timeframe, bar[0], model), bar[1]
+
+
+def _advice_allows(item: Opportunity, entry: AdviceState | None, moment: datetime, settings: AdvisorConfig) -> bool:
+    """Whether the advisor lets automatic trading take a ready row (6.4). Only ``filter`` holds
+    anything back; ``shadow`` never changes or delays an entry.
+
+    A veto at ``min_veto_confidence`` or above keeps the row out and says why; it stays ready
+    for a manual or armed entry, as the late-signal rule leaves it. A verdict still pending
+    holds the row until ``wait_seconds`` after the request, counted across cycles, never
+    waited for inside one; after that, or with no verdict at all (no key, budget spent, an
+    API failure, a full queue, an abstention), the row goes on, unless ``require_verdict``.
+    """
+    if settings.mode != "filter":
+        return True
+    advice = entry.advice if entry is not None else None
+    if entry is not None and entry.status == "pending":
+        waited = max(0.0, (moment - entry.requested_at).total_seconds())
+        if waited < settings.wait_seconds:
+            item.reason = f"{item.reason}; aguardando a análise IA ({waited:.0f} de {settings.wait_seconds} s)"
+            return False
+    elif advice is not None and advice.verdict != "abstain":
+        if advice.verdict == "veto" and advice.confidence >= settings.min_veto_confidence:
+            why = advice.rationale or "sem justificativa"
+            item.reason = f"{item.reason}; IA desaconselha: {why} (confiança {advice.confidence:.0%}); sem entrada automática"
+            return False
+        return True
+    if settings.require_verdict:
+        item.reason = f"{item.reason}; análise IA exigida e sem veredito: sem entrada automática"
+        return False
+    return True
+
+
 def _clears_floor(item: Opportunity, config: BotConfig) -> bool:
     """Whether a real (non-test) row's estimated hit rate allows an automatic entry.
 
@@ -457,6 +525,18 @@ def _entry_drift_r(
     if not (signal > 0 and math.isfinite(signal) and math.isfinite(last)):
         return None
     return (last / signal - 1) / risk_pct
+
+
+def _signal_bar(snapshot: MarketSnapshot, symbol: str, timeframe: str, moment: datetime) -> tuple[str, float] | None:
+    """When the signal's closed bar closed (ISO time) and its close; None without such a bar."""
+    width = market._BAR.get(timeframe)
+    frame = market._closed(snapshot, symbol, timeframe, moment) if width is not None else None
+    if frame is None or width is None:
+        return None
+    close = float(frame["close"].iloc[-1])
+    if not (close > 0 and math.isfinite(close)):
+        return None
+    return (pd.Timestamp(frame.index[-1]) + width).isoformat(), close
 
 
 def _signal_age(snapshot: MarketSnapshot, symbol: str, timeframe: str, moment: datetime) -> float | None:

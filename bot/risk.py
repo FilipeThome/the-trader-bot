@@ -34,6 +34,7 @@ SIZE_LIMITS: dict[str, str] = {
     "vol_target": "alvo de volatilidade",
     "cash": "caixa",
     "throttle": "volatilidade de 7 dias alta (metade)",
+    "advice": "análise IA",
 }
 
 #: Risk levels of ``RiskManager.portfolio_state``, mildest first.
@@ -312,6 +313,7 @@ class RiskManager:
         atr_daily_pct: float | None = None,
         throttle: float = 1.0,
         vol_target_cap_usd: float | None = None,
+        advice_factor: float = 1.0,
     ) -> RiskVerdict:
         """Whether a row may trade, and its size (``sizing`` within the exposure room).
 
@@ -320,6 +322,10 @@ class RiskManager:
         ``risk_scale`` lowers the risk share. The exposure room is ``min(C·max_exposure_pct,
         vol_target_cap_usd) − exposure_usd``: an order larger than the room shrinks to it
         (``exposure`` or ``vol_target`` binds), and no room refuses.
+
+        ``advice_factor`` is the DeepSeek advisor's ``reduce`` factor in ``filter`` mode. It
+        only multiplies the size ``_decide`` reaches (``_advice_factor``): it never lifts a
+        refusal above, and a factor that shrinks the order to zero refuses like any cap.
         """
         if stale:
             return RiskVerdict(False, "OHLCV com mais de 2 intervalos de atraso")
@@ -345,7 +351,13 @@ class RiskManager:
             caps = {name: round(value, 2) for name, value in room.items()}
             return RiskVerdict(False, self._room_reason(tightest, exposure_usd), size_limit=tightest, caps=caps)
         decision = self._decide(
-            opportunity, scale, venue_cap_usd=venue_cap_usd, atr_daily_pct=atr_daily_pct, throttle=throttle, room=room
+            opportunity,
+            scale,
+            venue_cap_usd=venue_cap_usd,
+            atr_daily_pct=atr_daily_pct,
+            throttle=throttle,
+            room=room,
+            advice=advice_factor,
         )
         # Below a cent the order would be sent as zero.
         if round(decision.size_usd, 2) <= 0:
@@ -371,7 +383,13 @@ class RiskManager:
         atr_daily_pct: float | None,
         throttle: float,
         room: dict[str, float] | None = None,
+        advice: float = 1.0,
     ) -> SizeDecision:
+        """The smallest cap, then the throttle, then the advisor's factor, each only shrinking.
+
+        The advisor's factor comes last, as a multiplier like the throttle: it can lower the
+        size the deterministic caps allow and never raise it (S-A3, R-A8).
+        """
         capital = self.sizing_capital
         share, share_limit = self._risk_share(opportunity)
         stop = opportunity.risk_pct
@@ -393,6 +411,11 @@ class RiskManager:
             size *= factor
             caps["throttle"] = size
             binding = "throttle"
+        shrink = _advice_factor(advice)
+        if shrink < 1 and size > 0:
+            size *= shrink
+            caps["advice"] = size
+            binding = "advice"
         return SizeDecision(size, binding, {name: round(value, 2) for name, value in caps.items()})
 
     def _risk_share(self, opportunity: Opportunity) -> tuple[float, str]:
@@ -881,6 +904,17 @@ def _throttle_factor(throttle: float) -> float:
     if not _finite(throttle):
         return 1.0
     return min(1.0, max(0.0, float(throttle)))
+
+
+#: The advisor may shrink an order to a quarter of its size, never less, never more than whole.
+MIN_ADVICE_FACTOR = 0.25
+
+
+def _advice_factor(factor: float) -> float:
+    """The advisor's size factor within [``MIN_ADVICE_FACTOR``, 1]; 1 when unreadable (abstain)."""
+    if not _finite(factor):
+        return 1.0
+    return min(1.0, max(MIN_ADVICE_FACTOR, float(factor)))
 
 
 def _level_of(previous: RiskState | Mapping[str, Any] | str | None) -> str | None:

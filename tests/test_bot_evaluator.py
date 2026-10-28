@@ -83,10 +83,15 @@ def test_classify_uses_the_given_taker() -> None:
 
 def test_new_opportunity_fields_default_and_come_last() -> None:
     row = classify(_setup(), slippage=0.0007).to_dict()
-    added = ["size_limit", "size_caps", "signal_age_seconds", "entry_drift_r", "cluster", "slippage_est", "plan_target_pct"]
+    added = [
+        "size_limit", "size_caps", "signal_age_seconds", "entry_drift_r", "cluster", "slippage_est", "plan_target_pct",
+        "regime", "advice",
+    ]
     assert list(row)[-len(added):] == added
     assert row["slippage_est"] == 0.0007
-    assert all(row[name] is None for name in added if name != "slippage_est")
+    # classify copies the setup's regime; the advisor's verdict comes later, from the cycle.
+    assert row["regime"] == _setup().regime
+    assert all(row[name] is None for name in added if name not in ("slippage_est", "regime"))
 
 
 def test_trend_never_backs_a_range_regime() -> None:

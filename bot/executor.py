@@ -62,7 +62,7 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -269,6 +269,20 @@ def floor_price(value: Decimal, rules: MarketRules) -> Decimal:
     return Decimal(0)
 
 
+def _advice_record(advice: Mapping[str, Any] | None) -> tuple[str, float | None, int | None] | None:
+    """The advisor's verdict, confidence and ``advice_log`` id on the row an entry comes from
+    (``Opportunity.advice``); None when the row had no verdict."""
+    if not advice or advice.get("status") != "done" or not isinstance(advice.get("verdict"), str):
+        return None
+    confidence = advice.get("confidence")
+    log_id = advice.get("id")
+    return (
+        str(advice["verdict"]),
+        float(confidence) if isinstance(confidence, (int, float)) and not isinstance(confidence, bool) else None,
+        log_id if isinstance(log_id, int) and not isinstance(log_id, bool) else None,
+    )
+
+
 class Executor:
     def __init__(
         self,
@@ -367,6 +381,7 @@ class Executor:
             return decide("bloqueado", "entrada abaixo do mínimo da corretora")
         plan_stop = _positive(opportunity.risk_pct)
         plan_target = _positive(opportunity.plan_target_pct)
+        advice = _advice_record(opportunity.advice)
         position_id = self.store.open_pending(
             symbol,
             opportunity.strategy,
@@ -381,9 +396,14 @@ class Executor:
             plan_stop_pct=float(plan_stop) if plan_stop is not None and plan_stop < 1 else None,
             plan_target_pct=None if plan_target is None else float(plan_target),
             exit_hysteresis=self.exit_hysteresis,
+            entry_advice_verdict=advice[0] if advice is not None else None,
+            entry_advice_confidence=advice[1] if advice is not None else None,
         )
         if position_id is None:
             return decide("bloqueado", "já existe posição viva neste par e estratégia")
+        if advice is not None and advice[2] is not None:
+            # The calibration's realized column follows this link to the position's result.
+            self.store.link_advice(advice[2], position_id)
         key = self._key(position_id, "entry", 0)
         # Persisted before the write: a crash after the send still leaves a row the sync can resolve,
         # and the fill's slippage is measured against the quote the order was priced on.

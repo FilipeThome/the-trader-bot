@@ -22,6 +22,8 @@ from bot.api.hub import EventHub
 from bot.api.state import ctx
 from bot.api.validation import revalidate_stale
 from bot import decay, risk
+from bot.advisor import calibration as advice_calibration
+from bot.advisor.service import Advisor
 from bot.backtest.instances import REPLAY_WINDOW_DAYS, replay_windows
 from bot.backtest.runner import VALIDATABLE, shutdown_pool
 from bot.collector import Collector, MarketSnapshot
@@ -129,6 +131,9 @@ class ConfigUpdate(BaseModel):
     #: UTC ISO times; ``[]`` clears the list.
     macro_events_utc: list[str] | None = None
     macro_pause_minutes: int | None = None
+    #: The DeepSeek advisor's settings (``AdvisorConfig``), merged over the saved ones. A
+    #: credential-shaped field is refused (422): the key lives in deepseek.json only.
+    advisor: dict[str, Any] | None = None
     #: Rewrite the mandate from the resulting config. Required to change ``flatten_on_halt``.
     reconfirm_mandate: bool = False
 
@@ -175,11 +180,13 @@ def _bind(config: BotConfig) -> Runtime:
     pin_mode_root(mode_root(config))
     if ctx.collector is None:
         ctx.collector = Collector()
+    if ctx.advisor is None:
+        ctx.advisor = Advisor()
     if ctx.runtime is not None:
         # A tick of the old runtime still reading Binance stops before it acts.
         ctx.runtime.retired = True
     store = ctx.store_for(config)
-    runtime = Runtime(config, store, ctx.collector, publish=hub.publish, lock=ctx.lock)
+    runtime = Runtime(config, store, ctx.collector, publish=hub.publish, lock=ctx.lock, advisor=ctx.advisor)
     ctx.runtime = runtime
     ctx.config = config
     cap = _pilot_cap(store) if config.mode == "production" else None
@@ -300,7 +307,13 @@ def status() -> dict[str, Any]:
         "violations_avoided": int(today["violations_avoided"]) if today else 0,
         "net_pnl": float(today["net_pnl"]) if today else 0.0,
         "trades": int(today["trades"]) if today else 0,
+        "advisor": _advisor(runtime).status(config.advisor, store, datetime.now(timezone.utc)),
     }
+
+
+def _advisor(runtime: Runtime) -> Advisor:
+    """The process's advisor; a fresh, idle one when this runtime was built without it."""
+    return runtime.advisor or ctx.advisor or Advisor()
 
 
 def _validated(row: dict[str, Any], config: BotConfig) -> bool:
@@ -414,6 +427,10 @@ def performance() -> dict[str, Any]:
         "equity_peak": runtime.config.capital_for_sizing() + store.peak_pnl(),
         "calibration": store.calibration(),
         "pairs": _pair_slippage(runtime),
+        "advice_calibration": advice_calibration.calibration(
+            store.advice_rows(), min_veto_confidence=runtime.config.advisor.min_veto_confidence, now=datetime.now(timezone.utc)
+        ),
+        "advisor_usage": advice_calibration.usage(store, datetime.now(timezone.utc)),
     }
 
 
@@ -920,6 +937,8 @@ def update_config(body: ConfigUpdate) -> dict[str, Any]:
             data["flatten_on_halt"] = body.flatten_on_halt
         if body.limits is not None:
             data["limits"] = _merge_limits(data["limits"], body.limits)
+        if body.advisor is not None:
+            data["advisor"] = {**data["advisor"], **body.advisor}
         if {"take_profit_pct", "stop_loss_pct"} & body.model_fields_set:
             data["take_profit_pct"] = body.take_profit_pct
             data["stop_loss_pct"] = body.stop_loss_pct
