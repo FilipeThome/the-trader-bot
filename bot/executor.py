@@ -62,7 +62,7 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -73,7 +73,9 @@ from bot.exchange import service
 from bot.exchange.execution.rules import MarketRules, decimal_text, floor_to_step
 from bot.exchange.weight import weight_pressure
 from bot.instances import ORDERS_PER_RESTING_LEG
+from bot.logging_setup import redact
 from bot.reports import append_ledger
+from bot.risk import buy_block
 from bot.store import Store
 from bot.strategies import exit_policy_for
 from bot.strategies.day import DAY
@@ -267,6 +269,23 @@ def floor_price(value: Decimal, rules: MarketRules) -> Decimal:
     return Decimal(0)
 
 
+def _advice_record(advice: Mapping[str, Any] | None, scope: str) -> tuple[str, float | None, int | None] | None:
+    """The advisor's verdict, confidence and ``advice_log`` id on the row an entry comes from
+    (``Opportunity.advice``); None when the row had no verdict. The id is kept only when the
+    verdict was logged in the store ``scope`` (``Store.identity``) names: an id of another mode's
+    store would mark an unrelated row of this one as taken."""
+    if not advice or advice.get("status") != "done" or not isinstance(advice.get("verdict"), str):
+        return None
+    confidence = advice.get("confidence")
+    log_id = advice.get("id")
+    own = advice.get("store") == scope
+    return (
+        str(advice["verdict"]),
+        float(confidence) if isinstance(confidence, (int, float)) and not isinstance(confidence, bool) else None,
+        log_id if own and isinstance(log_id, int) and not isinstance(log_id, bool) else None,
+    )
+
+
 class Executor:
     def __init__(
         self,
@@ -365,6 +384,7 @@ class Executor:
             return decide("bloqueado", "entrada abaixo do mínimo da corretora")
         plan_stop = _positive(opportunity.risk_pct)
         plan_target = _positive(opportunity.plan_target_pct)
+        advice = _advice_record(opportunity.advice, self.store.identity)
         position_id = self.store.open_pending(
             symbol,
             opportunity.strategy,
@@ -379,9 +399,14 @@ class Executor:
             plan_stop_pct=float(plan_stop) if plan_stop is not None and plan_stop < 1 else None,
             plan_target_pct=None if plan_target is None else float(plan_target),
             exit_hysteresis=self.exit_hysteresis,
+            entry_advice_verdict=advice[0] if advice is not None else None,
+            entry_advice_confidence=advice[1] if advice is not None else None,
         )
         if position_id is None:
             return decide("bloqueado", "já existe posição viva neste par e estratégia")
+        if advice is not None and advice[2] is not None:
+            # The calibration's realized column follows this link to the position's result.
+            self.store.link_advice(advice[2], position_id)
         key = self._key(position_id, "entry", 0)
         # Persisted before the write: a crash after the send still leaves a row the sync can resolve,
         # and the fill's slippage is measured against the quote the order was priced on.
@@ -499,11 +524,9 @@ class Executor:
         The row is an ordinary position whose strategy and exit policy are the kind, so
         the sync, the halt, the risk checks and the panel treat it like any other.
         """
-        reducing = self._buy_block()
+        reducing = self._buy_block(clock_blocked=clock_blocked)
         if reducing is not None:
             return {"status": "blocked", "error": reducing}
-        if clock_blocked:
-            return {"status": "blocked", "error": "relógio fora de 1s — só cancelamentos e saídas"}
         blocker = service.write_blocker()
         if blocker is not None:
             return {"status": "blocked", "error": blocker}
@@ -558,11 +581,9 @@ class Executor:
             return "sem stop confirmado"
         if position.get("pending_leg") or position.get("keep_qty") is not None:
             return "outra ordem da posição em andamento"
-        reducing = self._buy_block()
+        reducing = self._buy_block(clock_blocked=clock_blocked)
         if reducing is not None:
             return reducing
-        if clock_blocked:
-            return "relógio fora de 1s — só cancelamentos e saídas"
         blocker = service.write_blocker()
         if blocker is not None:
             return blocker
@@ -762,11 +783,9 @@ class Executor:
             return "sem stop confirmado"
         if position.get("pending_leg") or position.get("keep_qty") is not None:
             return "outra ordem da posição em andamento"
-        reducing = self._buy_block()
+        reducing = self._buy_block(clock_blocked=clock_blocked)
         if reducing is not None:
             return reducing
-        if clock_blocked:
-            return "relógio fora de 1s — só cancelamentos e saídas"
         blocker = service.write_blocker()
         if blocker is not None:
             return blocker
@@ -881,11 +900,11 @@ class Executor:
                 outcome = self.cancel_rest(int(position["id"]))
             except UnprotectedPosition as exc:
                 logger.error("resting buy of position %s: %s", position["id"], exc)
-                results.append({**row, "status": "error", "error": str(exc), "unprotected": True})
+                results.append({**row, "status": "error", "error": redact(str(exc)), "unprotected": True})
                 continue
             except Exception as exc:  # noqa: BLE001 - one position must not stop the rest
                 logger.exception("cancel of the resting buy of position %s failed", position["id"])
-                results.append({**row, "status": "error", "error": f"{type(exc).__name__}: {exc}"})
+                results.append({**row, "status": "error", "error": redact(f"{type(exc).__name__}: {exc}")})
                 continue
             failed = outcome in (REST_CANCEL_PENDING, REST_RESTOP_PENDING)
             results.append({**row, "status": "error" if failed else "ok", "outcome": outcome})
@@ -1636,7 +1655,7 @@ class Executor:
                 results.append(
                     {
                         "status": "error",
-                        "error": f"{type(exc).__name__}: {exc}",
+                        "error": redact(f"{type(exc).__name__}: {exc}"),
                         "position_id": position["id"],
                         "symbol": position["symbol"],
                         # Only the raise itself is known; the stop may already be off the book.
@@ -1974,27 +1993,15 @@ class Executor:
     def _ask(self, symbol: str) -> Decimal | None:
         return self._quote_field(symbol, "ask")
 
-    def _buy_block(self) -> str | None:
-        """Why every buy is refused now: REDUCING, or the daily-loss pause (``paused_until``), else None.
-        Stops, exits and the sync go on under both."""
-        return self._reducing() or self._paused()
+    def _buy_block(self, *, clock_blocked: bool = False) -> str | None:
+        """Why every buy is refused now (``risk.buy_block``), else None. Stops, exits and the sync go on.
 
-    def _paused(self) -> str | None:
-        """The daily-loss pause: buys wait for the next UTC day (``bot_state.paused_until``)."""
-        until = self.store.get_state("paused_until")
-        if isinstance(until, str) and until > _now().isoformat():
-            return "pausado até o próximo dia UTC"
-        return None
-
-    def _reducing(self) -> str | None:
-        """Why a buy is refused: the portfolio is in REDUCING (``bot_state.risk_state``), else None."""
-        state = self.store.get_state("risk_state")
-        if not isinstance(state, dict) or state.get("level") != "reducing":
-            return None
-        drawdown = state.get("drawdown")
-        if isinstance(drawdown, (int, float)) and not isinstance(drawdown, bool):
-            return f"modo só reduzir: drawdown de {drawdown:.1%}"
-        return "modo só reduzir"
+        Read from the store with the wall clock at order time, not the cycle's moment: a level or a
+        pause stored since the cycle began still refuses the buy at the choke point.
+        """
+        return buy_block(
+            self.store.get_state("risk_state"), self.store.get_state("paused_until"), _now(), clock_blocked=clock_blocked
+        )
 
     def _stop_window(self, kind: str, position_id: int, started: float | None) -> None:
         """Store how long the position stood without a stop, once the new one is on the book.

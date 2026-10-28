@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -17,21 +16,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from bot.api import presets, validation
 from bot.api.auth import load_or_create_token, refusal
 from bot.api.hub import EventHub
-from bot.api.state import BotContext
+from bot.api.state import ctx
+from bot.api.validation import revalidate_stale
 from bot import decay, risk
-from bot.backtest.loaders.binance_loader import WeightPressure
+from bot.advisor import calibration as advice_calibration
+from bot.advisor.service import Advisor
 from bot.backtest.instances import REPLAY_WINDOW_DAYS, replay_windows
-from bot.backtest.runner import (
-    VALIDATABLE,
-    BacktestResult,
-    shutdown_pool,
-    strategy_record,
-    timeframe_record,
-    validate_strategy,
-    validation_days,
-)
+from bot.backtest.runner import VALIDATABLE, shutdown_pool
 from bot.collector import Collector, MarketSnapshot
 from bot.config import DEFAULT_SYMBOLS, MAX_SYMBOLS, BotConfig, is_usdt_pair
 from bot.evaluator import Opportunity
@@ -41,30 +35,19 @@ from bot.features import build_features, ensure_chart_data
 from bot.instances import DcaParams, GridParams, Kind
 from bot.live.mandate.store import load_mandate
 from bot.mandate_io import commit_mandate_for, mandate_caps_for, mandate_is_restricted
-from bot.strategies.day import DAY, DAY_WIN_RATE_MARGIN
+from bot.strategies.day import DAY_WIN_RATE_MARGIN
 from bot.strategies.trailing import TRAIL
 from bot.markets import CHART_LEAD, chart_interval, merge_symbols, top_liquid_usdt, tradable_symbols, venue_klines, venue_symbols
 from bot.paths import pin_mode_root
 from bot.promotion import PILOT_STATE, switch_to_production
 from bot.recommend import recommendations
-from bot.reports import append_ledger, build_daily_report, verify_ledger
+from bot.reports import build_daily_report, verify_ledger
 from bot.runtime import Runtime, mode_root, profile_for
 from bot.store import Store
-from bot.strategies import (
-    DAY_STRATEGIES,
-    GATE_VERSION,
-    STRATEGIES,
-    STRATEGY_VERSIONS,
-    exit_policy_for,
-    pairset_hash,
-    timeframe_result,
-    uses_hysteresis,
-    validated_for,
-)
+from bot.strategies import STRATEGIES, live_thresholds, timeframe_result, validated_for
 
 logger = logging.getLogger(__name__)
 hub = EventHub()
-ctx = BotContext()
 #: Liquid pairs read for the "top" preset; the venue filter keeps the first ``count`` it can trade.
 _TOP_POOL = 60
 #: Single flight for the recommendations scan.
@@ -76,23 +59,12 @@ _CHART_TAIL = timedelta(minutes=15)
 #: A DCA or grid preview replays its plan on the last 30, 90 and 180 days of 1h candles (D27).
 REPLAY_INTERVAL = "1h"
 REPLAY_DAYS = max(REPLAY_WINDOW_DAYS)
-#: The market filter reads BTC's 4h bars; its EMA of 240 bars needs about 40 days before the span.
-MARKET_SYMBOL = "BTC/USDT"
-MARKET_WARMUP_DAYS = 40
-#: Extra days of 1h bars that warm a day strategy's EMA 50 trend filter.
-HOURLY_WARMUP_DAYS = 5
-#: A pair-set change re-validates a strategy at most once per this period (D12).
-PAIRSET_REVALIDATE_EVERY = timedelta(hours=24)
-#: An automatic re-validation that failed is tried again after this, not on every loop step.
-REVALIDATE_RETRY = timedelta(hours=1)
 #: Days the stop-window statistics and the per-pair slippage cover.
 REPORT_DAYS = 30
 #: A pair's slippage is the mean round trip of its last trades (the decay block's window).
 SLIPPAGE_TRADES = 20
 #: A pair's ``blocked_reason`` when its slippage check failed; its ``blocked`` is then null (unknown).
 SLIPPAGE_CHECK_FAILED = "verificação de slippage falhou"
-#: Stop distance of the day preset's sizing example.
-PRESET_STOP_PCT = 0.01
 _TRADE_FIELDS = (
     "id", "symbol", "strategy", "side", "status", "qty", "avg_price", "stop_price", "target_price",
     "peak_price", "exit_policy", "opened_at", "closed_at", "exit_price", "realized_pnl", "reason", "test_only",
@@ -100,15 +72,6 @@ _TRADE_FIELDS = (
     "entry_ref_price", "initial_stop", "initial_risk_usd", "mae_price", "mfe_price", "entry_slippage",
     "exit_slippage", "r_multiple",
 )
-#: The day-trade preset: research-backed defaults (docs/plano-day-trade.md), editable afterwards.
-DAY_PRESET_LIMITS: dict[str, float | int] = {
-    "risk_per_trade_pct": 0.005,
-    "max_daily_loss_pct": 0.02,
-    "max_trades_per_day": 8,
-    "pair_cooldown_minutes": 60,
-    "loss_guard_trades": 3,
-}
-DAY_PRESET_FIELDS: dict[str, float] = {"cost_multiple": 3.0, "min_reward_risk": 1.2}
 
 
 @asynccontextmanager
@@ -168,6 +131,9 @@ class ConfigUpdate(BaseModel):
     #: UTC ISO times; ``[]`` clears the list.
     macro_events_utc: list[str] | None = None
     macro_pause_minutes: int | None = None
+    #: The DeepSeek advisor's settings (``AdvisorConfig``), merged over the saved ones. A
+    #: credential-shaped field is refused (422): the key lives in deepseek.json only.
+    advisor: dict[str, Any] | None = None
     #: Rewrite the mandate from the resulting config. Required to change ``flatten_on_halt``.
     reconfirm_mandate: bool = False
 
@@ -214,11 +180,13 @@ def _bind(config: BotConfig) -> Runtime:
     pin_mode_root(mode_root(config))
     if ctx.collector is None:
         ctx.collector = Collector()
+    if ctx.advisor is None:
+        ctx.advisor = Advisor()
     if ctx.runtime is not None:
         # A tick of the old runtime still reading Binance stops before it acts.
         ctx.runtime.retired = True
     store = ctx.store_for(config)
-    runtime = Runtime(config, store, ctx.collector, publish=hub.publish, lock=ctx.lock)
+    runtime = Runtime(config, store, ctx.collector, publish=hub.publish, lock=ctx.lock, advisor=ctx.advisor)
     ctx.runtime = runtime
     ctx.config = config
     cap = _pilot_cap(store) if config.mode == "production" else None
@@ -286,6 +254,7 @@ def status() -> dict[str, Any]:
     stored = store.strategies()
     since = (datetime.now(timezone.utc) - timedelta(days=REPORT_DAYS)).isoformat()
     since_pass = {strategy_id: store.trials_since_pass(strategy_id) for strategy_id in VALIDATABLE}
+    universe = validation.replay_universe(config, store) or config.symbols
     return {
         "running": runtime.running,
         "halted": runtime.halted,
@@ -302,10 +271,10 @@ def status() -> dict[str, Any]:
         # Trial rows recorded since the last pass, and the deflated Sharpe's N they make with this config.
         "trials": {strategy_id: len(trials) for strategy_id, trials in since_pass.items()},
         "trials_n": {
-            strategy_id: _trial_count(trials, _config_combinations(strategy_id, config))
+            strategy_id: validation._trial_count(trials, validation._config_combinations(strategy_id, config, universe))
             for strategy_id, trials in since_pass.items()
         },
-        "validations": _validation_jobs(runtime.config.mode),
+        "validations": validation._validation_jobs(runtime.config.mode),
         "risk_state": store.get_state("risk_state"),
         "stop_windows": store.stop_window_stats(since),
         "mandate": _mandate_summary(),
@@ -338,20 +307,32 @@ def status() -> dict[str, Any]:
         "violations_avoided": int(today["violations_avoided"]) if today else 0,
         "net_pnl": float(today["net_pnl"]) if today else 0.0,
         "trades": int(today["trades"]) if today else 0,
+        "advisor": _advisor(runtime).status(config.advisor, store, datetime.now(timezone.utc)),
     }
+
+
+def _advisor(runtime: Runtime) -> Advisor:
+    """The process's advisor; a fresh, idle one when this runtime was built without it."""
+    return runtime.advisor or ctx.advisor or Advisor()
 
 
 def _validated(row: dict[str, Any], config: BotConfig) -> bool:
     """Executable by the cycle's signal-only rule: not signal-only, the result replayed today's
-    rules, and an operated timeframe passed with a readable Monte Carlo p95 drawdown under the
-    drawdown limit at today's risk per trade (``risk.mc_drawdown_ok``)."""
+    rules and ``classify`` thresholds, and an operated timeframe passed with a readable Monte
+    Carlo p95 drawdown under the drawdown limit at today's risk per trade (``risk.mc_drawdown_ok``)."""
     params = row["params"]
     strategy = STRATEGIES.get(row["strategy_id"])
     timeframes = strategy.timeframes if strategy is not None else ()
+    thresholds = live_thresholds(config.score_threshold, config.cost_multiple, config.min_reward_risk, config.exit_policy)
     return (
         not row["signal_only"]
         and validated_for(
-            params, row["strategy_id"], config.exit_policy, market_filter=config.market_filter, hysteresis=config.exit_hysteresis
+            params,
+            row["strategy_id"],
+            config.exit_policy,
+            market_filter=config.market_filter,
+            hysteresis=config.exit_hysteresis,
+            thresholds=thresholds,
         )
         and any(_operable(timeframe_result(params, timeframe), config) for timeframe in timeframes)
     )
@@ -365,13 +346,24 @@ def _operable(result: dict[str, Any] | None, config: BotConfig) -> bool:
 def _validation_detail_of(params: dict[str, Any] | None, config: BotConfig) -> dict[str, dict[str, Any]]:
     """Each replayed timeframe's result plus ``mc_ok`` (``risk.mc_drawdown_ok``, the live check, D10):
     the Monte Carlo p95 drawdown at today's risk per trade is readable and below the drawdown
-    limit. A missing or unreadable p95 is not ok."""
+    limit. A missing or unreadable p95 is not ok. Each result also carries the universe it
+    replayed (``universe``: "liquid" under automatic selection, "pairs" otherwise, with
+    ``universe_pairs``) and keeps the portfolio limits it ran under (``limits``,
+    ``skipped_by_limits``): changing a limit does not re-validate (Q-A5)."""
     detail: dict[str, dict[str, Any]] = {}
+    universe = {
+        "universe": (params or {}).get("universe", "pairs"),
+        "universe_pairs": len((params or {}).get("symbols") or ()),
+    }
     for timeframe in (params or {}).get("timeframes") or {}:
         result = timeframe_result(params, timeframe)
         if result is None:
             continue
-        detail[timeframe] = {**result, "mc_ok": risk.mc_drawdown_ok(result.get("mc_p95_dd_r"), config.limits)}
+        detail[timeframe] = {
+            **result,
+            **universe,
+            "mc_ok": risk.mc_drawdown_ok(result.get("mc_p95_dd_r"), config.limits),
+        }
     return detail
 
 
@@ -441,6 +433,10 @@ def performance() -> dict[str, Any]:
         "equity_peak": runtime.config.capital_for_sizing() + store.peak_pnl(),
         "calibration": store.calibration(),
         "pairs": _pair_slippage(runtime),
+        "advice_calibration": advice_calibration.calibration(
+            store.advice_rows(), min_veto_confidence=runtime.config.advisor.min_veto_confidence, now=datetime.now(timezone.utc)
+        ),
+        "advisor_usage": advice_calibration.usage(store, datetime.now(timezone.utc)),
     }
 
 
@@ -752,8 +748,8 @@ def trade(position_id: int) -> dict[str, Any]:
     if position is None:
         raise HTTPException(status_code=404, detail="trade não encontrado")
     now = datetime.now(timezone.utc)
-    opened = _utc(position["opened_at"])
-    closed = _utc(position["closed_at"]) if position.get("closed_at") else None
+    opened = validation._utc(position["opened_at"])
+    closed = validation._utc(position["closed_at"]) if position.get("closed_at") else None
     start = opened - CHART_LEAD
     end = min(now, closed + _CHART_TAIL) if closed else now
     interval, candles = _chart_candles(runtime.config.mode, position["symbol"], start, end)
@@ -778,11 +774,6 @@ def trade(position_id: int) -> dict[str, Any]:
         "pnl_pct": pnl_pct,
         "updated_at": now.isoformat(),
     }
-
-
-def _utc(value: Any) -> datetime:
-    moment = datetime.fromisoformat(str(value))
-    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
 
 
 def _chart_candles(mode: str, symbol: str, start: datetime, end: datetime) -> tuple[str, list[dict[str, Any]]]:
@@ -825,358 +816,18 @@ def validate(strategy_id: str) -> dict[str, Any]:
     mode switch while it runs neither moves its result nor loses its state.
     """
     if strategy_id not in VALIDATABLE:
-        raise HTTPException(status_code=422, detail="só trend, mean_reversion e momentum têm teste histórico")
+        raise HTTPException(status_code=422, detail=f"só {', '.join(VALIDATABLE)} têm teste histórico")
     runtime = _runtime()
     config = runtime.config.model_copy(deep=True)
-    job = _claim_validation(config, strategy_id, "baixando")
+    job = validation._claim_validation(config, strategy_id, "baixando")
     if job is None:
         raise HTTPException(status_code=409, detail="essa validação já está rodando")
-    _mark_started(runtime.store, [strategy_id], datetime.now(timezone.utc))
+    validation._mark_started(runtime.store, [strategy_id], datetime.now(timezone.utc))
     key = (config.mode, strategy_id)
     threading.Thread(
-        target=_run_validation, args=(key, strategy_id, config, mode_root(config)), name=f"validate-{strategy_id}", daemon=True
+        target=validation._run_validation, args=(key, strategy_id, config, mode_root(config)), name=f"validate-{strategy_id}", daemon=True
     ).start()
     return job
-
-
-def _claim_validation(config: BotConfig, strategy_id: str, stage: str) -> dict[str, Any] | None:
-    """Register a validation job, or None when one of this strategy is already running."""
-    key = (config.mode, strategy_id)
-    with ctx.validation_lock:
-        running = ctx.validations.get(key)
-        if running is not None and running["status"] == "running":
-            return None
-        job: dict[str, Any] = {
-            "status": "running",
-            "stage": stage,
-            "done": 0,
-            # One download per pair and operated timeframe.
-            "total": len(config.symbols) * len(STRATEGIES[strategy_id].timeframes),
-            "started_at": datetime.now(timezone.utc).isoformat(),
-        }
-        ctx.validations[key] = job
-        return dict(job)
-
-
-def _stale_cause(params: dict[str, Any] | None, strategy_id: str, config: BotConfig) -> str | None:
-    """Why the stored validation does not hold for ``config``; None while it does.
-
-    "new": never validated. "gate": an older gate or strategy version. "rules": another
-    exit rule, market filter or exit hysteresis, or an operated timeframe it did not
-    replay. "pairs": another pair set (D6).
-    """
-    if not params:
-        return "new"
-    if params.get("gate") != GATE_VERSION or params.get("version") != STRATEGY_VERSIONS.get(strategy_id):
-        return "gate"
-    if not validated_for(params, strategy_id, config.exit_policy, market_filter=config.market_filter, hysteresis=config.exit_hysteresis):
-        return "rules"
-    if any(timeframe_result(params, timeframe) is None for timeframe in STRATEGIES[strategy_id].timeframes):
-        return "rules"
-    if params.get("pairset") != pairset_hash(config.symbols):
-        return "pairs"
-    return None
-
-
-def _auto_validate(config: BotConfig, store: Store) -> list[str]:
-    """Validate, one after another, each enabled strategy without a result for the current rules.
-
-    Changing the take-profit and stop-loss, the market filter or the hysteresis, or
-    turning a strategy on, then needs no click: the gate runs by itself and nothing
-    trades until it passes. A strategy that already has a result for these rules,
-    passed or not, is not re-run (a changed pair set waits for ``revalidate_stale``);
-    one running is left alone.
-    """
-    stored = {row["strategy_id"]: row["params"] for row in store.strategies()}
-    wanted = [
-        strategy_id
-        for strategy_id in VALIDATABLE
-        if config.strategies.get(strategy_id) and _stale_cause(stored.get(strategy_id), strategy_id, config) in ("new", "gate", "rules")
-    ]
-    return _queue_validations(config, store, wanted)
-
-
-def revalidate_stale(runtime: Runtime, *, startup: bool = False, now: datetime | None = None) -> list[str]:
-    """Queue a validation of each enabled strategy whose stored result went stale (D12); returns them.
-
-    A new gate or strategy version, or another exit rule, market filter, hysteresis or
-    operated timeframe, re-validates at once; a changed pair set at most once per
-    ``PAIRSET_REVALIDATE_EVERY`` since the strategy's last start (``revalidate_at:<id>``).
-    A strategy never validated is left to the operator and to config changes
-    (``_auto_validate``); a failed run waits ``REVALIDATE_RETRY``. Called at startup
-    and by the process loop after each tick, so it only reads the store when nothing is stale.
-    """
-    config, store = runtime.config, runtime.store
-    moment = now or datetime.now(timezone.utc)
-    stored = {row["strategy_id"]: row["params"] for row in store.strategies()}
-    causes: dict[str, str] = {}
-    for strategy_id in VALIDATABLE:
-        if not config.strategies.get(strategy_id):
-            continue
-        cause = _stale_cause(stored.get(strategy_id), strategy_id, config)
-        if cause in (None, "new") or _failed_recently(config.mode, strategy_id, moment):
-            continue
-        if cause == "pairs" and _started_within(store, strategy_id, moment, PAIRSET_REVALIDATE_EVERY):
-            continue
-        causes[strategy_id] = str(cause)
-    queued = _queue_validations(config, store, list(causes), now=moment)
-    for stale in sorted({causes[strategy_id] for strategy_id in queued}):
-        strategies = [strategy_id for strategy_id in queued if causes[strategy_id] == stale]
-        runtime._ledger("revalidate", {"strategies": strategies, "cause": "startup" if startup else stale, "stale": stale})
-    return queued
-
-
-def _failed_recently(mode: str, strategy_id: str, moment: datetime) -> bool:
-    with ctx.validation_lock:
-        job = ctx.validations.get((mode, strategy_id))
-        finished = job.get("finished_at") if job is not None and job.get("status") == "error" else None
-    return finished is not None and _utc(finished) > moment - REVALIDATE_RETRY
-
-
-def _started_within(store: Store, strategy_id: str, moment: datetime, period: timedelta) -> bool:
-    stamp = store.get_state(f"revalidate_at:{strategy_id}")
-    try:
-        return stamp is not None and _utc(stamp) > moment - period
-    except (TypeError, ValueError):
-        return False
-
-
-def _mark_started(store: Store, strategy_ids: list[str], moment: datetime) -> None:
-    """Record when each validation started: the pair-set rate limit counts from it."""
-    for strategy_id in strategy_ids:
-        store.set_state(f"revalidate_at:{strategy_id}", moment.isoformat())
-
-
-def _queue_validations(config: BotConfig, store: Store, strategy_ids: list[str], *, now: datetime | None = None) -> list[str]:
-    """Claim a job for each strategy not already running and validate them one after another.
-
-    A single worker keeps the history downloads off each other.
-    """
-    queued = [strategy_id for strategy_id in strategy_ids if _claim_validation(config, strategy_id, "na fila") is not None]
-    if not queued:
-        return []
-    _mark_started(store, queued, now or datetime.now(timezone.utc))
-    snapshot = config.model_copy(deep=True)
-    root = mode_root(snapshot)
-
-    def work() -> None:
-        for strategy_id in queued:
-            key = (snapshot.mode, strategy_id)
-            _update_job(key, stage="baixando")
-            _run_validation(key, strategy_id, snapshot, root)
-
-    threading.Thread(target=work, name="validate-auto", daemon=True).start()
-    return queued
-
-
-def _validation_jobs(mode: str) -> dict[str, dict[str, Any]]:
-    with ctx.validation_lock:
-        return {strategy: dict(job) for (job_mode, strategy), job in ctx.validations.items() if job_mode == mode}
-
-
-def _update_job(key: tuple[str, str], **fields: Any) -> None:
-    with ctx.validation_lock:
-        ctx.validations[key].update(fields)
-
-
-class _HistoryMissing(RuntimeError):
-    """History the validation cannot run without; the message is the operator's."""
-
-
-def _run_validation(key: tuple[str, str], strategy_id: str, config: BotConfig, root: Any) -> None:
-    """Validate ``strategy_id`` on every timeframe it trades (D7) over the config's pair set (D6).
-
-    Each timeframe replays ``validation_days`` of history (D11). A day strategy also
-    reads 1h bars for its trend filter, and the market filter BTC's 4h bars with the
-    warm-up of its EMA. Each timeframe is one trial (D9), logged with ``add_trial``.
-    The record keeps one result per timeframe (``strategy_record``).
-    """
-    from bot.backtest.loaders.registry import resolve_loader
-
-    began = time.monotonic()
-    symbols = list(config.symbols)
-    spans = {timeframe: validation_days(strategy_id, timeframe) for timeframe in STRATEGIES[strategy_id].timeframes}
-    longest = max(spans.values())
-    end = datetime.now(timezone.utc)
-    try:
-        loader = resolve_loader("crypto")
-        frames: dict[str, dict[str, Any]] = {}
-        for index, (timeframe, days) in enumerate(spans.items()):
-            frames[timeframe] = loader.fetch(
-                symbols,
-                (end - timedelta(days=days)).isoformat(),
-                end.isoformat(),
-                interval=timeframe,
-                on_symbol=_progress(key, index * len(symbols)),
-            )
-        hourly = None
-        if strategy_id in DAY_STRATEGIES:
-            # The 1h trend filter replays on real 1h bars, with a few extra days to warm EMA 50.
-            start = end - timedelta(days=longest + HOURLY_WARMUP_DAYS)
-            hourly = loader.fetch(symbols, start.isoformat(), end.isoformat(), interval="1h")
-        market = None
-        if config.market_filter != "off":
-            start = end - timedelta(days=longest + MARKET_WARMUP_DAYS)
-            market = loader.fetch([MARKET_SYMBOL], start.isoformat(), end.isoformat(), interval="4h").get(MARKET_SYMBOL)
-            if market is None or market.empty:
-                # Without BTC the replay would run unfiltered under the filter's key.
-                raise _HistoryMissing("histórico do BTC indisponível para o filtro de mercado")
-        _update_job(key, stage="calculando")
-        store = Store(root / "bot.sqlite")
-        try:
-            results = _replay_timeframes(store, strategy_id, frames, config, hourly=hourly, market=market)
-            elapsed = round(time.monotonic() - began, 1)
-            record = strategy_record(
-                results,
-                symbols=symbols,
-                exit_policy=config.exit_policy,
-                market_filter=config.market_filter,
-                hysteresis=config.exit_hysteresis,
-                extra={"days": spans, "elapsed_s": elapsed},
-            )
-            store.save_strategy(record)
-        finally:
-            store.close()
-        for result in results.values():
-            try:
-                append_ledger({"kind": "validate", "mode": config.mode, **result.to_dict()}, path=root / "bot-ledger.jsonl")
-            except Exception:
-                logger.exception("ledger append for validation failed")
-        _update_job(
-            key,
-            status="done",
-            stage="pronto",
-            result=_job_result(record, results),
-            elapsed_s=elapsed,
-            finished_at=datetime.now(timezone.utc).isoformat(),
-        )
-    except (WeightPressure, _HistoryMissing) as exc:
-        _update_job(key, status="error", error=str(exc), finished_at=datetime.now(timezone.utc).isoformat())
-    except Exception as exc:  # noqa: BLE001 - a failed job is reported in /bot/status and the log
-        logger.exception("validation of %s failed", strategy_id)
-        _update_job(
-            key,
-            status="error",
-            error=f"histórico da Binance indisponível ({type(exc).__name__})",
-            finished_at=datetime.now(timezone.utc).isoformat(),
-        )
-
-
-def _progress(key: tuple[str, str], offset: int) -> Callable[[str, int], None]:
-    """The loader's per-pair callback: downloads of earlier timeframes count first."""
-
-    def report(_symbol: str, done: int) -> None:
-        _update_job(key, done=offset + done)
-
-    return report
-
-
-def _replay_timeframes(
-    store: Store,
-    strategy_id: str,
-    frames: dict[str, dict[str, Any]],
-    config: BotConfig,
-    *,
-    hourly: dict[str, Any] | None,
-    market: Any,
-) -> dict[str, BacktestResult]:
-    """Run the gate on each timeframe and log each run as a trial.
-
-    The deflated Sharpe's N is ``_trial_count`` of the trials since the strategy's last
-    pass, the earlier timeframes of this run included, plus the current combination; the
-    variance uses those trials' per-trade Sharpe.
-    """
-    seen = store.trials_since_pass(strategy_id)
-    results: dict[str, BacktestResult] = {}
-    for timeframe, by_symbol in frames.items():
-        combination = _config_combination(strategy_id, timeframe, config)
-        _timeframe, policy, pairset, _market_filter, hysteresis = combination
-        result = validate_strategy(
-            strategy_id,
-            by_symbol,
-            timeframe,
-            exit_policy=config.exit_policy,
-            hourly_frames=hourly,
-            hysteresis=config.exit_hysteresis,
-            market_frame=market,
-            trials=_trial_count(seen, [combination]),
-            trial_sharpes=[float(trial["sharpe_trade"]) for trial in seen],
-        )
-        sharpe = float(result.sharpe_trade)
-        trial = {
-            "strategy_id": strategy_id,
-            "timeframe": timeframe,
-            "exit_policy": policy,
-            "pairset": pairset,
-            "market_filter": config.market_filter,
-            "hysteresis": hysteresis,
-            "sharpe_trade": sharpe if math.isfinite(sharpe) else 0.0,
-            "trades": result.trades,
-            "passed": result.passed,
-            "payload": timeframe_record(result),
-        }
-        store.add_trial(trial)
-        seen.append(trial)
-        results[timeframe] = result
-    return results
-
-
-_Combination = tuple[str, str, str, str, bool]
-
-
-def _combination(trial: dict[str, Any]) -> _Combination:
-    """A logged trial's (timeframe, exit rule, pair set, market filter, hysteresis)."""
-    return (
-        str(trial["timeframe"]),
-        str(trial["exit_policy"]),
-        str(trial["pairset"]),
-        str(trial["market_filter"]),
-        bool(trial["hysteresis"]),
-    )
-
-
-def _config_combination(strategy_id: str, timeframe: str, config: BotConfig) -> _Combination:
-    """The combination a validation of ``strategy_id`` on ``timeframe`` under ``config`` logs."""
-    policy = exit_policy_for(strategy_id, config.exit_policy)
-    hysteresis = bool(config.exit_hysteresis) and uses_hysteresis(strategy_id, policy)
-    return (timeframe, policy, pairset_hash(config.symbols), config.market_filter, hysteresis)
-
-
-def _config_combinations(strategy_id: str, config: BotConfig) -> list[_Combination]:
-    """One combination per timeframe the strategy operates, as its next validation runs them."""
-    return [_config_combination(strategy_id, timeframe, config) for timeframe in STRATEGIES[strategy_id].timeframes]
-
-
-def _trial_count(seen: list[dict[str, Any]], current: list[_Combination]) -> int:
-    """The deflated Sharpe's N (D9): the distinct combinations among ``seen`` (the trials since
-    the last pass) and ``current``.
-
-    The validation passes the timeframe it is about to replay; ``/bot/status`` passes every
-    operated timeframe of the config, the N the next validation reaches on its last one.
-    """
-    return len({_combination(trial) for trial in seen} | set(current))
-
-
-def _job_result(record: dict[str, Any], results: dict[str, BacktestResult]) -> dict[str, Any]:
-    """The job's summary: the verdict and pooled counts, the headline timeframe's metrics
-    (the record's choice: the best passed daily Sharpe) and every timeframe's result."""
-    passed = [result for result in results.values() if result.passed]
-    best = max(passed or list(results.values()), key=lambda result: result.daily_sharpe)
-    params = record["params"]
-    return {
-        "passed": not record["signal_only"],
-        "exit_policy": best.exit_policy,
-        "timeframe": best.timeframe,
-        "sharpe": best.sharpe,
-        "daily_sharpe": best.daily_sharpe,
-        "dsr": best.dsr,
-        "trials": best.trials,
-        "max_drawdown": best.max_drawdown,
-        "trades": params["trades"],
-        "wins": params["wins"],
-        "reason": params["reason"],
-        "timeframes": params["timeframes"],
-    }
 
 
 @app.post("/bot/symbols")
@@ -1244,80 +895,10 @@ def _commit_mandate(config: BotConfig, store: Store) -> None:
     commit_mandate_for(config)
 
 
-def _day_preset(current: BotConfig) -> BotConfig:
-    """The current config with the day-trade limits, the day strategies on and the swing ones off."""
-    data = current.model_dump()
-    data["limits"] = {**data["limits"], **DAY_PRESET_LIMITS}
-    data.update(DAY_PRESET_FIELDS)
-    data["strategies"] = {name: name in DAY_STRATEGIES for name in data["strategies"]}
-    return BotConfig.model_validate(data)
-
-
-def _preset_preview(current: BotConfig, preset: BotConfig) -> dict[str, Any]:
-    """What the preset changes, and what an order can really be under it."""
-    before, after = current.model_dump(), preset.model_dump()
-    changes = [
-        {"field": f"limits.{name}", "from": before["limits"][name], "to": after["limits"][name]}
-        for name in DAY_PRESET_LIMITS
-        if before["limits"][name] != after["limits"][name]
-    ]
-    changes += [
-        {"field": name, "from": before[name], "to": after[name]} for name in DAY_PRESET_FIELDS if before[name] != after[name]
-    ]
-    changes += [
-        {"field": f"strategies.{name}", "from": before["strategies"].get(name), "to": on}
-        for name, on in after["strategies"].items()
-        if before["strategies"].get(name) != on
-    ]
-    capital = preset.capital_for_sizing()
-    order_cap = capital * preset.limits.max_order_notional_pct
-    # At the narrowest day stop, the risk per trade asks for this notional; the order cap may cut it.
-    wanted = capital * preset.limits.risk_per_trade_pct / DAY.min_stop_pct
-    return {
-        "changes": changes,
-        "order_cap_usd": round(order_cap, 2),
-        "risk_notional_usd": round(wanted, 2),
-        "capped_by_order_cap": wanted > order_cap,
-        "mandate_orders_per_day": mandate_caps_for(preset)["max_trades_per_day"],
-        "sizing": _size_example(preset, PRESET_STOP_PCT),
-    }
-
-
-def _size_example(config: BotConfig, stop_pct: float) -> dict[str, Any]:
-    """The order one entry at a ``stop_pct`` stop would place under ``config`` (``RiskManager.sizing``).
-
-    No pair is named, so neither the venue nor the volatility cap applies, and no hit
-    rate is known, so Kelly does not cut the share.
-    """
-    manager = risk.RiskManager(config.limits, config.capital_for_sizing())
-    opportunity = Opportunity(
-        symbol="",
-        strategy="preset",
-        action="Comprar",
-        score=0.0,
-        net_return=0.0,
-        risk_pct=stop_pct,
-        status="potencial",
-        reason="",
-        timeframe="15m",
-        direction=1.0,
-        cost=0.0,
-        gross_return=0.0,
-    )
-    decision = manager.sizing(opportunity)
-    return {
-        "stop_pct": stop_pct,
-        "size_usd": round(decision.size_usd, 2),
-        "binding": decision.binding,
-        "label": risk.SIZE_LIMITS[decision.binding],
-        "caps": {name: round(value, 2) for name, value in decision.caps.items()},
-    }
-
-
 @app.get("/bot/presets/day")
 def day_preset_preview() -> dict[str, Any]:
     current = _runtime().config
-    return _preset_preview(current, _day_preset(current))
+    return presets._preset_preview(current, presets._day_preset(current))
 
 
 @app.post("/bot/presets/day")
@@ -1327,16 +908,16 @@ def apply_day_preset() -> dict[str, Any]:
         runtime = _runtime()
         current = runtime.config
         try:
-            preset = _day_preset(current)
+            preset = presets._day_preset(current)
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=_validation_detail(exc)) from exc
-        preview = _preset_preview(current, preset)
+        preview = presets._preset_preview(current, preset)
         # The mandate first: if it cannot be written, the config does not move either.
         _commit_mandate(preset, runtime.store)
         preset.save()
         rebound = _bind(preset)
         rebound._ledger("day_preset", {"changes": preview["changes"]})
-        return {"status": "ok", **preview, "validating": _auto_validate(preset, rebound.store)}
+        return {"status": "ok", **preview, "validating": validation._auto_validate(preset, rebound.store)}
 
 
 @app.put("/bot/config")
@@ -1362,6 +943,8 @@ def update_config(body: ConfigUpdate) -> dict[str, Any]:
             data["flatten_on_halt"] = body.flatten_on_halt
         if body.limits is not None:
             data["limits"] = _merge_limits(data["limits"], body.limits)
+        if body.advisor is not None:
+            data["advisor"] = {**data["advisor"], **body.advisor}
         if {"take_profit_pct", "stop_loss_pct"} & body.model_fields_set:
             data["take_profit_pct"] = body.take_profit_pct
             data["stop_loss_pct"] = body.stop_loss_pct
@@ -1467,7 +1050,7 @@ def update_config(body: ConfigUpdate) -> dict[str, Any]:
             or config.exit_hysteresis != current.exit_hysteresis
         )
         if rules_changed or body.strategies is not None:
-            validating = _auto_validate(config, rebound.store)
+            validating = validation._auto_validate(config, rebound.store)
         recorded = _pilot_cap(rebound.store) if config.mode == "production" else None
         rebound._ledger("config", {"mode": config.mode, "operator": "panel", "reasons": reasons, "pilot_cap_usd": recorded})
         return {"status": "ok", "mode": config.mode, "config": json.loads(config.model_dump_json()), "validating": validating}

@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 import time
 
 import uvicorn
 
-from bot.api.app import _runtime, app, revalidate_stale
+from bot.api.app import _runtime, app
+from bot.api.validation import revalidate_stale
 from bot.config import BotConfig
+from bot.logging_setup import UVICORN_LOGGERS, install_redaction
 from bot.runtime import MAX_FAILURES, Runtime
 
 logger = logging.getLogger("bot")
 _DEFAULT_INTERVAL = 60
+#: uvicorn's exit code for a server that did not start (``uvicorn.main.STARTUP_FAILURE``, not exported).
+_STARTUP_FAILURE = 3
 
 
 def run_once(failures: int) -> tuple[int, int]:
@@ -62,9 +67,18 @@ def _loop() -> None:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    threading.Thread(target=_loop, name="bot-tick", daemon=True).start()
+    install_redaction()
     # 127.0.0.1 outside a container. The Host-header guard (bot.api.auth) still applies on 0.0.0.0.
-    uvicorn.run(app, host=os.environ.get("BOT_API_HOST", "127.0.0.1"), port=8000)
+    # uvicorn installs its own handlers when its Config is built, so the redaction wraps them
+    # after that and before the server (and the tick loop) can log anything.
+    config = uvicorn.Config(app, host=os.environ.get("BOT_API_HOST", "127.0.0.1"), port=8000)
+    install_redaction(UVICORN_LOGGERS)
+    threading.Thread(target=_loop, name="bot-tick", daemon=True).start()
+    server = uvicorn.Server(config)
+    server.run()
+    if not server.started:
+        # As uvicorn.run does: a failed startup exits non-zero, so a supervisor restarts the bot.
+        sys.exit(_STARTUP_FAILURE)
 
 
 if __name__ == "__main__":

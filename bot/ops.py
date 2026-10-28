@@ -16,6 +16,9 @@ Commands (``--mode`` defaults to the mode in ``bot.json``):
   was investigated.
 * ``adopt-checkpoint --reason TEXT``: re-anchor the journal checkpoint after a
   restore or a migration. Refused while the checkpoint anchors lost records.
+* ``advisor-key``: save the DeepSeek key to ``deepseek.json`` (owner-only, atomic). The
+  key is read from stdin (hidden at a terminal), never from an argument, so it stays out
+  of the shell history and the process list.
 
 Every command prints one JSON object and exits 1 when the result is an error.
 """
@@ -23,6 +26,7 @@ Every command prints one JSON object and exits 1 when the result is an error.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import sys
 from typing import Any
@@ -56,7 +60,11 @@ def run(argv: list[str]) -> tuple[int, dict[str, Any]]:
         command.add_argument("--reason", required=True)
     adopt = sub.add_parser("adopt-checkpoint")
     adopt.add_argument("--reason", required=True)
+    sub.add_parser("advisor-key")
     args = parser.parse_args(argv)
+    if args.command == "advisor-key":
+        saved = _save_advisor_key()
+        return (0 if saved.get("status") == "ok" else 1), saved
 
     from bot.exchange import service
     from bot.exchange.execution import journal, reconcile
@@ -78,6 +86,18 @@ def run(argv: list[str]) -> tuple[int, dict[str, Any]]:
         except (ValueError, journal.PersistError) as exc:
             result = {"status": "error", "error": str(exc)}
     return (0 if result.get("status") == "ok" else 1), result
+
+
+def _save_advisor_key() -> dict[str, Any]:
+    """Read the DeepSeek key from stdin and save it (``credentials.save_key``). Prints only the file."""
+    from bot.advisor import credentials
+
+    key = getpass.getpass("Chave da DeepSeek: ") if sys.stdin.isatty() else sys.stdin.readline()
+    try:
+        path = credentials.save_key(key)
+    except (credentials.CredentialsError, OSError) as exc:
+        return {"status": "error", "error": str(exc)}
+    return {"status": "ok", "file": path.name}
 
 
 def main() -> None:

@@ -1111,6 +1111,14 @@ def _gate_blocked() -> dict[str, Any]:
         "trading_authorized": False,
         "diagnostic_authorizes_trading": False,
     }
+
+
+#: ccxt error classes that are the exchange's own answer: the order was refused, not lost.
+#: A subclass counts too, so ``OrderImmediatelyFillable`` (-2010, a stop that would trigger
+#: at once) and ``OrderNotFillable`` reject through ``InvalidOrder``. ``RateLimitExceeded`` and
+#: ``DDoSProtection`` sit under ``NetworkError`` in ccxt, but Binance answered them (429/418).
+#: The rest of ``NetworkError`` (``InvalidNonce``, ``RequestTimeout``, ``ExchangeNotAvailable``)
+#: and any other error stay unknown: the request may have reached the matching engine.
 _DEFINITE_REJECT_TYPES = frozenset(
     {
         "InsufficientFunds",
@@ -1122,8 +1130,13 @@ _DEFINITE_REJECT_TYPES = frozenset(
         "PermissionDenied",
         "AccountSuspended",
         "OrderNotFound",
+        "RateLimitExceeded",
+        "DDoSProtection",
     }
 )
+#: Binance -1021: the request's timestamp fell outside the server's window. ccxt maps it to
+#: ``InvalidNonce`` on spot. Only this code is resent, once, after the clock is measured again.
+_CLOCK_REJECT_CODE = re.compile(r'["\']?code["\']?\s*:\s*-1021\b')
 
 
 def _reject_write_surface(cfg: BinanceConfig) -> dict[str, Any] | None:
@@ -1194,9 +1207,60 @@ def _wire_decimal(value: Any, label: str) -> tuple[str | None, dict[str, Any] | 
 def _exchange_outcome(exc: BaseException) -> dict[str, Any]:
     """A definite reject is an exchange response. Anything else may have been sent."""
     name = type(exc).__name__
-    if name in _DEFINITE_REJECT_TYPES:
+    if _is_ccxt_error(exc, _DEFINITE_REJECT_TYPES):
         return {"status": "error", "error": f"exchange rejected the order ({name})"}
     return {"status": "unknown", "error": f"exchange outcome is unknown ({name})"}
+
+
+def _is_ccxt_error(exc: BaseException, names: frozenset[str]) -> bool:
+    """Whether ``exc`` is one of the ccxt error classes ``names``, or a subclass of one.
+
+    The class names along the MRO, so the test doubles that mirror ccxt's hierarchy classify
+    the same, or ``isinstance`` against ccxt's own classes when ccxt is installed.
+    """
+    if any(cls.__name__ in names for cls in type(exc).__mro__):
+        return True
+    try:
+        from ccxt.base import errors
+    except ImportError:
+        return False
+    classes = tuple(getattr(errors, name) for name in names if isinstance(getattr(errors, name, None), type))
+    return bool(classes) and isinstance(exc, classes)
+
+
+def _clock_rejected(exc: BaseException) -> bool:
+    """Binance refused the request's timestamp (-1021), so it never reached the matching engine.
+
+    Both marks are required: ccxt's ``InvalidNonce`` and the code in the message. -1022 (an
+    invalid signature) is an ``AuthenticationError`` and is never resent.
+    """
+    return _is_ccxt_error(exc, frozenset({"InvalidNonce"})) and bool(_CLOCK_REJECT_CODE.search(str(exc)))
+
+
+def _write_with_clock_retry(exchange: Any, write: Callable[[], Any], recheck: Callable[[], Any]) -> Any:
+    """Send one exchange write; resend it once when Binance refused its timestamp (-1021).
+
+    The clock offset is measured again first, with one extra second only when Binance said the
+    request was ahead of its time, as ``_read_with_clock_retry`` does. ``recheck`` runs the final
+    pre-send checks again (latch, write surface, mandate, halt); when it blocks, or the clock
+    cannot be read, the first error is raised and the caller reports it as sent. A second error,
+    -1021 included, is raised as it is: no third attempt.
+    """
+    try:
+        return write()
+    except Exception as exc:
+        if not _clock_rejected(exc):
+            raise
+        first = exc
+    try:
+        exchange.load_time_difference()
+        if "ahead of the server" in str(first).lower():
+            exchange.options["timeDifference"] += 1_000
+    except Exception:  # noqa: BLE001 - no fresh offset: the first answer stands
+        raise first from None
+    if recheck() is not None:
+        raise first
+    return write()
 
 #: ccxt ``timeInForce`` values Binance spot accepts for limit orders. Binance
 #: has no DAY policy; the unified ``"day"`` intent maps to GTC, which is the
@@ -1237,6 +1301,10 @@ def place_order(
     returned before ``create_order`` was called, so the exchange cannot have
     received the request. A halt flag set at any time before that point blocks
     the order here, as the last check before the exchange write.
+
+    A -1021 refusal (timestamp outside Binance's window) is resent once with the
+    same client order id after the clock is measured again and those checks pass
+    again (``_write_with_clock_retry``); the caller's journal record covers both.
     """
     prepared = _prepare_order(
         config,
@@ -1284,7 +1352,12 @@ def place_order(
         return unsent
 
     try:
-        order = ex.create_order(clean_symbol, type_clean, side_clean, amount, price, params)
+        # The same parameters, client order id included, on a resend after -1021.
+        order = _write_with_clock_retry(
+            ex,
+            lambda: ex.create_order(clean_symbol, type_clean, side_clean, amount, price, dict(params)),
+            lambda: _unsent_before_write(cfg),
+        )
     except Exception as exc:  # noqa: BLE001 - the request may already have left the process
         outcome = _exchange_outcome(exc)
         if client_id:
@@ -1334,13 +1407,18 @@ def _fees(order: Any) -> list[dict[str, Any]]:
     return rows
 
 
-def _unsent_before_write(cfg: BinanceConfig) -> dict[str, Any] | None:
-    """Final checks before the exchange write: latch, write surface, halt."""
+def _unsent_before_write(cfg: BinanceConfig, *, halt: bool = True) -> dict[str, Any] | None:
+    """Final checks before the exchange write: latch, write surface, halt.
+
+    ``halt=False`` for a cancel, which the halt never blocks (it reduces risk).
+    """
     if not _execution_latch_open():
         return {**_gate_blocked(), "request_sent": False}
     blocked = _reject_write_surface(cfg)
     if blocked:
         return {**blocked, "request_sent": False}
+    if not halt:
+        return None
     try:
         from bot.live.halt import halt_flag_set
 
@@ -1452,7 +1530,8 @@ def cancel_order(
     """Cancel one spot order. Binance requires the order id and the symbol.
 
     A halt does not block a cancel (it reduces risk). Every result carries
-    ``request_sent``, ``False`` only when ``cancel_order`` was never called.
+    ``request_sent``, ``False`` only when ``cancel_order`` was never called. A -1021
+    refusal is resent once, as in ``place_order``.
     """
     cfg = config or load_config()
 
@@ -1489,7 +1568,11 @@ def cancel_order(
         return unsent({"status": "error", "error": f"exchange client was not created ({type(exc).__name__})"})
 
     try:
-        order = ex.cancel_order(order_id_clean, clean_symbol)
+        order = _write_with_clock_retry(
+            ex,
+            lambda: ex.cancel_order(order_id_clean, clean_symbol),
+            lambda: _unsent_before_write(cfg, halt=False),
+        )
     except Exception as exc:  # noqa: BLE001 - the request may already have left the process
         return {**_exchange_outcome(exc), "request_sent": True}
 
@@ -1557,10 +1640,7 @@ def _read_with_clock_retry(exchange: Any, read: Callable[[], Any]) -> Any:
         return read()
     except Exception as exc:
         message = str(exc)
-        if not (
-            re.search(r'["\']?code["\']?\s*:\s*-1021\b', message)
-            and "ahead of the server" in message.lower()
-        ):
+        if not (_CLOCK_REJECT_CODE.search(message) and "ahead of the server" in message.lower()):
             raise
         exchange.load_time_difference()
         exchange.options["timeDifference"] += 1_000

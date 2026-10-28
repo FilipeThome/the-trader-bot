@@ -28,6 +28,89 @@ export type Opportunity = {
   /** Estimated slippage, a share of the price, inside the round-trip cost. */
   slippage_est?: number | null;
   plan_target_pct?: number | null;
+  /** The setup's market regime (trend_up, trend_down, range...). */
+  regime?: string | null;
+  /** The DeepSeek advisor's verdict on the row, when it was consulted. */
+  advice?: Advice | null;
+};
+
+/** Opportunity.advice: pending while the call runs, done with the verdict, failed with a redacted error. */
+export type Advice = {
+  status: "pending" | "done" | "failed";
+  requested_at?: string;
+  verdict?: "confirm" | "reduce" | "veto" | "abstain";
+  confidence?: number;
+  size_factor?: number;
+  regime?: string | null;
+  risk_flags?: string[];
+  rationale?: string;
+  id?: number | null;
+  error?: string;
+};
+
+/** One day range of advisor_usage_daily, summed (Store.advisor_usage). */
+export type AdvisorUsageTotals = {
+  calls: number;
+  prompt_tokens: number;
+  cache_hit_tokens: number;
+  completion_tokens: number;
+  /** Estimated from the price table in bot.advisor.client; the billed value is DeepSeek's. */
+  cost_usd: number;
+  confirm: number;
+  reduce: number;
+  veto: number;
+  abstain: number;
+  errors: number;
+};
+
+/** /bot/status advisor: the settings, whether a key exists, the last outcome and today's usage. Never the key. */
+export type AdvisorStatus = {
+  mode: "off" | "shadow" | "filter";
+  model: "deepseek-flash" | "deepseek-v4-pro";
+  daily_budget_usd: number;
+  min_veto_confidence: number;
+  require_verdict: boolean;
+  wait_seconds: number;
+  configured: boolean;
+  /** ISO time of the last verdict. */
+  last_ok: string | null;
+  /** "<ISO time> <redacted message>" of the last failure. */
+  last_error: string | null;
+  /** Today's usage over both modes (testnet and production): one DeepSeek key, one daily budget. */
+  today: AdvisorUsageTotals;
+  /** Today's usage of the current mode only. */
+  today_mode?: AdvisorUsageTotals;
+  prompt_version: string;
+};
+
+/** /bot/performance advisor_usage. */
+export type AdvisorUsage = {
+  today: AdvisorUsageTotals;
+  last_30_days: AdvisorUsageTotals;
+  prices_as_of: string;
+  estimate: boolean;
+};
+
+/**
+ * One line of /bot/performance advice_calibration, per (model, prompt version): "all" is every
+ * consulted row, then each verdict, then "veto_confident" (what filter would remove). The means
+ * cover only rows whose 48-bar window has passed; ``waiting`` counts the others, and ``expired``
+ * the rows whose window passed without the candles to label them (never in a mean).
+ */
+export type AdviceCalibrationLine = {
+  model: string;
+  prompt_version: string;
+  group: "all" | "confirm" | "reduce" | "veto" | "abstain" | "veto_confident" | string;
+  label: string;
+  n: number;
+  mean_r: number | null;
+  se: number | null;
+  waiting: number;
+  expired?: number;
+  realized_n: number;
+  realized_mean_r: number | null;
+  /** reduce only: the mean of (1 − factor) × counterfactual R. */
+  reduced_mean_r?: number | null;
 };
 
 export type ValidationJob = {
@@ -81,6 +164,19 @@ export type TimeframeResult = {
   turnover?: number;
   avg_hold_hours?: number;
   elapsed_s?: number;
+  /** Trades ``classify`` would have made ready, with the thresholds the replay used. */
+  filtered_trades?: number;
+  filtered_wins?: number;
+  filtered_sharpe?: number;
+  score_threshold?: number;
+  cost_multiple?: number;
+  min_reward_risk?: number;
+  /** Trades the replayed portfolio limits refused, and those limits. */
+  skipped_by_limits?: number;
+  limits?: { max_positions?: number; pair_cooldown_minutes?: number; loss_guard_trades?: number; loss_guard_r?: number };
+  /** From /bot/status: "liquid" (automatic selection's 40 most liquid pairs) or "pairs" (the configured ones). */
+  universe?: string;
+  universe_pairs?: number;
   mc_ok?: boolean;
 };
 
@@ -325,6 +421,8 @@ export type Status = {
   net_pnl: number;
   trades: number;
   violations_avoided: number;
+  /** The DeepSeek advisor; absent on an older API. */
+  advisor?: AdvisorStatus;
 };
 
 export type PnlDay = {

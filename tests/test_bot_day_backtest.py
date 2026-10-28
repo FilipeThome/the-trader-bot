@@ -151,3 +151,28 @@ def test_a_day_validation_holds_only_for_the_rules_it_replayed() -> None:
     assert not validated_for({**day, "day": other}, "intraday_momentum", "trailing")
     assert not validated_for({**day, "exit_policy": "trailing"}, "intraday_momentum", "trailing")
     assert validated_for(key("trend", "trailing", "1h"), "trend", "trailing")
+
+
+class Alternating:
+    """Buys at every flat bar; every other setup has no confidence, so its score fails ``classify``."""
+
+    style = "day"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def evaluate(self, symbol: str, timeframe: str, frame: pd.DataFrame, *, hourly: pd.DataFrame | None = None) -> Setup | None:
+        self.calls += 1
+        confidence = 1.0 if self.calls % 2 else 0.0
+        return Setup("intraday_momentum", symbol, "15m", "Comprar", 1.0, 0.03, 0.01, 0.01, 0.015, "t", "trend_up", confidence=confidence)
+
+
+def test_the_day_replay_marks_the_setups_classify_would_refuse() -> None:
+    rules = DayRules(max_hold_minutes=30, quiet_start_hour=0, quiet_end_hour=0)
+    trades = simulate_day(Alternating(), "BTC/USDT", _frame(_flat(80)), _hourly(), rules)  # type: ignore[arg-type]
+    assert len(trades) >= 4
+    assert [trade.accepted for trade in trades] == [index % 2 == 0 for index in range(len(trades))]
+    # The cost filter refuses too: a looser score floor still refuses a setup that cannot cover twice its cost.
+    cheap = runner.EntryFilter(score_threshold=-1.0, cost_multiple=50.0, min_reward_risk=0.0)
+    costly = simulate_day(Alternating(), "BTC/USDT", _frame(_flat(80)), _hourly(), rules, entry_filter=cheap)  # type: ignore[arg-type]
+    assert costly and not any(trade.accepted for trade in costly)

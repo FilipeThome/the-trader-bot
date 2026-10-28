@@ -145,8 +145,6 @@ def _history_blockers(store: Store, limits: RiskLimits, now: datetime) -> list[s
         window = days[-HISTORY_DAYS:]
         if sum(float(row["net_pnl"]) for row in window) <= 0:
             reasons.append(f"PnL líquido dos últimos {HISTORY_DAYS} dias não é positivo")
-        if sum(int(row["violations_avoided"]) for row in window) < 0:
-            reasons.append("histórico de violações ilegível")
     trades = store.closed_trades(since=(now - timedelta(days=HISTORY_DAYS)).isoformat())
     r = [float(trade["r_multiple"]) for trade in trades if trade.get("r_multiple") is not None]
     if len(r) < MIN_LIVE_TRADES:

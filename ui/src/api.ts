@@ -1,4 +1,4 @@
-import type { ArmedEntry, Balance, BotInstance, CalibrationRow, DayPreset, Decision, Features, InstanceKind, InstancePreview, Market, Opportunity, PairSlippage, PnlDay, Position, Recommendation, Status, Trade } from "./types";
+import type { AdviceCalibrationLine, AdvisorUsage, ArmedEntry, Balance, BotInstance, CalibrationRow, DayPreset, Decision, Features, InstanceKind, InstancePreview, Market, Opportunity, PairSlippage, PnlDay, Position, Recommendation, Status, Trade } from "./types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -34,7 +34,14 @@ export const api = {
   opportunities: () => request<{ rows: Opportunity[] }>("/bot/opportunities"),
   positions: () => request<{ rows: Position[] }>("/bot/positions"),
   performance: () =>
-    request<{ days: PnlDay[]; calibration: CalibrationRow[]; pairs?: PairSlippage[]; equity_peak?: number }>("/bot/performance"),
+    request<{
+      days: PnlDay[];
+      calibration: CalibrationRow[];
+      pairs?: PairSlippage[];
+      equity_peak?: number;
+      advice_calibration?: AdviceCalibrationLine[];
+      advisor_usage?: AdvisorUsage;
+    }>("/bot/performance"),
   trade: (positionId: number) => request<Trade>(`/bot/trades/${positionId}`),
   features: (symbol: string) => request<Features>(`/bot/features?symbol=${encodeURIComponent(symbol)}`),
   markets: () => request<{ symbols: Market[] }>("/bot/markets"),

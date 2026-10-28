@@ -5,17 +5,9 @@ import { api } from "../api";
 import { formatPct, money } from "../App";
 import { Help } from "../Help";
 import { MarketCharts } from "../LiveCharts";
-import { sizeLimitName, statusLabels, strategyName } from "../labels";
+import { adviceVerdicts, sizeLimitName, statusLabels, strategyName } from "../labels";
 import { useBot } from "../store";
-import type { ArmedEntry, Decision, Opportunity } from "../types";
-
-const strategies = [
-  ["todas", "Todas"],
-  ["trend", "Trend"],
-  ["mean_reversion", "Mean Reversion"],
-  ["momentum", "Momentum"],
-  ["funding_carry", "Funding Carry"],
-] as const;
+import type { Advice, ArmedEntry, Decision, Opportunity } from "../types";
 
 /** Every size cap of the row in USD, smallest first, for the badge's tooltip. */
 function capsText(row: Opportunity): string {
@@ -30,11 +22,86 @@ function signalAge(seconds: number, drift?: number | null): string {
   return drift == null ? age : `${age}, preço ${drift >= 0 ? "+" : ""}${drift.toFixed(2)} R`;
 }
 
+/** The verdict filter's choices: a done verdict, or "none" for every row without one. */
+const adviceFilters: [string, string][] = [
+  ["todas", "todas"],
+  ["confirm", "confirmadas"],
+  ["reduce", "reduzidas"],
+  ["veto", "desaconselhadas"],
+  ["none", "sem veredito"],
+];
+
+/** The row's verdict when the advisor answered with an opinion; abstain, pending and failed have none. */
+function verdictOf(row: Opportunity): string | null {
+  const advice = row.advice;
+  if (advice?.status !== "done" || !advice.verdict || advice.verdict === "abstain") return null;
+  return advice.verdict;
+}
+
+function shareText(value: number): string {
+  return `${Math.round(value * 100)}%`;
+}
+
+function factorText(value: number): string {
+  return `×${Number(value.toFixed(2)).toString().replace(".", ",")}`;
+}
+
+/** The badge's tooltip: the rationale and confidence, the size factor of a reduce, and what the verdict does. */
+function adviceTitle(advice: Advice, minVetoConfidence: number): string {
+  if (advice.status === "pending") {
+    const since = advice.requested_at ? ` desde ${new Date(advice.requested_at).toLocaleTimeString("pt-BR")}` : "";
+    return `A DeepSeek está analisando este sinal${since}. No modo filtro, o automático espera o veredito até o tempo configurado em Controles.`;
+  }
+  if (advice.status === "failed") {
+    return `A consulta não trouxe veredito${advice.error ? `: ${advice.error}` : ""}. A linha segue pelas regras de sempre, salvo com o veredito exigido.`;
+  }
+  const lines = [advice.rationale || "Sem justificativa."];
+  if (advice.confidence != null) lines.push(`Confiança ${shareText(advice.confidence)}.`);
+  if (advice.verdict === "reduce" && advice.size_factor != null) {
+    lines.push(`No modo filtro, o tamanho do automático é multiplicado por ${factorText(advice.size_factor)}.`);
+  }
+  if (advice.verdict === "veto") {
+    lines.push(
+      (advice.confidence ?? 0) >= minVetoConfidence
+        ? "No modo filtro, a linha não entra no automático."
+        : `Confiança abaixo do mínimo de ${shareText(minVetoConfidence)}: não barra o automático.`,
+    );
+  }
+  if (advice.risk_flags?.length) lines.push(`Riscos: ${advice.risk_flags.join("; ")}.`);
+  if (advice.regime) lines.push(`Regime visto pela IA: ${advice.regime}.`);
+  lines.push("A entrada manual nunca é bloqueada pela IA.");
+  return lines.join("\n");
+}
+
+function AdviceBadge({ advice, minVetoConfidence }: { advice: Advice; minVetoConfidence: number }) {
+  const key = advice.status === "done" ? (advice.verdict ?? "abstain") : advice.status === "pending" ? "pending" : "abstain";
+  const strongVeto = key === "veto" && (advice.confidence ?? 0) >= minVetoConfidence;
+  const tone =
+    key === "confirm"
+      ? "bg-green-100 text-green-900 dark:bg-green-900 dark:text-green-100"
+      : key === "reduce"
+        ? "bg-amber-200 text-amber-900"
+        : strongVeto
+          ? "bg-red-600 text-white"
+          : key === "veto"
+            ? "bg-red-100 text-red-900 dark:bg-red-900 dark:text-red-100"
+            : "bg-neutral-200 text-neutral-800 dark:bg-neutral-700 dark:text-neutral-100";
+  return (
+    <span className={`ml-1 cursor-help whitespace-nowrap rounded px-1 text-xs ${tone}`} title={adviceTitle(advice, minVetoConfidence)}>
+      {adviceVerdicts[key] ?? key}
+      {key === "reduce" && advice.size_factor != null && ` ${factorText(advice.size_factor)}`}
+    </span>
+  );
+}
+
 export function Opportunities() {
   const rows = useBot((state) => state.rows);
+  const enabled = useBot((state) => state.status?.strategies);
   const perform = useBot((state) => state.perform);
   const busy = useBot((state) => state.busy);
+  const minVetoConfidence = useBot((state) => state.status?.advisor?.min_veto_confidence ?? 0.6);
   const [strategy, setStrategy] = useState("todas");
+  const [verdict, setVerdict] = useState("todas");
   const [selected, setSelected] = useState<Opportunity | null>(null);
   const [tradeId, setTradeId] = useState<number | null>(null);
   const [armed, setArmed] = useState<ArmedEntry[]>([]);
@@ -80,21 +147,42 @@ export function Opportunities() {
     );
     setTradeId(started?.position_id ?? null);
   }
-  const visible = rows.filter((row) => strategy === "todas" || row.strategy === strategy);
+  const visible = rows
+    .filter((row) => strategy === "todas" || row.strategy === strategy)
+    .filter((row) => verdict === "todas" || (verdict === "none" ? verdictOf(row) == null : verdictOf(row) === verdict));
+  // The strategies switched on in Controls, plus the one chosen here if it was switched off since.
+  const options = Object.entries(enabled ?? {})
+    .filter(([id, on]) => on || id === strategy)
+    .map(([id]) => id)
+    .filter((id) => id !== "todas");
 
   return (
     <section>
-      <label className="mb-3 flex items-center text-sm">
+      <div className="mb-3 flex flex-wrap items-center gap-x-6 gap-y-2 text-sm">
+      <label className="flex items-center">
         Estratégia
-        <Help text="Escolhe qual jeito de operar aparece na lista. Todas junta as três. Trend segue o movimento, Mean Reversion aposta na volta à média e Funding Carry só mostra um sinal, sem executar." />
+        <Help text="Escolhe qual estratégia aparece na lista, entre as ligadas em Controles. Todas junta as ligadas. A descrição de cada uma está em Controles." />
         <select className="ml-2 bg-transparent" value={strategy} onChange={(event) => setStrategy(event.target.value)}>
-          {strategies.map(([value, label]) => (
+          <option value="todas">Todas</option>
+          {options.map((id) => (
+            <option key={id} value={id}>
+              {strategyName(id)}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="flex items-center">
+        Análise IA
+        <Help text="Filtra pelo veredito do consultor DeepSeek. Sem veredito junta as linhas que não foram consultadas, as que ainda esperam a resposta, as que a IA deixou sem opinião e as em que a consulta falhou." />
+        <select className="ml-2 bg-transparent" value={verdict} onChange={(event) => setVerdict(event.target.value)}>
+          {adviceFilters.map(([value, label]) => (
             <option key={value} value={value}>
               {label}
             </option>
           ))}
         </select>
       </label>
+      </div>
       <MarketCharts strategy={strategy} />
       <table className="w-full text-left text-sm">
         <thead className="text-neutral-500">
@@ -106,7 +194,7 @@ export function Opportunities() {
               Par<Help text="As duas moedas da operação. BTC/USDT significa comprar ou vender bitcoin pagando em dólar digital." />
             </th>
             <th className="pr-3 font-medium">
-              Estratégia<Help text="O método que gerou a sugestão: Trend, Mean Reversion ou Funding Carry." />
+              Estratégia<Help text="A estratégia ligada em Controles que gerou a sugestão." />
             </th>
             <th className="pr-3 font-medium">
               Ação<Help text="O que o robô sugere fazer nesta linha: comprar, vender ou sair." />
@@ -122,7 +210,7 @@ export function Opportunities() {
             </th>
             <th className="pr-3 font-medium">
               Tamanho
-              <Help text="Quanto o robô compraria, em dólares, e o limite que decidiu esse valor. O tamanho é o menor entre: o risco por trade dividido pela distância do stop (ou menos, pelo Kelly), o teto por ordem, o teto da corretora, a volatilidade diária do par e o espaço que sobra na exposição total. Passe o mouse no selo para ver todos os tetos." />
+              <Help text="Quanto o robô compraria, em dólares, e o limite que decidiu esse valor. O tamanho é o menor entre: o risco por trade dividido pela distância do stop (ou menos, pelo Kelly), o teto por ordem, o teto da corretora, a volatilidade diária do par e o espaço que sobra na exposição total. No modo filtro do consultor, um veredito IA reduz multiplica o resultado e o selo mostra análise IA. Passe o mouse no selo para ver todos os tetos." />
             </th>
             <th className="pr-3 font-medium">
               Acerto
@@ -130,7 +218,7 @@ export function Opportunities() {
             </th>
             <th className="pr-3 font-medium">
               Status
-              <Help text="Pronta pode ser enviada. Potencial ainda não passou no critério. Bloqueada foi barrada por um limite. Ignorada fica escondida por 24 horas. Em posição já está aberta." />
+              <Help text="Pronta pode ser enviada. Potencial ainda não passou no critério. Bloqueada foi barrada por um limite. Ignorada fica escondida por 24 horas. Em posição já está aberta. O selo IA é o veredito do consultor DeepSeek: passe o mouse para ver a justificativa e a confiança." />
             </th>
             <th className="font-medium">
               Motivo<Help align="end" text="A explicação curta de por que o robô chegou nesse status. Os botões desta coluna agem só nesta linha." />
@@ -182,6 +270,7 @@ export function Opportunities() {
               <td className="pr-3">
                 {statusLabels[row.status] ?? row.status}
                 {row.test_only && <span className="ml-1 rounded bg-amber-200 px-1 text-xs text-amber-900">teste</span>}
+                {row.advice && <AdviceBadge advice={row.advice} minVetoConfidence={minVetoConfidence} />}
               </td>
               <td>
                 {row.reason}
@@ -280,6 +369,14 @@ export function Opportunities() {
             {selected.signal_age_seconds != null && <>{signalAge(selected.signal_age_seconds, selected.entry_drift_r)}. </>}
             {selected.timeframe && <>Tempo gráfico {selected.timeframe}.</>}
           </p>
+          {selected.advice && (
+            <p className="mt-1 whitespace-pre-line text-neutral-500">
+              Consultor DeepSeek:
+              <AdviceBadge advice={selected.advice} minVetoConfidence={minVetoConfidence} />
+              {"\n"}
+              {adviceTitle(selected.advice, minVetoConfidence)}
+            </p>
+          )}
           {selected.action.startsWith("Compr") && (
             <div className="mt-3 flex flex-wrap items-center gap-2">
               Armar por gatilho: comprar a

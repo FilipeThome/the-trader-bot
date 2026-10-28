@@ -2,8 +2,8 @@ import { useState } from "react";
 
 import { api } from "../api";
 import { Help } from "../Help";
-import { riskLevels, strategyName } from "../labels";
-import { parseDecimal, parseWhole } from "../numbers";
+import { advisorModels, advisorModes, riskLevels, strategyName } from "../labels";
+import { formatUsdCost, parseDecimal, parseWhole } from "../numbers";
 import { useBot } from "../store";
 import type { MandateSummary, Status, ValidationJob } from "../types";
 
@@ -504,6 +504,7 @@ export function Controls() {
       </p>
       <RulesCard status={status} />
       <MacroCard status={status} />
+      <AdvisorCard status={status} />
       <div className="rounded border border-neutral-300 p-3 dark:border-neutral-700">
         <p className="mb-2 flex items-center font-medium">
           Switch de ambiente
@@ -854,6 +855,186 @@ function RulesCard({ status }: { status: Status }) {
         <Help text={`A perda do dia conta o patrimônio, inclusive o que ainda não foi realizado. Ao passar de ${pctText(status.limits.max_daily_loss_pct)} do capital, o robô pausa as entradas até o dia seguinte (UTC). Marcado, ele também vende os day trades abertos antes de pausar; as posições swing seguem com o stop. Desmarcado por padrão, porque vender na perda costuma vender no fundo.`} />
       </p>
     </div>
+  );
+}
+
+/** The DeepSeek advisor's settings, saved through PUT /bot/config ``advisor``. The key never passes through the panel. */
+function AdvisorCard({ status }: { status: Status }) {
+  const perform = useBot((state) => state.perform);
+  const [budget, setBudget] = useState("");
+  const [vetoPct, setVetoPct] = useState("");
+  const [wait, setWait] = useState("");
+  const advisor = status.advisor;
+  if (!advisor) return null;
+  // Same bounds as bot.config.AdvisorConfig; the API refuses anything else with a 422.
+  const budgetValue = parseDecimal(budget);
+  const budgetValid = budgetValue != null && budgetValue <= 50;
+  const vetoValue = parseDecimal(vetoPct);
+  const vetoValid = vetoValue != null && vetoValue >= 50 && vetoValue <= 100;
+  const waitValue = parseWhole(wait);
+  const waitValid = waitValue != null && waitValue >= 5 && waitValue <= 120;
+  const typed: [string, boolean, string, number | null][] = [
+    ["daily_budget_usd", budgetValid, budget, budgetValue],
+    ["min_veto_confidence", vetoValid, vetoPct, vetoValue == null ? null : vetoValue / 100],
+    ["wait_seconds", waitValid, wait, waitValue],
+  ];
+  const filled = typed.filter(([, , text]) => text.trim() !== "");
+  const payload: Record<string, number> = {};
+  for (const [key, , , value] of filled) if (value != null) payload[key] = value;
+  const valid = filled.length > 0 && filled.every(([, ok]) => ok);
+  const save = (label: string, change: Record<string, unknown>, describe?: () => string) =>
+    perform(label, () => api.updateConfig({ advisor: change }), describe);
+  return (
+    <div className="space-y-2 rounded border border-neutral-300 p-3 dark:border-neutral-700">
+      <p className="flex items-center font-medium">
+        Consultor DeepSeek
+        <Help text="Uma segunda opinião sobre cada sinal Pronto das estratégias, dada pela IA da DeepSeek com os números do setup, do par, do BTC e da conta. O motor do robô decide: a IA só pode tirar uma entrada do automático ou diminuir o tamanho dela. Nunca cria nem aumenta uma ordem, e nunca passa pelo portão de segurança, pelo mandato, pelo halt ou pelos stops. Sem chave, sem rede ou sem orçamento, o robô opera como se ela estivesse desligada." />
+      </p>
+      <p>
+        Chave:{" "}
+        {advisor.configured ? (
+          <span className="text-green-600">presente</span>
+        ) : (
+          <>
+            <span className="text-amber-600">ausente</span>
+            <span className="block text-neutral-500">
+              Rode <code>python -m bot.ops advisor-key</code> na máquina do robô e cole a chave quando ele pedir. Ela fica em deepseek.json, nunca no painel nem no bot.json.
+            </span>
+          </>
+        )}
+      </p>
+      <p className="flex flex-wrap items-center gap-2">
+        <label className="inline-flex items-center">
+          Modo
+          <select
+            className="ml-2 bg-transparent"
+            value={advisor.mode}
+            onChange={(event) => {
+              const mode = event.target.value;
+              void save(`Consultor: ${advisorModes[mode] ?? mode}`, { mode });
+            }}
+          >
+            {Object.entries(advisorModes).map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <Help text="Desligado: nada é consultado. Sombra: cada sinal Pronto é enviado à IA uma vez; o veredito é gravado e aparece em Oportunidades, e nenhuma ordem muda nem espera. Filtro: um veto com confiança acima do mínimo tira a linha do automático (o manual continua permitido), e um reduzir multiplica o tamanho por um fator entre 0,25 e 1. Confirmar não muda nada. Em nenhum modo a IA cria ou aumenta uma ordem. Robôs DCA e Grid, entradas armadas e linhas de teste não são consultados. Use a sombra até a calibração em Desempenho mostrar que os vetos ajudam." />
+        <label className="ml-4 inline-flex items-center">
+          Modelo
+          <select
+            className="ml-2 bg-transparent"
+            value={advisor.model}
+            onChange={(event) => {
+              const model = event.target.value;
+              void save(`Consultor: modelo ${advisorModels[model] ?? model}`, { model });
+            }}
+          >
+            {Object.entries(advisorModels).map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <Help align="end" text="Flash é rápido e barato. V4 Pro custa mais por chamada. Cada modelo e cada versão do prompt têm a própria linha na calibração de Desempenho." />
+      </p>
+      <p className="flex items-center">
+        <label>
+          <input
+            type="checkbox"
+            checked={advisor.require_verdict}
+            onChange={(event) => {
+              const on = event.target.checked;
+              if (on && !window.confirm("Exigir o veredito da IA?\n\nNo modo filtro, uma linha sem veredito não entra no automático. Se a DeepSeek falhar, a chave faltar ou o orçamento do dia acabar, as entradas automáticas param até ela voltar.")) return;
+              void save(on ? "Exigir o veredito da IA" : "Não exigir o veredito da IA", { require_verdict: on });
+            }}
+          />{" "}
+          Exigir veredito para entrar no automático
+        </label>
+        <Help text="Só no modo filtro. Marcado, uma linha Pronta sem veredito não entra no automático. Atenção: se a API da DeepSeek falhar, ficar sem chave ou o orçamento do dia acabar, as entradas automáticas param até ela voltar. Stops, saídas e a entrada manual continuam. Desmarcado, depois da espera a linha segue sem veredito." />
+      </p>
+      <AdvisorField
+        label="Orçamento diário (US$)"
+        help="Gasto máximo estimado por dia UTC. Ao chegar nele, as linhas seguem sem veredito até o dia seguinte. De 0 a 50."
+        current={formatUsdCost(advisor.daily_budget_usd)}
+        text={budget}
+        bad={budget.trim() !== "" && !budgetValid}
+        onChange={setBudget}
+      />
+      <AdvisorField
+        label="Confiança mínima do veto (%)"
+        help="No modo filtro, um veto só tira a linha do automático com pelo menos esta confiança. Abaixo dela, o veto só aparece. De 50 a 100."
+        current={`${Math.round(advisor.min_veto_confidence * 100)}%`}
+        text={vetoPct}
+        bad={vetoPct.trim() !== "" && !vetoValid}
+        onChange={setVetoPct}
+      />
+      <AdvisorField
+        label="Espera pelo veredito (s)"
+        help="No modo filtro, quanto tempo uma linha Pronta fica fora do automático esperando o veredito, contado entre ciclos. Depois disso, ou com erro, segue sem ele. De 5 a 120."
+        current={`${advisor.wait_seconds} s`}
+        text={wait}
+        bad={wait.trim() !== "" && !waitValid}
+        onChange={setWait}
+      />
+      <button
+        className="underline disabled:opacity-50"
+        type="button"
+        disabled={!valid}
+        onClick={() =>
+          void save("Salvar o consultor", payload, () => "Consultor salvo").then((outcome) => {
+            if (outcome.ok) {
+              setBudget("");
+              setVetoPct("");
+              setWait("");
+            }
+          })
+        }
+      >
+        salvar consultor
+      </button>
+      <p className="text-neutral-500">
+        Hoje, testnet e produção somados: {advisor.today.calls} consultas · {formatUsdCost(advisor.today.cost_usd)} de {formatUsdCost(advisor.daily_budget_usd)} (estimativa) · {advisor.today.errors} erros
+        {advisor.last_ok && <> · último veredito {new Date(advisor.last_ok).toLocaleString("pt-BR")}</>} · prompt {advisor.prompt_version}
+      </p>
+      {advisor.last_error && <p className="text-red-600">Último erro: {advisor.last_error}</p>}
+    </div>
+  );
+}
+
+/** One numeric advisor setting: typed, checked against its bounds, saved with the others. */
+function AdvisorField({
+  label,
+  help,
+  current,
+  text,
+  bad,
+  onChange,
+}: {
+  label: string;
+  help: string;
+  current: string;
+  text: string;
+  bad: boolean;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label className="flex flex-wrap items-center gap-2">
+      <span className="inline-flex w-64 items-center">
+        {label}
+        <Help text={help} />
+      </span>
+      <input
+        className={`w-20 border bg-transparent px-2 py-1 ${bad ? "border-red-600" : ""}`}
+        value={text}
+        onChange={(event) => onChange(event.target.value)}
+        aria-label={label}
+      />
+      <span className="text-neutral-500">atual {current}</span>
+    </label>
   );
 }
 

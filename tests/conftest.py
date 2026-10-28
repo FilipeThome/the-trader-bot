@@ -23,6 +23,12 @@ def _serial_backtest(monkeypatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_advice_klines(monkeypatch) -> None:
+    """The advisor's resolver reads Binance klines for rows outside the snapshot; never in tests."""
+    monkeypatch.setattr("bot.advisor.calibration.fetch_closed", lambda *_args: None)
+
+
+@pytest.fixture(autouse=True)
 def _clear_mode_pin() -> Iterator[None]:
     reset_weight()
     reset_journal_cache()
@@ -47,6 +53,7 @@ def api_client(tmp_path, monkeypatch) -> Iterator[TestClient]:
     ctx.config = None
     ctx.collector = None
     ctx.balance_cache = None
+    _reset_advisor(ctx)
     with ctx.validation_lock:
         ctx.validations.clear()
 
@@ -63,3 +70,9 @@ def api_client(tmp_path, monkeypatch) -> Iterator[TestClient]:
     ctx.runtime = None
     ctx.config = None
     ctx.collector = None
+    _reset_advisor(ctx)
+
+
+def _reset_advisor(ctx) -> None:
+    """The advisor is process-wide like the collector: each API test starts with none."""
+    ctx.advisor = None

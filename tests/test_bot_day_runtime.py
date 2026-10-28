@@ -85,7 +85,7 @@ def test_no_day_entry_in_the_quiet_hours(tmp_path, monkeypatch) -> None:
     runtime, _executor = _day_runtime(tmp_path, monkeypatch, close=100.0)
     runtime.config.strategies.update(trend=False, intraday_momentum=True)
     runtime.collector.snapshot = _snapshot(100.0, quiet)  # type: ignore[attr-defined]
-    monkeypatch.setattr("bot.runtime._setup", _day_setup)
+    monkeypatch.setattr("bot.cycle.scoring._setup", _day_setup)
     runtime.tick(now=quiet)
     rows = runtime.store.opportunities()
     assert rows and rows[0]["status"] == "bloqueada" and "hora sem liquidez" in rows[0]["reason"]
@@ -95,7 +95,7 @@ def test_no_day_entry_in_the_quiet_hours(tmp_path, monkeypatch) -> None:
 
 
 def test_a_day_setup_reads_the_closed_15m_and_1h_bars(tmp_path, monkeypatch) -> None:
-    from bot.runtime import _setup
+    from bot.cycle.scoring import _setup
     from bot.strategies import STRATEGIES
 
     seen: dict[str, Any] = {}
@@ -132,7 +132,7 @@ def test_a_mandate_with_a_day_strategy_budgets_its_extra_orders(tmp_path, monkey
 def test_a_day_row_prices_its_first_target_from_the_setup(tmp_path, monkeypatch) -> None:
     runtime, _executor = _day_runtime(tmp_path, monkeypatch, close=100.0)
     runtime.config.strategies.update(trend=False, intraday_momentum=True)
-    monkeypatch.setattr("bot.runtime._setup", _day_setup)
+    monkeypatch.setattr("bot.cycle.scoring._setup", _day_setup)
     runtime.tick(now=NOW)
     row = runtime.store.opportunities()[0]
     setup = _day_setup()

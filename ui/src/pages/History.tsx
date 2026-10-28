@@ -16,7 +16,7 @@ export function History() {
               Par<Help text="A moeda da decisão. Fica vazio quando a decisão vale para o robô inteiro, não para um par." />
             </th>
             <th className="pr-3 font-medium">
-              Estratégia<Help text="O método ligado a essa decisão: Trend, Mean Reversion ou Funding Carry." />
+              Estratégia<Help text="A estratégia ligada a essa decisão." />
             </th>
             <th className="pr-3 font-medium">
               Decisão<Help text="O que foi resolvido. Não operar significa que o robô olhou e preferiu ficar de fora." />

@@ -6,6 +6,7 @@ import threading
 from datetime import datetime
 from typing import Any
 
+from bot.advisor.service import Advisor
 from bot.collector import Collector
 from bot.config import BotConfig
 from bot.runtime import Runtime
@@ -17,6 +18,8 @@ class BotContext:
         self.config: BotConfig | None = None
         self.runtime: Runtime | None = None
         self.collector: Collector | None = None
+        #: The DeepSeek advisor of the process, shared by every runtime the API binds (R-A7).
+        self.advisor: Advisor | None = None
         self.token: str | None = None
         #: (profile id, read at, response) of the last balance read.
         self.balance_cache: tuple[str, datetime, dict[str, Any]] | None = None
@@ -33,3 +36,7 @@ class BotContext:
         from bot.runtime import mode_root
 
         return Store(mode_root(config) / "bot.sqlite")
+
+
+#: The one context of the process; the app and the validation jobs share it.
+ctx = BotContext()
