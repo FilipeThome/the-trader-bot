@@ -600,9 +600,10 @@ class Store:
 
     @_locked
     def recent_losses(self, since: str) -> list[dict[str, Any]]:
-        """Closed positions with a realized loss, closed at or after ``since`` (ISO time)."""
+        """Closed positions with a realized loss, closed at or after ``since`` (ISO time), with the
+        entry risk that turns the loss into R for the loss guard."""
         rows = self._conn.execute(
-            """SELECT symbol, closed_at, realized_pnl FROM positions
+            """SELECT symbol, closed_at, realized_pnl, initial_risk_usd FROM positions
             WHERE status='closed' AND realized_pnl < 0 AND closed_at IS NOT NULL AND closed_at >= ?
             ORDER BY closed_at""",
             (since,),

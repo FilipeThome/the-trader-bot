@@ -336,3 +336,58 @@ def test_status_trials_n_is_the_n_the_next_validation_reaches(api_client, loader
     assert status()["trials"]["trend"] == 4
     validate()
     assert status()["trials"]["trend"] == 6 and status()["trials_n"]["trend"] == 4
+
+
+def test_auto_select_replays_the_liquid_universe_not_the_chosen_pairs(api_client, loader, monkeypatch) -> None:
+    from bot.cycle.market import UNIVERSE_STATE
+
+    universe = ["ADA/USDT", "BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    strategies = {**ctx.runtime.config.strategies, "trend": True}  # type: ignore[union-attr]
+    runtime = _use({"auto_select": True, "symbols": ["SOL/USDT", "ETH/USDT"], "strategies": strategies})
+    runtime.store.set_state(UNIVERSE_STATE, universe)
+    assert api_client.post("/bot/strategies/trend/validate").status_code == 202
+    _join()
+    assert loader.reads[0] == ("1h", tuple(universe), 240)
+    params = runtime.store.strategy("trend")["params"]  # type: ignore[index]
+    assert params["symbols"] == universe and params["pairset"] == pairset_hash(universe) and params["universe"] == "liquid"
+    assert all(trial["pairset"] == pairset_hash(universe) for trial in runtime.store.trials_since_pass("trend"))
+    job = api_client.get("/bot/status").json()["validations"]["trend"]
+    assert job["done"] == job["total"] == 2 * len(universe)
+    detail = api_client.get("/bot/status").json()["validation_detail"]["trend"]["1h"]
+    assert detail["universe"] == "liquid" and detail["universe_pairs"] == 4
+    monkeypatch.setattr(validation, "_run_validation", lambda *_args: None)
+    start = datetime.now(timezone.utc)
+    # The hourly choice moves inside the universe: nothing is stale, and the N stays.
+    _use({"symbols": ["ADA/USDT"]})
+    assert module.revalidate_stale(runtime, now=start) == []
+    assert api_client.get("/bot/status").json()["trials_n"]["trend"] == 2
+    # The universe itself changes: stale, at most once a day from the last start (D12).
+    runtime.store.set_state(UNIVERSE_STATE, [*universe, "XRP/USDT"])
+    assert module.revalidate_stale(runtime, now=start + timedelta(hours=1)) == []
+    assert module.revalidate_stale(runtime, now=start + timedelta(hours=25)) == ["trend"]
+
+
+def test_the_validation_keeps_the_limits_it_replayed_and_a_limit_change_keeps_it(api_client, loader) -> None:
+    from bot.config import RiskLimits
+
+    runtime = _use({"limits": RiskLimits(max_positions=3), "strategies": {**ctx.runtime.config.strategies, "trend": True}})  # type: ignore[union-attr]
+    assert api_client.post("/bot/strategies/trend/validate").status_code == 202
+    _join()
+    params = runtime.store.strategy("trend")["params"]  # type: ignore[index]
+    replayed = {"max_positions": 3, "pair_cooldown_minutes": 120, "loss_guard_trades": 3, "loss_guard_r": 2.0}
+    assert params["limits"] == replayed and params["universe"] == "pairs"
+    detail = api_client.get("/bot/status").json()["validation_detail"]["trend"]
+    assert detail["1h"]["limits"] == replayed and detail["1h"]["skipped_by_limits"] == 0
+    assert detail["4h"]["score_threshold"] == 0.3 and detail["4h"]["filtered_trades"] == 0
+    # Limits are not part of the key: another limit re-validates nothing.
+    _use({"limits": RiskLimits(max_positions=1, loss_guard_r=1.0)})
+    assert module.revalidate_stale(runtime, now=datetime.now(timezone.utc) + timedelta(days=2)) == []
+
+
+def test_a_strategy_without_a_replay_lists_every_validatable_one(api_client) -> None:
+    from bot.backtest.runner import VALIDATABLE
+
+    reply = api_client.post("/bot/strategies/funding_carry/validate")
+    assert reply.status_code == 422
+    assert reply.json()["detail"] == f"só {', '.join(VALIDATABLE)} têm teste histórico"
+    assert all(strategy_id in reply.json()["detail"] for strategy_id in ("intraday_momentum", "vwap_pullback"))

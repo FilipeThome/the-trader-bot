@@ -81,6 +81,19 @@ export type TimeframeResult = {
   turnover?: number;
   avg_hold_hours?: number;
   elapsed_s?: number;
+  /** Trades ``classify`` would have made ready, with the thresholds the replay used. */
+  filtered_trades?: number;
+  filtered_wins?: number;
+  filtered_sharpe?: number;
+  score_threshold?: number;
+  cost_multiple?: number;
+  min_reward_risk?: number;
+  /** Trades the replayed portfolio limits refused, and those limits. */
+  skipped_by_limits?: number;
+  limits?: { max_positions?: number; pair_cooldown_minutes?: number; loss_guard_trades?: number; loss_guard_r?: number };
+  /** From /bot/status: "liquid" (automatic selection's 40 most liquid pairs) or "pairs" (the configured ones). */
+  universe?: string;
+  universe_pairs?: number;
   mc_ok?: boolean;
 };
 

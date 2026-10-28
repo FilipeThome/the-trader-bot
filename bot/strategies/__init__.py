@@ -39,7 +39,9 @@ def exit_policy_for(strategy_id: str, swing_policy: str) -> str:
 
 
 #: Version of the backtest gate. A result of an older gate is stale and is re-validated.
-GATE_VERSION = 2
+#: 3: portfolio limits replayed, a hold-out with trades and pace, the liquid universe under
+#: automatic selection, and trades marked by ``classify``.
+GATE_VERSION = 3
 #: Version of each strategy's entry and exit code; bump one when its replay changes.
 STRATEGY_VERSIONS: dict[str, int] = {key: 1 for key in STRATEGIES}
 #: Strategies whose own exit (EMA 20/50 cross) has the hysteresis switch.

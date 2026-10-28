@@ -41,7 +41,7 @@ export function Positions() {
               Par<Help text="A moeda que está aberta contra USDT." />
             </th>
             <th className="pr-3 font-medium">
-              Estratégia<Help text="Qual método abriu esta posição: Trend, Mean Reversion ou Funding Carry." />
+              Estratégia<Help text="A estratégia que abriu esta posição." />
             </th>
             <th className="pr-3 font-medium">
               Lado<Help text="Compra significa que você ganha se o preço subir. Venda significa que você ganha se o preço cair." />

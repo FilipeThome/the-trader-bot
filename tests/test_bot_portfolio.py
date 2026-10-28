@@ -323,3 +323,13 @@ def test_a_row_with_no_estimated_edge_is_refused_but_a_test_row_is_not() -> None
     assert refused.allowed is False and "sem vantagem estimada" in refused.reason
     assert manager.assess(_rated(0.30, test_only=True), **common).allowed is True
     assert manager.assess(_rated(0.70), **common).allowed is True
+
+
+def test_the_ranking_keeps_the_liquid_pool_it_read(monkeypatch) -> None:
+    import bot.markets as markets
+
+    collector = Collector()
+    monkeypatch.setattr(markets, "top_liquid_usdt", lambda _collector, count, listed=None: ["BTC/USDT", "ETHBTC", "SOL/USDT"][:count])
+    monkeypatch.setattr(markets, "_momentum_score", lambda _collector, pair: 1.0 if pair == "SOL/USDT" else -1.0)
+    assert markets.rank_promising(collector, 5) == ["SOL/USDT"]
+    assert collector.universe_cache == ["BTC/USDT", "SOL/USDT"]

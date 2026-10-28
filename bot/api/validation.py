@@ -11,7 +11,7 @@ import logging
 import math
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -20,13 +20,17 @@ from bot.backtest.loaders.binance_loader import WeightPressure
 from bot.backtest.runner import (
     VALIDATABLE,
     BacktestResult,
+    filter_for,
+    replayed_limits,
     strategy_record,
     timeframe_record,
     validate_strategy,
     validation_days,
 )
 from bot.config import BotConfig
+from bot.cycle.market import UNIVERSE_STATE
 from bot.logging_setup import redact
+from bot.markets import liquid_pool, venue_symbols
 from bot.reports import append_ledger
 from bot.runtime import Runtime, mode_root
 from bot.store import Store
@@ -79,12 +83,34 @@ def _claim_validation(config: BotConfig, strategy_id: str, stage: str) -> dict[s
         return dict(job)
 
 
-def _stale_cause(params: dict[str, Any] | None, strategy_id: str, config: BotConfig) -> str | None:
+def replay_universe(config: BotConfig, store: Store) -> list[str] | None:
+    """The pairs a validation under ``config`` replays (D6, Q-A6).
+
+    The configured pairs, or under automatic selection the whole liquid pool the
+    selection ranks (``markets.RANK_POOL`` pairs by 24h volume, ``UNIVERSE_STATE``),
+    not the pairs it chose: the chosen ones are the best momentum of the last 28 days,
+    a window inside the hold-out. None under automatic selection before any ranking
+    saved the pool.
+    """
+    if not config.auto_select:
+        return list(config.symbols)
+    saved = store.get_state(UNIVERSE_STATE)
+    if isinstance(saved, list) and saved and all(isinstance(symbol, str) for symbol in saved):
+        return list(saved)
+    return None
+
+
+def _stale_cause(
+    params: dict[str, Any] | None, strategy_id: str, config: BotConfig, universe: Sequence[str] | None
+) -> str | None:
     """Why the stored validation does not hold for ``config``; None while it does.
 
     "new": never validated. "gate": an older gate or strategy version. "rules": another
     exit rule, market filter or exit hysteresis, or an operated timeframe it did not
-    replay. "pairs": another pair set (D6).
+    replay. "pairs": another pair set (D6) than ``universe`` (``replay_universe``; an
+    unknown universe stales nothing). Under automatic selection the hourly change of
+    the chosen pairs therefore stales nothing; a change of the liquid pool does. The
+    portfolio limits are not part of the key: the record keeps the ones it replayed.
     """
     if not params:
         return "new"
@@ -94,7 +120,7 @@ def _stale_cause(params: dict[str, Any] | None, strategy_id: str, config: BotCon
         return "rules"
     if any(timeframe_result(params, timeframe) is None for timeframe in STRATEGIES[strategy_id].timeframes):
         return "rules"
-    if params.get("pairset") != pairset_hash(config.symbols):
+    if universe is not None and params.get("pairset") != pairset_hash(universe):
         return "pairs"
     return None
 
@@ -109,10 +135,12 @@ def _auto_validate(config: BotConfig, store: Store) -> list[str]:
     one running is left alone.
     """
     stored = {row["strategy_id"]: row["params"] for row in store.strategies()}
+    universe = replay_universe(config, store)
     wanted = [
         strategy_id
         for strategy_id in VALIDATABLE
-        if config.strategies.get(strategy_id) and _stale_cause(stored.get(strategy_id), strategy_id, config) in ("new", "gate", "rules")
+        if config.strategies.get(strategy_id)
+        and _stale_cause(stored.get(strategy_id), strategy_id, config, universe) in ("new", "gate", "rules")
     ]
     return _queue_validations(config, store, wanted)
 
@@ -121,8 +149,9 @@ def revalidate_stale(runtime: Runtime, *, startup: bool = False, now: datetime |
     """Queue a validation of each enabled strategy whose stored result went stale (D12); returns them.
 
     A new gate or strategy version, or another exit rule, market filter, hysteresis or
-    operated timeframe, re-validates at once; a changed pair set at most once per
-    ``PAIRSET_REVALIDATE_EVERY`` since the strategy's last start (``revalidate_at:<id>``).
+    operated timeframe, re-validates at once; a changed pair set (under automatic selection,
+    a changed liquid pool) at most once per ``PAIRSET_REVALIDATE_EVERY`` since the
+    strategy's last start (``revalidate_at:<id>``).
     A strategy never validated is left to the operator and to config changes
     (``_auto_validate``); a failed run waits ``REVALIDATE_RETRY``. Called at startup
     and by the process loop after each tick, so it only reads the store when nothing is stale.
@@ -130,11 +159,12 @@ def revalidate_stale(runtime: Runtime, *, startup: bool = False, now: datetime |
     config, store = runtime.config, runtime.store
     moment = now or datetime.now(timezone.utc)
     stored = {row["strategy_id"]: row["params"] for row in store.strategies()}
+    universe = replay_universe(config, store)
     causes: dict[str, str] = {}
     for strategy_id in VALIDATABLE:
         if not config.strategies.get(strategy_id):
             continue
-        cause = _stale_cause(stored.get(strategy_id), strategy_id, config)
+        cause = _stale_cause(stored.get(strategy_id), strategy_id, config, universe)
         if cause in (None, "new") or _failed_recently(config.mode, strategy_id, moment):
             continue
         if cause == "pairs" and _started_within(store, strategy_id, moment, PAIRSET_REVALIDATE_EVERY):
@@ -196,30 +226,60 @@ def _validation_jobs(mode: str) -> dict[str, dict[str, Any]]:
 
 
 def _update_job(key: tuple[str, str], **fields: Any) -> None:
+    """Update a running job; one whose registry entry is gone (the context was reset) is left alone."""
     with ctx.validation_lock:
-        ctx.validations[key].update(fields)
+        job = ctx.validations.get(key)
+        if job is not None:
+            job.update(fields)
 
 
 class _HistoryMissing(RuntimeError):
     """History the validation cannot run without; the message is the operator's."""
 
 
+def _universe_for(config: BotConfig, root: Any) -> list[str]:
+    """The pairs this validation replays (``replay_universe``). Under automatic selection
+    before any ranking saved the liquid pool, it is read here, outside every lock, and saved."""
+    if not config.auto_select:
+        return list(config.symbols)
+    store = Store(root / "bot.sqlite")
+    try:
+        universe = replay_universe(config, store)
+        if universe is not None:
+            return universe
+        collector = ctx.collector
+        if collector is None:
+            raise _HistoryMissing("universo de pares líquidos indisponível para a seleção automática")
+        pool = sorted(liquid_pool(collector, listed=venue_symbols(collector, config.mode)))
+        if not pool:
+            raise _HistoryMissing("universo de pares líquidos indisponível para a seleção automática")
+        store.set_state(UNIVERSE_STATE, pool)
+        return pool
+    finally:
+        store.close()
+
+
 def _run_validation(key: tuple[str, str], strategy_id: str, config: BotConfig, root: Any) -> None:
-    """Validate ``strategy_id`` on every timeframe it trades (D7) over the config's pair set (D6).
+    """Validate ``strategy_id`` on every timeframe it trades (D7) over its replay universe (D6, Q-A6).
 
     Each timeframe replays ``validation_days`` of history (D11). A day strategy also
     reads 1h bars for its trend filter, and the market filter BTC's 4h bars with the
     warm-up of its EMA. Each timeframe is one trial (D9), logged with ``add_trial``.
-    The record keeps one result per timeframe (``strategy_record``).
+    The replay marks trades with the config's ``classify`` thresholds and replays its
+    portfolio limits (Q-A5); the record keeps one result per timeframe (``strategy_record``)
+    with the limits it ran under.
     """
     from bot.backtest.loaders.registry import resolve_loader
 
     began = time.monotonic()
-    symbols = list(config.symbols)
     spans = {timeframe: validation_days(strategy_id, timeframe) for timeframe in STRATEGIES[strategy_id].timeframes}
     longest = max(spans.values())
     end = datetime.now(timezone.utc)
     try:
+        symbols = _universe_for(config, root)
+        if config.auto_select:
+            # The job was claimed with the chosen pairs; the replay downloads the universe.
+            _update_job(key, total=len(symbols) * len(spans))
         loader = resolve_loader("crypto")
         frames: dict[str, dict[str, Any]] = {}
         for index, (timeframe, days) in enumerate(spans.items()):
@@ -245,15 +305,22 @@ def _run_validation(key: tuple[str, str], strategy_id: str, config: BotConfig, r
         _update_job(key, stage="calculando")
         store = Store(root / "bot.sqlite")
         try:
-            results = _replay_timeframes(store, strategy_id, frames, config, hourly=hourly, market=market)
+            results = _replay_timeframes(store, strategy_id, frames, config, symbols=symbols, hourly=hourly, market=market)
             elapsed = round(time.monotonic() - began, 1)
+            extra = {
+                "days": spans,
+                "elapsed_s": elapsed,
+                "limits": replayed_limits(config.limits),
+                # "liquid": the RANK_POOL universe of the automatic selection; "pairs": the configured ones.
+                "universe": "liquid" if config.auto_select else "pairs",
+            }
             record = strategy_record(
                 results,
                 symbols=symbols,
                 exit_policy=config.exit_policy,
                 market_filter=config.market_filter,
                 hysteresis=config.exit_hysteresis,
-                extra={"days": spans, "elapsed_s": elapsed},
+                extra=extra,
             )
             store.save_strategy(record)
         finally:
@@ -298,6 +365,7 @@ def _replay_timeframes(
     frames: dict[str, dict[str, Any]],
     config: BotConfig,
     *,
+    symbols: Sequence[str],
     hourly: dict[str, Any] | None,
     market: Any,
 ) -> dict[str, BacktestResult]:
@@ -305,12 +373,14 @@ def _replay_timeframes(
 
     The deflated Sharpe's N is ``_trial_count`` of the trials since the strategy's last
     pass, the earlier timeframes of this run included, plus the current combination; the
-    variance uses those trials' per-trade Sharpe.
+    variance uses those trials' per-trade Sharpe. ``symbols`` is the replay universe:
+    its hash is the trial's pair set.
     """
     seen = store.trials_since_pass(strategy_id)
     results: dict[str, BacktestResult] = {}
+    marks = filter_for(config.score_threshold, config.cost_multiple, config.min_reward_risk, config.exit_policy)
     for timeframe, by_symbol in frames.items():
-        combination = _config_combination(strategy_id, timeframe, config)
+        combination = _config_combination(strategy_id, timeframe, config, symbols)
         _timeframe, policy, pairset, _market_filter, hysteresis = combination
         result = validate_strategy(
             strategy_id,
@@ -322,6 +392,8 @@ def _replay_timeframes(
             market_frame=market,
             trials=_trial_count(seen, [combination]),
             trial_sharpes=[float(trial["sharpe_trade"]) for trial in seen],
+            limits=config.limits,
+            entry_filter=marks,
         )
         sharpe = float(result.sharpe_trade)
         trial = {
@@ -356,16 +428,17 @@ def _combination(trial: dict[str, Any]) -> _Combination:
     )
 
 
-def _config_combination(strategy_id: str, timeframe: str, config: BotConfig) -> _Combination:
-    """The combination a validation of ``strategy_id`` on ``timeframe`` under ``config`` logs."""
+def _config_combination(strategy_id: str, timeframe: str, config: BotConfig, symbols: Sequence[str]) -> _Combination:
+    """The combination a validation of ``strategy_id`` on ``timeframe`` under ``config`` over
+    ``symbols`` (the replay universe) logs."""
     policy = exit_policy_for(strategy_id, config.exit_policy)
     hysteresis = bool(config.exit_hysteresis) and uses_hysteresis(strategy_id, policy)
-    return (timeframe, policy, pairset_hash(config.symbols), config.market_filter, hysteresis)
+    return (timeframe, policy, pairset_hash(symbols), config.market_filter, hysteresis)
 
 
-def _config_combinations(strategy_id: str, config: BotConfig) -> list[_Combination]:
+def _config_combinations(strategy_id: str, config: BotConfig, symbols: Sequence[str]) -> list[_Combination]:
     """One combination per timeframe the strategy operates, as its next validation runs them."""
-    return [_config_combination(strategy_id, timeframe, config) for timeframe in STRATEGIES[strategy_id].timeframes]
+    return [_config_combination(strategy_id, timeframe, config, symbols) for timeframe in STRATEGIES[strategy_id].timeframes]
 
 
 def _trial_count(seen: list[dict[str, Any]], current: list[_Combination]) -> int:

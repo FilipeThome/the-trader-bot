@@ -9,14 +9,6 @@ import { sizeLimitName, statusLabels, strategyName } from "../labels";
 import { useBot } from "../store";
 import type { ArmedEntry, Decision, Opportunity } from "../types";
 
-const strategies = [
-  ["todas", "Todas"],
-  ["trend", "Trend"],
-  ["mean_reversion", "Mean Reversion"],
-  ["momentum", "Momentum"],
-  ["funding_carry", "Funding Carry"],
-] as const;
-
 /** Every size cap of the row in USD, smallest first, for the badge's tooltip. */
 function capsText(row: Opportunity): string {
   const caps = Object.entries(row.size_caps ?? {}).sort(([, a], [, b]) => a - b);
@@ -32,6 +24,7 @@ function signalAge(seconds: number, drift?: number | null): string {
 
 export function Opportunities() {
   const rows = useBot((state) => state.rows);
+  const enabled = useBot((state) => state.status?.strategies);
   const perform = useBot((state) => state.perform);
   const busy = useBot((state) => state.busy);
   const [strategy, setStrategy] = useState("todas");
@@ -81,16 +74,22 @@ export function Opportunities() {
     setTradeId(started?.position_id ?? null);
   }
   const visible = rows.filter((row) => strategy === "todas" || row.strategy === strategy);
+  // The strategies switched on in Controls, plus the one chosen here if it was switched off since.
+  const options = Object.entries(enabled ?? {})
+    .filter(([id, on]) => on || id === strategy)
+    .map(([id]) => id)
+    .filter((id) => id !== "todas");
 
   return (
     <section>
       <label className="mb-3 flex items-center text-sm">
         Estratégia
-        <Help text="Escolhe qual jeito de operar aparece na lista. Todas junta as três. Trend segue o movimento, Mean Reversion aposta na volta à média e Funding Carry só mostra um sinal, sem executar." />
+        <Help text="Escolhe qual estratégia aparece na lista, entre as ligadas em Controles. Todas junta as ligadas. A descrição de cada uma está em Controles." />
         <select className="ml-2 bg-transparent" value={strategy} onChange={(event) => setStrategy(event.target.value)}>
-          {strategies.map(([value, label]) => (
-            <option key={value} value={value}>
-              {label}
+          <option value="todas">Todas</option>
+          {options.map((id) => (
+            <option key={id} value={id}>
+              {strategyName(id)}
             </option>
           ))}
         </select>
@@ -106,7 +105,7 @@ export function Opportunities() {
               Par<Help text="As duas moedas da operação. BTC/USDT significa comprar ou vender bitcoin pagando em dólar digital." />
             </th>
             <th className="pr-3 font-medium">
-              Estratégia<Help text="O método que gerou a sugestão: Trend, Mean Reversion ou Funding Carry." />
+              Estratégia<Help text="A estratégia ligada em Controles que gerou a sugestão." />
             </th>
             <th className="pr-3 font-medium">
               Ação<Help text="O que o robô sugere fazer nesta linha: comprar, vender ou sair." />

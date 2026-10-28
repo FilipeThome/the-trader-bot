@@ -207,7 +207,7 @@ function Validation({ status }: { status: Status | null }) {
     <div className="mt-8 text-sm">
       <p className="mb-1 flex items-center font-medium">
         Validação no histórico
-        <Help text="O teste que libera cada estratégia, por tempo gráfico. Aprova com: pelo menos 30 trades fora do hold-out, Sharpe acima de 1, queda menor que 20%, 3 de 4 janelas do walk-forward no lucro com eficiência (WFE) de pelo menos 0,5, hold-out final sem prejuízo e Sharpe deflacionado (DSR) de pelo menos 0,95. O DSR desconta quantas combinações foram testadas desde a última aprovação: quanto mais tentativas, mais exigente. Só o tempo gráfico aprovado opera." />
+        <Help text="O teste que libera cada estratégia, por tempo gráfico. Aprova com: pelo menos 30 trades fora do hold-out, Sharpe acima de 1, queda menor que 20%, 3 de 4 janelas do walk-forward no lucro com eficiência (WFE) de pelo menos 0,5, hold-out final com pelo menos 5 trades, lucro e ganho por dia de pelo menos metade do da amostra, e Sharpe deflacionado (DSR) de pelo menos 0,95. O DSR desconta quantas combinações foram testadas desde a última aprovação: quanto mais tentativas, mais exigente. O teste aplica os limites da carteira (posições, pausa do par, trava de perdas) com que rodou; mudar um limite não pede validar de novo. Só o tempo gráfico aprovado opera." />
       </p>
       <p className="mb-3 text-neutral-500">PBO não calculado: sem otimização de parâmetros.</p>
       {ids.length === 0 && <p className="text-neutral-500">Nenhuma validação registrada neste ambiente.</p>}
@@ -272,7 +272,7 @@ function StrategyValidation({
         <span className="block text-xs text-neutral-500">WFE {num(r.wfe)}</span>
       </span>
     )],
-    ["Hold-out", "Os últimos 20% do histórico, guardados fora do teste. Não pode dar prejuízo.", (r) =>
+    ["Hold-out", "Os últimos 20% do histórico, guardados fora do teste. Precisa de pelo menos 5 trades, lucro e ganho por dia de pelo menos metade do ganho por dia da amostra.", (r) =>
       r.holdout ? (
         <span className={r.holdout.passed ? "text-green-600" : "text-red-600"}>
           {pct(r.holdout.net)} em {r.holdout.trades} trades <span className="text-neutral-500">desde {day(r.holdout.start)}</span>
@@ -289,12 +289,38 @@ function StrategyValidation({
         </span>
       );
     }],
+    ["Filtro de entrada", "Os trades que o robô aceitaria ao vivo (nota, custo e ganho/risco com os limiares usados no teste), com a taxa de acerto, comparados a todos os setups. Com amostra suficiente e os mesmos limiares de hoje, a menor das duas taxas vale no piso de acerto e no Kelly.", (r) =>
+      r.filtered_trades == null ? "—" : (
+        <span>
+          {r.filtered_trades} de {r.trades ?? "—"} · acerto {pct(r.filtered_trades ? (r.filtered_wins ?? 0) / r.filtered_trades : null, 0)}
+          {" "}(todos {pct(r.trades ? (r.wins ?? 0) / r.trades : null, 0)})
+          <span className="block text-xs text-neutral-500">
+            Sharpe diário {num(r.filtered_sharpe)} · nota {num(r.score_threshold)} · custo {num(r.cost_multiple, 1)}x · ganho/risco {num(r.min_reward_risk, 1)}
+          </span>
+        </span>
+      )],
+    ["Limites da carteira", "Os limites com que o teste rodou: vagas, um trade por par, pausa do par depois de perda e trava de perdas. Os trades recusados por eles saem do teste. Risco total, cluster do BTC, correlação, caixa e vagas de outras estratégias não entram: o resultado é o melhor caso.", (r) =>
+      r.limits && r.limits.max_positions != null ? (
+        <span>
+          {r.skipped_by_limits ?? 0} trades pulados
+          <span className="block text-xs text-neutral-500">
+            {r.limits.max_positions} posições · pausa do par {r.limits.pair_cooldown_minutes} min · trava {r.limits.loss_guard_trades} perdas ou {num(r.limits.loss_guard_r, 1)} R em 6 h
+          </span>
+        </span>
+      ) : "—"],
     ["Fator de lucro", "Ganhos brutos divididos pelas perdas brutas. Acima de 1 ganha mais do que perde.", (r) => num(r.profit_factor)],
     ["Expectativa", "Resultado médio por trade em unidades de risco: +0,2 R ganha em média um quinto do que arrisca.", (r) => formatR(r.expectancy_r)],
     ["Queda máxima", "A maior queda do teste, por unidade investida. Precisa ficar abaixo de 20%.", (r) => pct(r.max_drawdown)],
   ];
+  const liquid = Object.values(results).find((result) => result.universe === "liquid");
   return (
     <div className="mb-6 overflow-x-auto rounded border border-neutral-300 p-3 dark:border-neutral-700">
+      {liquid && (
+        <p className="mb-2 text-xs text-neutral-500">
+          Seleção automática: o teste rodou nos {liquid.universe_pairs ?? 40} pares mais líquidos por volume, não só nos escolhidos.
+          A escolha por volume no fim do período ainda carrega algum viés e não vê pares deslistados.
+        </p>
+      )}
       <p className="mb-2 font-medium">
         {strategyName(id)} · {validated ? <span className="text-green-600">opera</span> : <span className="text-neutral-500">só sinal</span>}
         <span className="ml-2 inline-flex items-center font-normal text-neutral-500">

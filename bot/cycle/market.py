@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 _PRICE_INTERVALS = ("1m", "15m", "1h", "4h")
 #: Seconds between two automatic choices of the analysed pairs.
 AUTO_SELECT_SECONDS = 3600
+#: ``bot_state`` key of the liquid pool the last ranking read: the validation universe (Q-A6).
+UNIVERSE_STATE = "auto_select_universe"
 #: Read every cycle, analysed or not: the market filter and the correlation cluster need it.
 MARKET_SYMBOL = CLUSTER_ANCHOR
 #: Most seconds one cycle waits for the account-fee reads; the rest finish in the background.
@@ -146,6 +148,8 @@ def _choose_pairs(
 
     Returns the pairs to analyse, or None to keep the current ones. A failure
     keeps the current pairs and is logged; it never counts as a failed cycle.
+    The liquid pool the ranking read is saved as ``UNIVERSE_STATE``: validations
+    replay that pool, and a change of it (not of the chosen pairs) makes them stale.
     """
     if retired or not config.auto_select or weight_pressure():
         return None
@@ -156,6 +160,9 @@ def _choose_pairs(
         store.set_state("auto_select_at", moment.isoformat())
         listed = venue_symbols(collector, config.mode)
         chosen = rank_promising(collector, config.auto_select_count, listed=listed)
+        universe = getattr(collector, "universe_cache", None)
+        if universe:
+            store.set_state(UNIVERSE_STATE, sorted(universe))
         if not chosen:
             # No pair is rising: keep the current pairs the venue can still trade.
             chosen = [symbol for symbol in config.symbols if listed is None or symbol in listed]

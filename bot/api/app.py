@@ -247,6 +247,7 @@ def status() -> dict[str, Any]:
     stored = store.strategies()
     since = (datetime.now(timezone.utc) - timedelta(days=REPORT_DAYS)).isoformat()
     since_pass = {strategy_id: store.trials_since_pass(strategy_id) for strategy_id in VALIDATABLE}
+    universe = validation.replay_universe(config, store) or config.symbols
     return {
         "running": runtime.running,
         "halted": runtime.halted,
@@ -263,7 +264,7 @@ def status() -> dict[str, Any]:
         # Trial rows recorded since the last pass, and the deflated Sharpe's N they make with this config.
         "trials": {strategy_id: len(trials) for strategy_id, trials in since_pass.items()},
         "trials_n": {
-            strategy_id: validation._trial_count(trials, validation._config_combinations(strategy_id, config))
+            strategy_id: validation._trial_count(trials, validation._config_combinations(strategy_id, config, universe))
             for strategy_id, trials in since_pass.items()
         },
         "validations": validation._validation_jobs(runtime.config.mode),
@@ -326,13 +327,24 @@ def _operable(result: dict[str, Any] | None, config: BotConfig) -> bool:
 def _validation_detail_of(params: dict[str, Any] | None, config: BotConfig) -> dict[str, dict[str, Any]]:
     """Each replayed timeframe's result plus ``mc_ok`` (``risk.mc_drawdown_ok``, the live check, D10):
     the Monte Carlo p95 drawdown at today's risk per trade is readable and below the drawdown
-    limit. A missing or unreadable p95 is not ok."""
+    limit. A missing or unreadable p95 is not ok. Each result also carries the universe it
+    replayed (``universe``: "liquid" under automatic selection, "pairs" otherwise, with
+    ``universe_pairs``) and keeps the portfolio limits it ran under (``limits``,
+    ``skipped_by_limits``): changing a limit does not re-validate (Q-A5)."""
     detail: dict[str, dict[str, Any]] = {}
+    universe = {
+        "universe": (params or {}).get("universe", "pairs"),
+        "universe_pairs": len((params or {}).get("symbols") or ()),
+    }
     for timeframe in (params or {}).get("timeframes") or {}:
         result = timeframe_result(params, timeframe)
         if result is None:
             continue
-        detail[timeframe] = {**result, "mc_ok": risk.mc_drawdown_ok(result.get("mc_p95_dd_r"), config.limits)}
+        detail[timeframe] = {
+            **result,
+            **universe,
+            "mc_ok": risk.mc_drawdown_ok(result.get("mc_p95_dd_r"), config.limits),
+        }
     return detail
 
 
@@ -781,7 +793,7 @@ def validate(strategy_id: str) -> dict[str, Any]:
     mode switch while it runs neither moves its result nor loses its state.
     """
     if strategy_id not in VALIDATABLE:
-        raise HTTPException(status_code=422, detail="só trend, mean_reversion e momentum têm teste histórico")
+        raise HTTPException(status_code=422, detail=f"só {', '.join(VALIDATABLE)} têm teste histórico")
     runtime = _runtime()
     config = runtime.config.model_copy(deep=True)
     job = validation._claim_validation(config, strategy_id, "baixando")

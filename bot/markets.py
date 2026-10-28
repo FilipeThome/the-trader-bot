@@ -169,6 +169,15 @@ def top_liquid_usdt(collector: Collector, count: int, *, listed: frozenset[str] 
     return [pair for _volume, pair in ranked[:count]]
 
 
+def liquid_pool(collector: Collector, pool: int = RANK_POOL, *, listed: frozenset[str] | None = None) -> list[str]:
+    """The pairs the automatic selection ranks: the ``pool`` most liquid USDT pairs by 24h volume.
+
+    It is also the replay universe of a validation under automatic selection: the
+    pairs the selection could pick from, not the ones it picked.
+    """
+    return [pair for pair in top_liquid_usdt(collector, pool, listed=listed) if is_usdt_pair(pair)]
+
+
 def rank_promising(
     collector: Collector, count: int, *, pool: int = RANK_POOL, listed: frozenset[str] | None = None
 ) -> list[str]:
@@ -179,9 +188,11 @@ def rank_promising(
     too young for 28 days is scored the same way on its day (``_day_score``). Only
     pairs with a positive score are returned, best first. ``listed`` limits the
     pool to the pairs the order venue lists. Momentum here only
-    picks which pairs the strategies look at; it never buys by itself.
+    picks which pairs the strategies look at; it never buys by itself. The pool
+    read is kept in ``collector.universe_cache`` for the validation universe.
     """
-    candidates = [pair for pair in top_liquid_usdt(collector, pool, listed=listed) if is_usdt_pair(pair)]
+    candidates = liquid_pool(collector, pool, listed=listed)
+    collector.universe_cache = list(candidates)
     with ThreadPoolExecutor(max_workers=8) as executor:
         scores = list(executor.map(lambda pair: _momentum_score(collector, pair), candidates))
     ranked = sorted(

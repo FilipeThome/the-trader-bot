@@ -151,11 +151,15 @@ def _score(
             signal_reason = _signal_only_reason(
                 stats, keyed, result, setup.timeframe, symbol, strategy_id, limits, moment, blocks, effects, store=store
             )
+            # The thresholds classify judges with below: the filtered hit rate counts only when
+            # the replay marked its trades with the same ones.
+            min_reward_risk = 0.0 if fixed is not None else config.min_reward_risk
             win_rate, win_rate_n = estimate_win_rate(
                 {"exit_policy": params.get("exit_policy"), **result} if params and result is not None else None,
                 store.strategy_outcomes(strategy_id, policy),
                 exit_policy=policy,
                 min_sample=config.min_win_rate_sample,
+                thresholds=(config.score_threshold, config.cost_multiple, min_reward_risk),
             )
             stale = snapshot.stale(symbol, market._price_interval(setup.timeframe), now=moment)
             draft = classify(
@@ -167,7 +171,7 @@ def _score(
                 score_threshold=config.score_threshold,
                 cost_multiple=config.cost_multiple,
                 # The operator chose the payoff of a fixed rule; the hit-rate floor judges it.
-                min_reward_risk=0.0 if fixed is not None else config.min_reward_risk,
+                min_reward_risk=min_reward_risk,
                 # Never cheaper than the backtest's fee, whatever discount the account has.
                 taker=max(SPOT_TAKER, takers.get(symbol, SPOT_TAKER)),
             )

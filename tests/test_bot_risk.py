@@ -636,3 +636,66 @@ def test_buy_block_is_the_clock_then_the_level_then_the_pause(level: str, pause:
     else:
         expected = None
     assert reason == expected
+
+
+def _r_losses(now: datetime, r_values: list[float]) -> list[dict[str, Any]]:
+    """Losing closes an hour apart, the newest an hour ago, each risking 10 USD at its stop."""
+    from datetime import timedelta
+
+    return [
+        {
+            "symbol": f"P{index}/USDT",
+            "closed_at": (now - timedelta(hours=len(r_values) - index)).isoformat(),
+            "realized_pnl": r * 10.0,
+            "initial_risk_usd": 10.0,
+        }
+        for index, r in enumerate(r_values)
+    ]
+
+
+def test_three_small_losses_still_pause_the_entries() -> None:
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    row = _opportunity()
+    protect([row], _r_losses(now, [-0.1, -0.1, -0.1]), RiskLimits(pair_cooldown_minutes=0), now)
+    assert row.status == "bloqueada" and "3 perdas nas últimas 6 h" in row.reason
+
+
+def test_two_full_stop_outs_now_pause_the_entries() -> None:
+    from datetime import timedelta
+
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    losses = _r_losses(now, [-1.0, -1.0])
+    row = _opportunity()
+    protect([row], losses, RiskLimits(pair_cooldown_minutes=0), now)
+    # The older loss closed at 10:00: the sum rises above -2 R when it leaves the window at 16:00.
+    assert row.status == "bloqueada" and row.reason == "perdas somando -2.0 R nas últimas 6 h: entradas pausadas até 16:00 UTC"
+    off = _opportunity()
+    protect([off], losses, RiskLimits(pair_cooldown_minutes=0, loss_guard_r=0), now)
+    assert off.status == "pronta"
+    smaller = _opportunity()
+    protect([smaller], _r_losses(now, [-1.0, -0.9]), RiskLimits(pair_cooldown_minutes=0), now)
+    assert smaller.status == "pronta"
+    later = _opportunity()
+    protect([later], losses, RiskLimits(pair_cooldown_minutes=0), now + timedelta(hours=4, minutes=1))
+    assert later.status == "pronta"
+
+
+def test_the_loss_guard_r_is_bounded_and_on_by_default() -> None:
+    assert RiskLimits().loss_guard_r == 2.0
+    with pytest.raises(ValueError):
+        RiskLimits(loss_guard_r=-1)
+    with pytest.raises(ValueError):
+        RiskLimits(loss_guard_r=21)
+
+
+def test_recent_losses_carry_the_entry_risk(tmp_path) -> None:
+    from bot.store import Store
+
+    store = Store(tmp_path / "bot.sqlite")
+    position_id = store.open_pending("BTC/USDT", "trend", stop_price=95.0)
+    assert position_id is not None
+    store.update_position(position_id, status="open", qty=1.0, avg_price=100.0, initial_risk_usd=5.0)
+    store.close_position(position_id, exit_price=95.0, realized_pnl=-5.0, fees=0.0)
+    (loss,) = store.recent_losses("2000-01-01")
+    assert loss["initial_risk_usd"] == 5.0 and loss["realized_pnl"] == -5.0
+    store.close()

@@ -17,12 +17,19 @@ above it, never on a wick. Each round trip pays the spot taker fee twice and
 ``LEG_SLIPPAGE`` on each leg. With the market filter on, no entry is taken
 while BTC's last closed 4h bar is under its 40-day EMA.
 
-The gate (``GATE_VERSION`` 2 in ``bot.strategies``) judges in-sample trades:
-the last ``HOLDOUT_SHARE`` of the span, by exit time, is a hold-out that must
-not lose, and the rest is cut into ``WF_WINDOWS`` windows of which
-``WF_MIN_PROFITABLE`` must make money, with a walk-forward efficiency of at
-least ``MIN_WFE``. The in-sample Sharpe must pass 1 (per trade annualised by
-trades per year for swing strategies, daily for day strategies), the unit
+Every replayed trade records whether ``classify`` would have made its setup
+ready with the replay's cost and the configured thresholds. Before the gate,
+``constrain_portfolio`` replays the portfolio limits on those trades: a position
+slot, one position per pair, the pair cooldown after a loss and the loss guard.
+
+The gate (``GATE_VERSION`` 3 in ``bot.strategies``) judges in-sample trades:
+the last ``HOLDOUT_SHARE`` of the span, by exit time, is a hold-out that needs
+``HOLDOUT_MIN_TRADES`` trades, must make money and must earn per day at least
+``MIN_WFE`` times what the in-sample trades earn per day; the rest is cut into
+``WF_WINDOWS`` windows of which ``WF_MIN_PROFITABLE`` must make money, with a
+walk-forward efficiency of at least ``MIN_WFE``. The in-sample Sharpe must
+pass 1 (per trade annualised by trades per year for swing strategies, daily
+for day strategies), the unit
 drawdown stay under 20%, at least ``MIN_TRADES`` trades count, and the Sharpe
 deflated by the number of trials since the last pass reach ``MIN_DSR``.
 Monte Carlo drawdown in R is recorded, not gated: the live cycle compares it
@@ -31,6 +38,7 @@ with the current limits.
 
 from __future__ import annotations
 
+import heapq
 import math
 import multiprocessing
 import threading
@@ -39,15 +47,17 @@ from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from bot.backtest import stats
-from bot.evaluator import SPOT_TAKER
+from bot.config import RiskLimits
+from bot.evaluator import COST_MULTIPLE, MIN_REWARD_RISK, SCORE_READY, SPOT_TAKER, classify
 from bot.indicators import btc_trend_ok_series, ema
+from bot.risk import LOSS_GUARD_WINDOW, loss_guard
 from bot.strategies import STRATEGIES, validation_params
 from bot.strategies.base import Setup
 from bot.strategies.day import DAY, ENTRY_BAR, DayRules, in_quiet_hours
@@ -69,6 +79,8 @@ WF_MIN_PROFITABLE = 3
 MIN_WFE = 0.5
 #: The last share of the span, by exit time, kept out of the gate's sample.
 HOLDOUT_SHARE = 0.2
+#: Trades the hold-out needs: a quiet hold-out proves nothing.
+HOLDOUT_MIN_TRADES = 5
 #: Deflated Sharpe floor: the probability that the Sharpe beats the best of the trials by luck.
 MIN_DSR = 0.95
 #: Bootstrap resamples of the Monte Carlo drawdown, with a fixed seed.
@@ -145,6 +157,18 @@ class BacktestResult:
     #: In-sample per-trade Sharpe, not annualised: the trial's entry in the deflated Sharpe.
     sharpe_trade: float = 0.0
     days: int = 0
+    #: The trades ``classify`` would have made ready (``Trade.accepted``), their wins and their
+    #: daily Sharpe over the whole span, comparable with ``daily_sharpe``.
+    filtered_trades: int = 0
+    filtered_wins: int = 0
+    filtered_sharpe: float = 0.0
+    #: The ``classify`` thresholds the replay marked trades with (``min_reward_risk`` 0 under a fixed rule).
+    score_threshold: float = SCORE_READY
+    cost_multiple: float = COST_MULTIPLE
+    min_reward_risk: float = MIN_REWARD_RISK
+    #: Trades ``constrain_portfolio`` refused, and the limits it replayed (empty without limits).
+    skipped_by_limits: int = 0
+    limits: dict[str, Any] = field(default_factory=dict)
     #: Replay time; it differs between identical runs, so it is left out of equality.
     elapsed_s: float = field(default=0.0, compare=False)
 
@@ -155,7 +179,8 @@ class BacktestResult:
 @dataclass(frozen=True)
 class Trade:
     """A closed long position. ``mae`` and ``mfe`` are the worst and best price
-    excursions from the entry while it was held, as returns."""
+    excursions from the entry while it was held, as returns. ``accepted`` says
+    whether ``classify`` would have made its setup ready live (``EntryFilter``)."""
 
     exit_time: pd.Timestamp
     net_return: float
@@ -164,6 +189,39 @@ class Trade:
     mae: float = 0.0
     mfe: float = 0.0
     bars: int = 0
+    symbol: str = ""
+    accepted: bool = True
+
+
+@dataclass(frozen=True)
+class EntryFilter:
+    """The ``classify`` thresholds a replayed setup is marked with, at the replay's cost.
+
+    The live cycle trades only ready rows; the replay enters every setup, so each trade
+    records whether ``classify`` would have made it ready. The cost is the replay's own:
+    the spot taker fee twice plus ``LEG_SLIPPAGE`` on each leg.
+    """
+
+    score_threshold: float = SCORE_READY
+    cost_multiple: float = COST_MULTIPLE
+    min_reward_risk: float = MIN_REWARD_RISK
+
+    def accepts(self, setup: Setup) -> bool:
+        row = classify(
+            setup,
+            slippage=2 * LEG_SLIPPAGE,
+            taker=SPOT_TAKER,
+            score_threshold=self.score_threshold,
+            cost_multiple=self.cost_multiple,
+            min_reward_risk=self.min_reward_risk,
+        )
+        return row.status == "pronta"
+
+
+def filter_for(score_threshold: float, cost_multiple: float, min_reward_risk: float, exit_policy: str) -> EntryFilter:
+    """The filter the live cycle applies under ``exit_policy``: a fixed rule's payoff is the
+    operator's choice, so it has no reward-to-risk floor (``min_reward_risk`` 0), as in scoring."""
+    return EntryFilter(score_threshold, cost_multiple, 0.0 if parse_fixed(exit_policy) is not None else min_reward_risk)
 
 
 def _strategy(strategy_id: str) -> TrendBreakout | MeanReversion | Momentum | IntradayMomentum | VwapPullback | None:
@@ -219,9 +277,18 @@ def _market_gate(market: pd.DataFrame | None) -> _MarketGate | None:
 
 
 def _trade(
-    entered_at: pd.Timestamp, exit_time: pd.Timestamp, net: float, stop_pct: float, entry: float, worst: float, best: float, bars: int
+    entered_at: pd.Timestamp,
+    exit_time: pd.Timestamp,
+    net: float,
+    stop_pct: float,
+    entry: float,
+    worst: float,
+    best: float,
+    bars: int,
+    symbol: str,
+    accepted: bool,
 ) -> Trade:
-    return Trade(exit_time, net, entered_at, stop_pct, worst / entry - 1, best / entry - 1, bars)
+    return Trade(exit_time, net, entered_at, stop_pct, worst / entry - 1, best / entry - 1, bars, symbol, accepted)
 
 
 def simulate(
@@ -235,21 +302,27 @@ def simulate(
     day: DayRules | None = None,
     hysteresis: bool = True,
     market: pd.DataFrame | None = None,
+    entry_filter: EntryFilter | None = None,
 ) -> list[Trade]:
     """Replay one symbol. Returns one trade per closed long position.
 
     A day strategy replays with ``simulate_day`` (its 1h frame and ``day`` rules)
     and the operator's fixed rule with ``simulate_fixed``; everything below is
     the swing replay. ``market`` is BTC's 4h bars when the market filter is on.
+    Each trade records whether ``entry_filter`` accepts its setup; without one,
+    the default thresholds of ``exit_policy`` judge it.
     """
     strategy = _strategy(strategy_id)
     if strategy is None:
         return []
     fixed = parse_fixed(exit_policy)
+    gate_filter = entry_filter or filter_for(SCORE_READY, COST_MULTIPLE, MIN_REWARD_RISK, exit_policy)
     if fixed is not None:
-        return simulate_fixed(strategy, symbol, frame, timeframe, fixed, hourly=hourly, day=day or DAY, market=market)
+        return simulate_fixed(
+            strategy, symbol, frame, timeframe, fixed, hourly=hourly, day=day or DAY, market=market, entry_filter=gate_filter
+        )
     if isinstance(strategy, (IntradayMomentum, VwapPullback)):
-        return simulate_day(strategy, symbol, frame, hourly, day or DAY, market=market)
+        return simulate_day(strategy, symbol, frame, hourly, day or DAY, market=market, entry_filter=gate_filter)
     gate = _market_gate(market)
     bar = _bar_width(timeframe)
     opens, lows, highs, closes = _prices(frame)
@@ -257,6 +330,7 @@ def simulate(
     position: Setup | None = None
     entry = peak = worst = best = 0.0
     entered = 0
+    accepted = True
     for end in range(_WARMUP_BARS, len(frame)):
         window = frame.iloc[max(0, end + 1 - LIVE_WINDOW) : end + 1]
         price = closes[end]
@@ -268,6 +342,7 @@ def simulate(
                 position = setup
                 entry = peak = worst = best = price
                 entered = end
+                accepted = gate_filter.accepts(setup)
             continue
         # Live stops rest at the broker and fill inside the bar, so the replay checks
         # them against the bar's low: a wick through the stop exits at the stop, or at
@@ -292,7 +367,9 @@ def simulate(
                 peak = max(peak, price)
                 continue
         net = (fill - entry) / entry - ROUND_TRIP_COST - 2 * LEG_SLIPPAGE
-        trades.append(_trade(frame.index[entered], window.index[-1], net, position.stop_pct, entry, worst, best, end - entered))
+        trades.append(
+            _trade(frame.index[entered], window.index[-1], net, position.stop_pct, entry, worst, best, end - entered, symbol, accepted)
+        )
         position = None
     return trades
 
@@ -305,6 +382,7 @@ def simulate_day(
     rules: DayRules,
     *,
     market: pd.DataFrame | None = None,
+    entry_filter: EntryFilter | None = None,
 ) -> list[Trade]:
     """Replay a day strategy on closed 15m bars, as the live cycle trades it.
 
@@ -322,6 +400,8 @@ def simulate_day(
     """
     if hourly is None or hourly.empty:
         return []
+    gate_filter = entry_filter or EntryFilter()
+    accepted = True
     gate = _market_gate(market)
     closes = (hourly.index + pd.Timedelta(hours=1)).values
     hold_bars = -(-rules.max_hold_minutes // int(ENTRY_BAR.total_seconds() // 60))
@@ -348,6 +428,7 @@ def simulate_day(
                 stop = entry * (1 - setup.stop_pct)
                 target = entry * (1 + setup.target_pct)
                 entered, sold, first_leg = end, 0, None
+                accepted = gate_filter.accepts(setup)
             continue
         opened = opens[end]
         low = lows[end]
@@ -375,7 +456,9 @@ def simulate_day(
             gross = share * (first_leg - entry) / entry + (1 - share) * (rest - entry) / entry
         # Fees and slippage by notional: the whole position is bought once and sold once, in one or two parts.
         net = gross - ROUND_TRIP_COST - 2 * DAY_SLIPPAGE
-        trades.append(_trade(frame.index[entered], window.index[-1], net, position.stop_pct, entry, worst, best, end - entered))
+        trades.append(
+            _trade(frame.index[entered], window.index[-1], net, position.stop_pct, entry, worst, best, end - entered, symbol, accepted)
+        )
         position = None
     return trades
 
@@ -390,6 +473,7 @@ def simulate_fixed(
     hourly: pd.DataFrame | None = None,
     day: DayRules = DAY,
     market: pd.DataFrame | None = None,
+    entry_filter: EntryFilter | None = None,
 ) -> list[Trade]:
     """Replay the operator's fixed take-profit and stop-loss.
 
@@ -402,6 +486,8 @@ def simulate_fixed(
       that closes at or above it; live checks every minute and can sell on a touch
       the closed bar no longer shows, so the replay never counts a wick as a win.
     * No strategy exit, trailing or time stop. Both legs pay ``LEG_SLIPPAGE``.
+    * ``entry_filter`` judges the setup with the operator's stop and target, as live
+      scoring does (``FixedExit.apply``).
     """
     day_style = isinstance(strategy, (IntradayMomentum, VwapPullback))
     if day_style and (hourly is None or hourly.empty):
@@ -410,9 +496,11 @@ def simulate_fixed(
     bar = ENTRY_BAR if day_style else _bar_width(timeframe)
     closes = (hourly.index + pd.Timedelta(hours=1)).values if day_style and hourly is not None else None
     cost = ROUND_TRIP_COST + 2 * LEG_SLIPPAGE
+    gate_filter = entry_filter or EntryFilter(min_reward_risk=0.0)
     opens, lows, highs, bar_closes = _prices(frame)
     trades: list[Trade] = []
     holding = False
+    accepted = True
     entry = stop = target = worst = best = 0.0
     entered = 0
     for end in range(_WARMUP_BARS, len(frame)):
@@ -437,6 +525,7 @@ def simulate_fixed(
                 stop = entry * (1 - fixed.stop_loss_pct)
                 target = entry * (1 + fixed.take_profit_pct)
                 entered = end
+                accepted = gate_filter.accepts(fixed.apply(setup))
             continue
         opened = opens[end]
         low = lows[end]
@@ -450,7 +539,11 @@ def simulate_fixed(
             else:
                 continue
         net = (fill - entry) / entry - cost
-        trades.append(_trade(frame.index[entered], window.index[-1], net, fixed.stop_loss_pct, entry, worst, best, end - entered))
+        trades.append(
+            _trade(
+                frame.index[entered], window.index[-1], net, fixed.stop_loss_pct, entry, worst, best, end - entered, symbol, accepted
+            )
+        )
         holding = False
     return trades
 
@@ -490,6 +583,86 @@ def _daily_sharpe(trades: Sequence[Trade], start: pd.Timestamp, end: pd.Timestam
     return 0.0 if sigma == 0 else float(values.mean() / sigma * np.sqrt(365))
 
 
+def replayed_limits(limits: RiskLimits) -> dict[str, Any]:
+    """The portfolio limits ``constrain_portfolio`` replays, as the validation records them."""
+    return {
+        "max_positions": limits.max_positions,
+        "pair_cooldown_minutes": limits.pair_cooldown_minutes,
+        "loss_guard_trades": limits.loss_guard_trades,
+        "loss_guard_r": limits.loss_guard_r,
+    }
+
+
+def _entered(trade: Trade) -> pd.Timestamp:
+    """When the trade entered; a trade without an entry time is taken as entered at its exit."""
+    return pd.Timestamp(trade.entry_time if trade.entry_time is not None else trade.exit_time)
+
+
+def _trade_r(trade: Trade) -> float | None:
+    return trade.net_return / trade.stop_pct if trade.stop_pct > 0 else None
+
+
+def constrain_portfolio(trades: Sequence[Trade], limits: RiskLimits) -> tuple[list[Trade], int]:
+    """The trades the live portfolio limits would have let in, and how many they refused.
+
+    The live cycle skips much of what a per-pair replay takes, so the gate judges the
+    trades left after these limits. Only trades ``classify`` accepts (``Trade.accepted``)
+    compete for slots, the population that trades live; the others neither hold a slot
+    nor are refused, and stay in the general sample. In entry order (ties by symbol), a
+    trade is refused while ``max_positions`` trades are open, while its pair is open,
+    within ``pair_cooldown_minutes`` of a losing exit on its pair, and while
+    ``risk.loss_guard`` pauses. The guards at an entry see only accepted trades that
+    exited by then: never the future.
+
+    Not replayed, so the result is a best case: total open risk, the BTC cluster,
+    correlation, entries per cycle, drawdown steps, cash, and slots taken by other
+    strategies and robots.
+    """
+    competing = sorted((trade for trade in trades if trade.accepted), key=lambda trade: (_entered(trade), trade.symbol))
+    cooldown = timedelta(minutes=limits.pair_cooldown_minutes)
+    horizon = max(LOSS_GUARD_WINDOW, cooldown)
+    # Kept trades still open at the current entry, by exit time; at most max_positions of them.
+    held: list[tuple[pd.Timestamp, int, Trade]] = []
+    losses: list[Trade] = []
+    kept: list[Trade] = []
+    skipped = 0
+    for trade in competing:
+        at = _entered(trade)
+        while held and held[0][0] <= at:
+            closed = heapq.heappop(held)[2]
+            if closed.net_return < 0:
+                losses.append(closed)
+        losses = [loss for loss in losses if pd.Timestamp(loss.exit_time) >= at - horizon]
+        refused = (
+            len(held) >= limits.max_positions
+            or any(open_trade.symbol == trade.symbol for _exit, _order, open_trade in held)
+            or (
+                bool(cooldown)
+                and any(loss.symbol == trade.symbol and at < pd.Timestamp(loss.exit_time) + cooldown for loss in losses)
+            )
+            or loss_guard([(pd.Timestamp(loss.exit_time), _trade_r(loss)) for loss in losses], limits, at) is not None
+        )
+        if refused:
+            skipped += 1
+            continue
+        heapq.heappush(held, (pd.Timestamp(trade.exit_time), len(kept), trade))
+        kept.append(trade)
+    return [trade for trade in trades if not trade.accepted] + kept, skipped
+
+
+def _holdout_reason(holdout: dict[str, Any], held_rate: float, sample_rate: float) -> str | None:
+    """Why the hold-out fails, or None: it needs ``HOLDOUT_MIN_TRADES`` trades, a profit,
+    and a net per day of at least ``MIN_WFE`` times the in-sample net per day."""
+    label = f"o hold-out (últimos {HOLDOUT_SHARE:.0%} do período)"
+    if holdout["trades"] < HOLDOUT_MIN_TRADES:
+        return f"{label} tem {holdout['trades']} trades, menos que {HOLDOUT_MIN_TRADES}"
+    if holdout["net"] <= 0:
+        return f"{label} perde {holdout['net']:.1%}"
+    if held_rate < MIN_WFE * sample_rate:
+        return f"{label} ganha {held_rate:.2%} por dia, menos que {MIN_WFE} × os {sample_rate:.2%} por dia da amostra"
+    return None
+
+
 def evaluate(
     strategy_id: str,
     trades: list[Trade],
@@ -523,6 +696,12 @@ def evaluate(
     sample: list[Trade] = split["in_sample"]
     held_from = pd.Timestamp(split["holdout"]["start"])
     sample_returns = np.array([trade.net_return for trade in sample], dtype=float)
+    sample_days = (held_from - start).total_seconds() / 86400
+    held_days = (end - held_from).total_seconds() / 86400
+    sample_rate = float(sample_returns.sum()) / sample_days if sample_days > 0 else 0.0
+    held_rate = float(split["holdout"]["net"]) / held_days if held_days > 0 else 0.0
+    held_reason = _holdout_reason(split["holdout"], held_rate, sample_rate)
+    holdout = {**split["holdout"], "passed": held_reason is None}
     sharpe_trade = stats.per_trade_sharpe(sample_returns)
     if day_gate:
         sharpe = _daily_sharpe(sample, start, held_from)
@@ -533,7 +712,6 @@ def evaluate(
     profitable = sum(1 for window in split["windows"] if window["profitable"])
     wfe = stats.walk_forward_efficiency(split["windows"])
     dsr = stats.deflated_sharpe(sample_returns, trials, trial_sharpes)
-    holdout = split["holdout"]
     label = "Sharpe diário" if day_gate else "Sharpe"
     checks = [
         (sharpe <= MIN_SHARPE, f"{label} {sharpe:.2f} não passa de {MIN_SHARPE:.0f}"),
@@ -551,7 +729,7 @@ def evaluate(
             f"walk-forward: {profitable} de {WF_WINDOWS} janelas lucram, menos que {WF_MIN_PROFITABLE}",
         ),
         (wfe < MIN_WFE, f"eficiência walk-forward de {wfe:.2f}, abaixo de {MIN_WFE}"),
-        (not holdout["passed"], f"o hold-out (últimos {HOLDOUT_SHARE:.0%} do período) perde {holdout['net']:.1%}"),
+        (held_reason is not None, held_reason or ""),
         (dsr < MIN_DSR, f"Sharpe deflacionado de {dsr:.2f} em {trials} testes, abaixo de {MIN_DSR}"),
     ]
     reasons = [text for failed, text in checks if failed]
@@ -574,6 +752,7 @@ def evaluate(
     span_hours = (end - start).total_seconds() / 3600
     gains = returns[returns > 0]
     losses = returns[returns <= 0]
+    filtered = [trade for trade in ordered if trade.accepted]
     return BacktestResult(
         strategy_id,
         float(sharpe),
@@ -605,6 +784,9 @@ def evaluate(
         gate_trades=len(sample),
         sharpe_trade=sharpe_trade,
         days=int(round(years * 365)),
+        filtered_trades=len(filtered),
+        filtered_wins=sum(1 for trade in filtered if trade.net_return > 0),
+        filtered_sharpe=_daily_sharpe(filtered, start, end),
     )
 
 
@@ -620,6 +802,8 @@ def validate_strategy(
     trials: int = 1,
     trial_sharpes: Sequence[float] = (),
     span: tuple[pd.Timestamp, pd.Timestamp] | None = None,
+    limits: RiskLimits | None = None,
+    entry_filter: EntryFilter | None = None,
 ) -> BacktestResult:
     """Replay every symbol, in parallel processes, and judge the pooled trades against the gate.
 
@@ -627,20 +811,27 @@ def validate_strategy(
     operator's fixed rule replaces them, and needs ``hourly_frames``, the closed 1h
     bars of each symbol. ``market_frame`` (BTC's 4h bars) turns the market filter
     on. Without ``span`` the walk-forward runs from the first bar any symbol could
-    trade (after the warm-up) to the last bar.
+    trade (after the warm-up) to the last bar. ``entry_filter`` marks each trade
+    with ``classify`` (the default thresholds without one); with ``limits``,
+    ``constrain_portfolio`` replays them before the gate and the result records
+    them with ``skipped_by_limits``.
     """
     began = time.monotonic()
+    marks = entry_filter or filter_for(SCORE_READY, COST_MULTIPLE, MIN_REWARD_RISK, exit_policy)
     if is_day(strategy_id) and parse_fixed(exit_policy) is None:
         exit_policy = "day"
     hourly = hourly_frames or {}
     jobs: list[_Job] = [
-        (strategy_id, symbol, frame, timeframe, exit_policy, hourly.get(symbol), hysteresis, market_frame)
+        (strategy_id, symbol, frame, timeframe, exit_policy, hourly.get(symbol), hysteresis, market_frame, marks)
         for symbol, frame in frames.items()
         if not frame.empty
     ]
     trades: list[Trade] = []
     for replayed in _replay_all(jobs):
         trades.extend(replayed)
+    skipped = 0
+    if limits is not None:
+        trades, skipped = constrain_portfolio(trades, limits)
     if span is None and jobs:
         span = (
             min(job[2].index[min(_WARMUP_BARS, len(job[2]) - 1)] for job in jobs),
@@ -651,11 +842,16 @@ def validate_strategy(
         strategy_id, trades, years, exit_policy=exit_policy, span=span, trials=trials, trial_sharpes=trial_sharpes, pairs=len(jobs)
     )
     result.timeframe = timeframe
+    result.score_threshold = marks.score_threshold
+    result.cost_multiple = marks.cost_multiple
+    result.min_reward_risk = marks.min_reward_risk
+    result.skipped_by_limits = skipped
+    result.limits = replayed_limits(limits) if limits is not None else {}
     result.elapsed_s = round(time.monotonic() - began, 3)
     return result
 
 
-_Job = tuple[str, str, pd.DataFrame, str, str, "pd.DataFrame | None", bool, "pd.DataFrame | None"]
+_Job = tuple[str, str, pd.DataFrame, str, str, "pd.DataFrame | None", bool, "pd.DataFrame | None", EntryFilter]
 
 
 _POOL: ProcessPoolExecutor | None = None
@@ -663,9 +859,17 @@ _POOL_LOCK = threading.Lock()
 
 
 def _replay(job: _Job) -> list[Trade]:
-    strategy_id, symbol, frame, timeframe, exit_policy, hourly, hysteresis, market = job
+    strategy_id, symbol, frame, timeframe, exit_policy, hourly, hysteresis, market, marks = job
     return simulate(
-        strategy_id, symbol, frame, timeframe, exit_policy=exit_policy, hourly=hourly, hysteresis=hysteresis, market=market
+        strategy_id,
+        symbol,
+        frame,
+        timeframe,
+        exit_policy=exit_policy,
+        hourly=hourly,
+        hysteresis=hysteresis,
+        market=market,
+        entry_filter=marks,
     )
 
 
@@ -712,6 +916,8 @@ _TIMEFRAME_FIELDS = (
     "passed", "reason", "wins", "trades", "gate_trades", "days", "sharpe", "sharpe_trade", "daily_sharpe", "dsr",
     "trials", "max_drawdown", "net_return", "mc_p95_dd_r", "wfe", "windows", "holdout", "profit_factor", "expectancy_r",
     "sortino", "calmar", "avg_win", "avg_loss", "exposure", "mae_r", "mfe_r", "turnover", "avg_hold_hours", "elapsed_s",
+    "filtered_trades", "filtered_wins", "filtered_sharpe", "score_threshold", "cost_multiple", "min_reward_risk",
+    "skipped_by_limits", "limits",
 )
 
 

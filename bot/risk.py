@@ -717,6 +717,40 @@ def allocate(
     return accepted
 
 
+def loss_guard(losses: Sequence[tuple[datetime, float | None]], limits: RiskLimits, now: datetime) -> tuple[datetime, str] | None:
+    """Whether the loss guard pauses every entry at ``now``: (until when, reason), or None.
+
+    ``losses`` are losing closes as (closed at, R), R None when the entry risk is unknown.
+    Either rule pauses: ``loss_guard_trades`` losses in the last six hours (Freqtrade's
+    StoplossGuard), or their R summing to ``-loss_guard_r`` or less, so two full stop-outs
+    pause like three small losses. The pause ends by itself as losses age out of the window:
+    "until" is when neither rule fires any more. ``protect`` and the backtest's
+    ``constrain_portfolio`` both decide through this function, so the replay guards like live.
+    """
+    recent = sorted(
+        ((moment, r) for moment, r in losses if moment >= now - LOSS_GUARD_WINDOW), key=lambda loss: loss[0]
+    )
+    ends: list[tuple[datetime, str]] = []
+    count = limits.loss_guard_trades
+    if count > 0 and len(recent) >= count:
+        ends.append((recent[-count][0] + LOSS_GUARD_WINDOW, f"{len(recent)} perdas nas últimas 6 h"))
+    floor = -limits.loss_guard_r
+    total = sum(r for _moment, r in recent if r is not None)
+    if limits.loss_guard_r > 0 and total <= floor + _EPS:
+        # The sum rises above the floor once enough of the oldest losses leave the window.
+        remaining = total
+        for moment, r in recent:
+            remaining -= r or 0.0
+            if remaining > floor + _EPS:
+                ends.append((moment + LOSS_GUARD_WINDOW, f"perdas somando {total:.1f} R nas últimas 6 h"))
+                break
+    if not ends:
+        return None
+    # The later end wins; on a tie the count rule names the pause.
+    until, label = max(ends, key=lambda end: end[0])
+    return until, f"{label}: entradas pausadas até {until:%H:%M} UTC"
+
+
 def protect(
     rows: list[Opportunity],
     losses: list[dict[str, Any]],
@@ -725,26 +759,33 @@ def protect(
 ) -> None:
     """Refuse ready rows after recent losses, as Freqtrade's StoplossGuard and CooldownPeriod.
 
-    ``losses`` are losing closes (``symbol``, ``closed_at``). With at least
-    ``loss_guard_trades`` of them in the last six hours, every entry waits; the
-    pause ends by itself as they age out. A pair that closed at a loss within
+    ``losses`` are losing closes (``symbol``, ``closed_at``, ``realized_pnl`` and
+    ``initial_risk_usd``). While ``loss_guard`` pauses, every entry waits; the pause
+    ends by itself as they age out. A pair that closed at a loss within
     ``pair_cooldown_minutes`` gets no new entry.
     """
     closes = [(str(row["symbol"]), _at(row["closed_at"])) for row in losses]
-    recent = [moment for _symbol, moment in closes if moment >= now - LOSS_GUARD_WINDOW]
-    guard = limits.loss_guard_trades > 0 and len(recent) >= limits.loss_guard_trades
+    pause = loss_guard([(_at(row["closed_at"]), _loss_r(row)) for row in losses], limits, now)
     cooldown = timedelta(minutes=limits.pair_cooldown_minutes)
     for row in rows:
         if row.status != "pronta":
             continue
-        if guard:
-            until = sorted(recent)[-limits.loss_guard_trades] + LOSS_GUARD_WINDOW
-            _refuse(row, f"{len(recent)} perdas nas últimas 6 h: entradas pausadas até {until:%H:%M} UTC")
+        if pause is not None:
+            _refuse(row, pause[1])
             continue
         if cooldown:
             last = max((moment for symbol, moment in closes if symbol == row.symbol), default=None)
             if last is not None and now < last + cooldown:
                 _refuse(row, f"par em pausa após uma perda, até {last + cooldown:%H:%M} UTC")
+
+
+def _loss_r(row: Mapping[str, Any]) -> float | None:
+    """A close's R, the executor's unit: realized PnL over the risk at the entry stop; None when unknown."""
+    try:
+        pnl, risk = float(row["realized_pnl"]), float(row.get("initial_risk_usd") or 0)
+    except (KeyError, TypeError, ValueError):
+        return None
+    return pnl / risk if risk > 0 and math.isfinite(pnl) and math.isfinite(risk) else None
 
 
 def _cluster_of(returns_by_symbol: Mapping[str, Sequence[float]], threshold: float) -> Callable[[str], bool]:

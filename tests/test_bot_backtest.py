@@ -77,8 +77,25 @@ def test_gate_fails_when_the_holdout_loses() -> None:
     assert losing.passed is False and losing.reason.startswith("o hold-out (últimos 20% do período) perde")
     # Sharpe, drawdown and DSR judge the in-sample trades only: the hold-out is the only failure.
     assert ";" not in losing.reason
+    # A quiet hold-out proves nothing: it fails with its own reason.
     quiet = _judge(_placed([STEADY] * 4, []))
-    assert quiet.holdout == {**quiet.holdout, "trades": 0, "passed": True} and quiet.passed
+    assert quiet.holdout == {**quiet.holdout, "trades": 0, "passed": False} and not quiet.passed
+    assert quiet.reason == "o hold-out (últimos 20% do período) tem 0 trades, menos que 5"
+
+
+def test_a_holdout_of_four_winning_trades_fails() -> None:
+    four = _judge(_placed([STEADY] * 4, [0.02] * 4))
+    assert four.holdout["trades"] == 4 and four.holdout["net"] > 0
+    assert four.passed is False and four.reason == "o hold-out (últimos 20% do período) tem 4 trades, menos que 5"
+    five = _judge(_placed([STEADY] * 4, [0.02] * 5))
+    assert five.passed is True and five.holdout["passed"] is True
+
+
+def test_a_holdout_slower_than_half_the_sample_fails() -> None:
+    # In-sample: 0.352 over 80 days (0.44% a day). Hold-out: 0.03 over 20 days (0.15% a day) < 0.5 x 0.44%.
+    slow = _judge(_placed([STEADY] * 4, [0.006] * 5))
+    assert slow.holdout["net"] > 0 and slow.holdout["passed"] is False and slow.passed is False
+    assert slow.reason.startswith("o hold-out (últimos 20% do período) ganha 0.15% por dia, menos que 0.5")
 
 
 def test_gate_fails_on_low_dsr_after_many_trials() -> None:
@@ -181,11 +198,11 @@ def test_strategy_record_keeps_one_result_per_timeframe() -> None:
     assert failed["signal_only"] is True and failed["validated_at"] is None and failed["backtest_sharpe"] == 0.7
 
 
-def test_promotion_record_is_a_full_v2_record() -> None:
+def test_promotion_record_is_a_full_v3_record() -> None:
     result = evaluate("trend", [Trade(START, 0.01)], 1.0, exit_policy="trailing")
     record = promotion_record(result, {"timeframe": "4h", "symbols": ["BTC/USDT"], "days": 480})
     params = record["params"]
-    assert (params["gate"], params["version"], params["market_filter"], params["hysteresis"]) == (2, 1, "off", True)
+    assert (params["gate"], params["version"], params["market_filter"], params["hysteresis"]) == (3, 1, "off", True)
     assert list(params["timeframes"]) == ["4h"] and params["days"] == 480
     assert validated_for(params, "trend", "trailing", timeframe="4h", symbol="BTC/USDT")
     # Without a timeframe anywhere, the strategy's first one keys the result.
@@ -424,3 +441,117 @@ def test_daily_sharpe_does_not_depend_on_the_order_of_the_trades() -> None:
     ascending = _daily_sharpe(trades, start, end)
     assert ascending != 0
     assert _daily_sharpe(list(reversed(trades)), start, end) == pytest.approx(ascending)
+
+
+# -- portfolio limits and the classify marks (gate v3) ---------------------------
+
+
+def _at(hours: float) -> pd.Timestamp:
+    return START + pd.Timedelta(hours=hours)
+
+
+def _held(symbol: str, entered: float, exited: float, net: float, *, accepted: bool = True, stop_pct: float = 0.02) -> Trade:
+    return Trade(_at(exited), net, _at(entered), stop_pct, symbol=symbol, accepted=accepted)
+
+
+def test_overlapping_trades_beyond_the_position_slots_are_skipped() -> None:
+    from bot.config import RiskLimits
+
+    trades = [
+        _held("ETH/USDT", 0, 10, 0.01),
+        _held("BTC/USDT", 0, 10, 0.01),
+        _held("SOL/USDT", 1, 5, 0.01),
+        # classify would refuse it: it never trades live, so it neither takes a slot nor is refused.
+        _held("XRP/USDT", 1, 5, 0.01, accepted=False),
+        _held("SOL/USDT", 10, 12, 0.01),
+    ]
+    kept, skipped = runner.constrain_portfolio(trades, RiskLimits(max_positions=2, pair_cooldown_minutes=0))
+    assert skipped == 1
+    assert sorted((trade.symbol, trade.entry_time) for trade in kept) == [
+        ("BTC/USDT", _at(0)), ("ETH/USDT", _at(0)), ("SOL/USDT", _at(10)), ("XRP/USDT", _at(1)),
+    ]
+    # A tie at the entry goes to the symbol first in order.
+    one, skipped_one = runner.constrain_portfolio(trades[:2], RiskLimits(max_positions=1, pair_cooldown_minutes=0))
+    assert [trade.symbol for trade in one] == ["BTC/USDT"] and skipped_one == 1
+
+
+def test_the_loss_guard_counts_only_losses_that_exited_before_the_entry() -> None:
+    from bot.config import RiskLimits
+
+    limits = RiskLimits(max_positions=10, pair_cooldown_minutes=0, loss_guard_trades=2, loss_guard_r=0)
+    trades = [
+        _held("BTC/USDT", 0, 1, -0.01),
+        _held("ETH/USDT", 0, 3, -0.01),
+        # At 2h only BTC's loss has exited; ETH's exits an hour later and does not count yet.
+        _held("SOL/USDT", 2, 4, 0.01),
+        # At 3h30 both losses are in: paused.
+        _held("XRP/USDT", 3.5, 5, 0.01),
+        # At 7h30 BTC's loss is older than six hours.
+        _held("ADA/USDT", 7.5, 9, 0.01),
+    ]
+    kept, skipped = runner.constrain_portfolio(trades, limits)
+    assert [trade.symbol for trade in kept] == ["BTC/USDT", "ETH/USDT", "SOL/USDT", "ADA/USDT"] and skipped == 1
+    # The guard in R: two full stop-outs pause, whatever the count rule says.
+    in_r = [_held("BTC/USDT", 0, 1, -0.02), _held("ETH/USDT", 0, 2, -0.02), _held("SOL/USDT", 3, 4, 0.01)]
+    kept_r, skipped_r = runner.constrain_portfolio(in_r, RiskLimits(pair_cooldown_minutes=0, loss_guard_trades=3))
+    assert [trade.symbol for trade in kept_r] == ["BTC/USDT", "ETH/USDT"] and skipped_r == 1
+    # The replay and risk.protect decide through the same function.
+    from bot import risk
+
+    assert runner.loss_guard is risk.loss_guard
+
+
+def test_a_pair_waits_out_its_cooldown_in_the_replay() -> None:
+    from bot.config import RiskLimits
+
+    trades = [_held("BTC/USDT", 0, 1, -0.01), _held("BTC/USDT", 2, 3, 0.01), _held("BTC/USDT", 3.1, 4, 0.01)]
+    kept, skipped = runner.constrain_portfolio(trades, RiskLimits(pair_cooldown_minutes=120, loss_guard_trades=0, loss_guard_r=0))
+    assert [trade.entry_time for trade in kept] == [_at(0), _at(3.1)] and skipped == 1
+
+
+class Alternating:
+    """Buys at every flat bar; every other setup expects too little to cover twice the replay's cost."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def evaluate(self, symbol: str, timeframe: str, frame: pd.DataFrame) -> Setup | None:
+        self.calls += 1
+        expected = 0.05 if self.calls % 2 else 0.006
+        return Setup("trend", symbol, timeframe, "Comprar", 1.0, expected, 0.01, 0.03, 0.05, "t", "trend_up", confidence=1.0)
+
+
+def _seesaw(pairs: int = 20) -> pd.DataFrame:
+    """Flat warm-up, then 100 and 106 in turn: each entry at 100 exits at the 5% target on the next bar."""
+    closes = [100.0] * 60 + [100.0, 106.0] * pairs
+    return _bars(closes)
+
+
+def test_the_replay_marks_the_setups_classify_would_refuse(monkeypatch) -> None:
+    from bot.config import RiskLimits
+
+    monkeypatch.setattr(runner, "_strategy", lambda _id: Alternating())
+    result = runner.validate_strategy("trend", {"BTC/USDT": _seesaw()}, "1h", exit_policy="target")
+    assert result.trades == 20 and result.filtered_trades == 10 and result.filtered_wins == 10
+    assert (result.score_threshold, result.cost_multiple, result.min_reward_risk) == (0.3, 2.0, 1.5)
+    assert result.skipped_by_limits == 0 and result.limits == {}
+    record = runner.timeframe_record(result)
+    assert record["filtered_trades"] == 10 and record["cost_multiple"] == 2.0 and "filtered_sharpe" in record
+    # A looser filter lets every setup through, and the thresholds used are recorded.
+    loose = runner.validate_strategy(
+        "trend", {"BTC/USDT": _seesaw()}, "1h", exit_policy="target", entry_filter=runner.EntryFilter(0.3, 1.0, 0.0)
+    )
+    assert loose.filtered_trades == 20 and (loose.cost_multiple, loose.min_reward_risk) == (1.0, 0.0)
+    # Under a fixed rule the reward-to-risk floor is 0, as live scoring has it.
+    assert runner.filter_for(0.3, 2.0, 1.5, "fixed:300:150").min_reward_risk == 0.0
+    # With limits, only accepted trades compete: the second pair's accepted trades find the one slot taken.
+    monkeypatch.setattr(runner, "MAX_WORKERS", 1)
+    limited = runner.validate_strategy(
+        "trend",
+        {"BTC/USDT": _seesaw(), "ETH/USDT": _seesaw()},
+        "1h",
+        exit_policy="target",
+        limits=RiskLimits(max_positions=1, pair_cooldown_minutes=0),
+    )
+    assert limited.skipped_by_limits == 10 and limited.trades == 30 and limited.filtered_trades == 10
+    assert limited.limits == {"max_positions": 1, "pair_cooldown_minutes": 0, "loss_guard_trades": 3, "loss_guard_r": 2.0}

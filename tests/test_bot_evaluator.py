@@ -87,3 +87,39 @@ def test_new_opportunity_fields_default_and_come_last() -> None:
     assert list(row)[-len(added):] == added
     assert row["slippage_est"] == 0.0007
     assert all(row[name] is None for name in added if name != "slippage_est")
+
+
+def test_trend_never_backs_a_range_regime() -> None:
+    from bot.evaluator import regime_factor
+
+    assert regime_factor("trend", "trend_up", 1) == 1.0 and regime_factor("trend", "trend_down", -1) == 1.0
+    assert regime_factor("trend", "range", 1) == 0.0
+
+
+_STORED = {"exit_policy": "trailing", "wins": 30, "trades": 40, "score_threshold": 0.3, "cost_multiple": 2.0, "min_reward_risk": 1.5}
+_CURRENT = (0.3, 2.0, 1.5)
+
+
+def test_a_small_filtered_sample_leaves_the_general_estimate() -> None:
+    from bot.evaluator import estimate_win_rate
+
+    general = estimate_win_rate(_STORED, (0, 0), exit_policy="trailing", min_sample=20)
+    assert general == (31 / 42, 40)
+    small = {**_STORED, "filtered_trades": 5, "filtered_wins": 0}
+    assert estimate_win_rate(small, (0, 0), exit_policy="trailing", min_sample=20, thresholds=_CURRENT) == general
+
+
+def test_the_filtered_estimate_lowers_the_hit_rate_only_with_the_same_thresholds() -> None:
+    from bot.evaluator import estimate_win_rate
+
+    filtered = {**_STORED, "filtered_trades": 18, "filtered_wins": 6}
+    # 18 filtered plus 2 live trades reach the sample of 20: the lower estimate wins.
+    rate, n = estimate_win_rate(filtered, (1, 2), exit_policy="trailing", min_sample=20, thresholds=_CURRENT)
+    assert rate == pytest.approx(min(32 / 44, 8 / 22)) and n == 42
+    # Other thresholds today, or none given: the general estimate.
+    other = estimate_win_rate(filtered, (1, 2), exit_policy="trailing", min_sample=20, thresholds=(0.5, 2.0, 1.5))
+    assert other == (32 / 44, 42)
+    assert estimate_win_rate(filtered, (1, 2), exit_policy="trailing", min_sample=20) == (32 / 44, 42)
+    # A filtered side never turns a known estimate into None, and never makes one from too few trades.
+    assert estimate_win_rate({**filtered, "filtered_trades": 0}, (0, 0), exit_policy="trailing", min_sample=20, thresholds=_CURRENT)[0]
+    assert estimate_win_rate({**filtered, "trades": 10}, (0, 0), exit_policy="trailing", min_sample=20, thresholds=_CURRENT) == (None, 10)

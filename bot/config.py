@@ -95,6 +95,9 @@ class RiskLimits(BaseModel):
     pair_cooldown_minutes: int = Field(default=120, ge=0, le=1440)
     #: Losing closes in the last 6 hours that pause every new entry (0 = off).
     loss_guard_trades: int = Field(default=3, ge=0, le=20)
+    #: Losses in R (realized PnL over the entry risk) summing to minus this in the last 6 hours
+    #: also pause every new entry, so two full stop-outs pause like three small losses (0 = off).
+    loss_guard_r: float = Field(default=2.0, ge=0, le=20)
     #: Share of full Kelly a sized row may risk at its stop, when its hit rate is known (0 = off).
     kelly_fraction: float = Field(default=0.25, ge=0, le=1)
     #: New positions one cycle may open; the rest wait for the next cycle.

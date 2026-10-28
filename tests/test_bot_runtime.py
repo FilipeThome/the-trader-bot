@@ -994,3 +994,34 @@ def test_a_tick_applies_the_score_effects_once(tmp_path, monkeypatch) -> None:
     # The next cycle scores the same decisions: nothing new goes to the history.
     runtime.tick()
     assert len([row for row in runtime.store.decisions() if row["strategy"] == "trend"]) == 3
+
+
+def test_a_gate_2_validation_is_stale_and_its_rows_stay_signal_only(tmp_path, monkeypatch) -> None:
+    from bot.api.validation import _stale_cause
+    from bot.strategies import GATE_VERSION
+
+    assert GATE_VERSION == 3
+    runtime, executor = _ready_cycle(tmp_path, monkeypatch, entry_mode="auto")
+    old = {**_validated("trend", "trailing", wins=30, trades=40), "gate": 2}
+    runtime.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": old})
+    assert _stale_cause(old, "trend", runtime.config, runtime.config.symbols) == "gate"
+    runtime.tick()
+    row = runtime.store.opportunities()[0]
+    assert row["status"] == "bloqueada" and "somente sinal" in row["reason"]
+    assert "act:0" in executor.events
+
+
+def test_auto_select_saves_the_liquid_pool_it_ranked(tmp_path, monkeypatch) -> None:
+    from bot.cycle.market import UNIVERSE_STATE
+
+    runtime, collector, _executor = _runtime(tmp_path, monkeypatch, auto_select=True)
+
+    def rank(ranked_from: Any, count: int, listed: Any) -> list[str]:
+        ranked_from.universe_cache = ["SOL/USDT", "BTC/USDT", "ADA/USDT"]
+        return ["SOL/USDT"]
+
+    monkeypatch.setattr("bot.cycle.market.rank_promising", rank)
+    monkeypatch.setattr("bot.cycle.market.venue_symbols", lambda _collector, mode: None)
+    runtime.tick(now=datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc))
+    assert runtime.config.symbols == ["SOL/USDT"]
+    assert runtime.store.get_state(UNIVERSE_STATE) == ["ADA/USDT", "BTC/USDT", "SOL/USDT"]
