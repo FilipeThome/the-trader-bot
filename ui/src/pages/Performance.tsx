@@ -188,7 +188,7 @@ function AdvisorReport({ lines, usage }: { lines: AdviceCalibrationLine[]; usage
     <div className="mt-8 text-sm">
       <p className="mb-2 flex items-center font-medium">
         Consultor DeepSeek: calibração dos vereditos
-        <Help text="Cada veredito gravado, tenha entrado ou não, recebe o R que a posição teria feito entrando no fechamento da vela do sinal, com o stop e o alvo da linha, pelas regras do teste histórico e já sem o custo. Um veto útil tem R contrafactual médio negativo: as linhas desaconselhadas teriam perdido. Um confirmar útil fica acima da linha de todas as consultadas. Uma linha só entra na média depois que as 48 velas da janela passaram desde o sinal, qualquer que seja o resultado; até lá conta em Aguardando. EP é o erro padrão: uma diferença menor que duas vezes ele pode ser sorte. Os vetos com confiança acima do mínimo têm linha própria: são o que o modo filtro tiraria." />
+        <Help text="Cada veredito gravado, tenha entrado ou não, recebe o R que a posição teria feito entrando no fechamento da vela do sinal, com o stop e o alvo da linha, pelas regras do teste histórico e já sem o custo. Um veto útil tem R contrafactual médio negativo: as linhas desaconselhadas teriam perdido. Um confirmar útil fica acima da linha de todas as consultadas. Uma linha só entra na média depois que as 48 velas da janela passaram desde o sinal, qualquer que seja o resultado; até lá conta em Aguardando. Uma linha cuja janela passou sem as velas para medi-la (o par saiu da lista e a leitura do histórico falhou) expira: fica fora das médias e aparece em Aguardando como expirada. EP é o erro padrão: uma diferença menor que duas vezes ele pode ser sorte. Os vetos com confiança acima do mínimo têm linha própria: são o que o modo filtro tiraria." />
       </p>
       {groups.size === 0 ? (
         <p className="text-neutral-500">Nenhum veredito registrado neste ambiente.</p>
@@ -224,7 +224,10 @@ function AdvisorReport({ lines, usage }: { lines: AdviceCalibrationLine[]; usage
                       <td className={`pr-6 ${tone}`}>{meanWithError(line.mean_r, line.se)}</td>
                       <td className="pr-6">{line.group === "reduce" ? formatR(line.reduced_mean_r) : "—"}</td>
                       <td className="pr-6">{line.realized_n > 0 ? `${formatR(line.realized_mean_r)} (n=${line.realized_n})` : "—"}</td>
-                      <td>{line.waiting}</td>
+                      <td>
+                        {line.waiting}
+                        {line.expired ? ` (+${line.expired} expiradas)` : ""}
+                      </td>
                     </tr>
                   );
                 })}

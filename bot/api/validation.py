@@ -29,6 +29,7 @@ from bot.backtest.runner import (
 )
 from bot.config import BotConfig
 from bot.cycle.market import UNIVERSE_STATE
+from bot.evaluator import THRESHOLD_KEYS
 from bot.logging_setup import redact
 from bot.markets import liquid_pool, venue_symbols
 from bot.reports import append_ledger
@@ -106,11 +107,13 @@ def _stale_cause(
     """Why the stored validation does not hold for ``config``; None while it does.
 
     "new": never validated. "gate": an older gate or strategy version. "rules": another
-    exit rule, market filter or exit hysteresis, or an operated timeframe it did not
-    replay. "pairs": another pair set (D6) than ``universe`` (``replay_universe``; an
-    unknown universe stales nothing). Under automatic selection the hourly change of
-    the chosen pairs therefore stales nothing; a change of the liquid pool does. The
-    portfolio limits are not part of the key: the record keeps the ones it replayed.
+    exit rule, market filter or exit hysteresis, an operated timeframe it did not
+    replay, or other ``classify`` thresholds (``_thresholds``): they decide which trades
+    compete for the portfolio slots, so they change the verdict. "pairs": another pair
+    set (D6) than ``universe`` (``replay_universe``; an unknown universe stales nothing).
+    Under automatic selection the hourly change of the chosen pairs therefore stales
+    nothing; a change of the liquid pool does. The portfolio limits are not part of the
+    key: the record keeps the ones it replayed.
     """
     if not params:
         return "new"
@@ -120,16 +123,41 @@ def _stale_cause(
         return "rules"
     if any(timeframe_result(params, timeframe) is None for timeframe in STRATEGIES[strategy_id].timeframes):
         return "rules"
+    stored = _stored_thresholds(params)
+    if stored is not None and not _same(stored, _thresholds(config)):
+        return "rules"
     if universe is not None and params.get("pairset") != pairset_hash(universe):
         return "pairs"
     return None
 
 
+def _thresholds(config: BotConfig) -> dict[str, float]:
+    """The ``classify`` thresholds a validation under ``config`` marks its trades with
+    (``filter_for``: ``min_reward_risk`` 0 under a fixed exit rule)."""
+    marks = filter_for(config.score_threshold, config.cost_multiple, config.min_reward_risk, config.exit_policy)
+    return {name: float(getattr(marks, name)) for name in THRESHOLD_KEYS}
+
+
+def _stored_thresholds(params: dict[str, Any]) -> dict[str, float] | None:
+    """The thresholds a stored validation ran with: its ``thresholds``, or, for a record from
+    before that key, those of any timeframe result. None when it never recorded them: an
+    unknown set stales nothing, like an unknown universe."""
+    candidates = [params.get("thresholds"), *((params.get("timeframes") or {}).values())]
+    for found in candidates:
+        if isinstance(found, dict) and all(isinstance(found.get(name), (int, float)) for name in THRESHOLD_KEYS):
+            return {name: float(found[name]) for name in THRESHOLD_KEYS}
+    return None
+
+
+def _same(left: dict[str, float], right: dict[str, float]) -> bool:
+    return all(math.isclose(left[name], right[name], abs_tol=1e-9) for name in THRESHOLD_KEYS)
+
+
 def _auto_validate(config: BotConfig, store: Store) -> list[str]:
     """Validate, one after another, each enabled strategy without a result for the current rules.
 
-    Changing the take-profit and stop-loss, the market filter or the hysteresis, or
-    turning a strategy on, then needs no click: the gate runs by itself and nothing
+    Changing the take-profit and stop-loss, the market filter, the hysteresis or the
+    ``classify`` thresholds, or turning a strategy on, then needs no click: the gate runs by itself and nothing
     trades until it passes. A strategy that already has a result for these rules,
     passed or not, is not re-run (a changed pair set waits for ``revalidate_stale``);
     one running is left alone.
@@ -148,8 +176,8 @@ def _auto_validate(config: BotConfig, store: Store) -> list[str]:
 def revalidate_stale(runtime: Runtime, *, startup: bool = False, now: datetime | None = None) -> list[str]:
     """Queue a validation of each enabled strategy whose stored result went stale (D12); returns them.
 
-    A new gate or strategy version, or another exit rule, market filter, hysteresis or
-    operated timeframe, re-validates at once; a changed pair set (under automatic selection,
+    A new gate or strategy version, or another exit rule, market filter, hysteresis,
+    operated timeframe or ``classify`` threshold, re-validates at once; a changed pair set (under automatic selection,
     a changed liquid pool) at most once per ``PAIRSET_REVALIDATE_EVERY`` since the
     strategy's last start (``revalidate_at:<id>``).
     A strategy never validated is left to the operator and to config changes
@@ -311,6 +339,8 @@ def _run_validation(key: tuple[str, str], strategy_id: str, config: BotConfig, r
                 "days": spans,
                 "elapsed_s": elapsed,
                 "limits": replayed_limits(config.limits),
+                # The classify thresholds the trades were marked with: changing them re-validates.
+                "thresholds": _thresholds(config),
                 # "liquid": the RANK_POOL universe of the automatic selection; "pairs": the configured ones.
                 "universe": "liquid" if config.auto_select else "pairs",
             }

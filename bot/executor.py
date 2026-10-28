@@ -269,17 +269,20 @@ def floor_price(value: Decimal, rules: MarketRules) -> Decimal:
     return Decimal(0)
 
 
-def _advice_record(advice: Mapping[str, Any] | None) -> tuple[str, float | None, int | None] | None:
+def _advice_record(advice: Mapping[str, Any] | None, scope: str) -> tuple[str, float | None, int | None] | None:
     """The advisor's verdict, confidence and ``advice_log`` id on the row an entry comes from
-    (``Opportunity.advice``); None when the row had no verdict."""
+    (``Opportunity.advice``); None when the row had no verdict. The id is kept only when the
+    verdict was logged in the store ``scope`` (``Store.identity``) names: an id of another mode's
+    store would mark an unrelated row of this one as taken."""
     if not advice or advice.get("status") != "done" or not isinstance(advice.get("verdict"), str):
         return None
     confidence = advice.get("confidence")
     log_id = advice.get("id")
+    own = advice.get("store") == scope
     return (
         str(advice["verdict"]),
         float(confidence) if isinstance(confidence, (int, float)) and not isinstance(confidence, bool) else None,
-        log_id if isinstance(log_id, int) and not isinstance(log_id, bool) else None,
+        log_id if own and isinstance(log_id, int) and not isinstance(log_id, bool) else None,
     )
 
 
@@ -381,7 +384,7 @@ class Executor:
             return decide("bloqueado", "entrada abaixo do mínimo da corretora")
         plan_stop = _positive(opportunity.risk_pct)
         plan_target = _positive(opportunity.plan_target_pct)
-        advice = _advice_record(opportunity.advice)
+        advice = _advice_record(opportunity.advice, self.store.identity)
         position_id = self.store.open_pending(
             symbol,
             opportunity.strategy,

@@ -195,6 +195,21 @@ def test_a_rule_change_revalidates_at_once(api_client, runs) -> None:
     assert module.revalidate_stale(runtime) == ["momentum"]
 
 
+def test_a_threshold_change_makes_a_passed_validation_stale(api_client, runs) -> None:
+    runtime = _use({"strategies": {**ctx.runtime.config.strategies, "momentum": True}})  # type: ignore[union-attr]
+    passed = {**_params("momentum", {"4h": {"passed": True}}), "thresholds": validation._thresholds(runtime.config)}
+    runtime.store.save_strategy({"strategy_id": "momentum", "signal_only": False, "params": passed})
+    universe = validation.replay_universe(runtime.config, runtime.store)
+    assert validation._stale_cause(passed, "momentum", runtime.config, universe) is None
+    assert module.revalidate_stale(runtime) == []
+    _use({"score_threshold": 0.6})
+    assert validation._stale_cause(passed, "momentum", runtime.config, universe) == "rules"
+    assert module.revalidate_stale(runtime) == ["momentum"]
+    # A record from before the top-level key: the timeframe results carry the thresholds it ran with.
+    older = _params("momentum", {"4h": {"passed": True, "score_threshold": 0.3, "cost_multiple": 2.0, "min_reward_risk": 1.5}})
+    assert validation._stale_cause(older, "momentum", runtime.config, universe) == "rules"
+
+
 def test_pair_set_staleness_revalidates_at_most_daily(api_client, runs) -> None:
     runtime = _use({"strategies": {**ctx.runtime.config.strategies, "momentum": True}})  # type: ignore[union-attr]
     other_pairs = _params("momentum", {"4h": {"passed": True}}, symbols=["BTC/USDT"])
@@ -379,6 +394,7 @@ def test_the_validation_keeps_the_limits_it_replayed_and_a_limit_change_keeps_it
     detail = api_client.get("/bot/status").json()["validation_detail"]["trend"]
     assert detail["1h"]["limits"] == replayed and detail["1h"]["skipped_by_limits"] == 0
     assert detail["4h"]["score_threshold"] == 0.3 and detail["4h"]["filtered_trades"] == 0
+    assert params["thresholds"] == {"score_threshold": 0.3, "cost_multiple": runtime.config.cost_multiple, "min_reward_risk": 1.5}
     # Limits are not part of the key: another limit re-validates nothing.
     _use({"limits": RiskLimits(max_positions=1, loss_guard_r=1.0)})
     assert module.revalidate_stale(runtime, now=datetime.now(timezone.utc) + timedelta(days=2)) == []

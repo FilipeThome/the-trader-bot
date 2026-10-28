@@ -23,6 +23,12 @@ def _serial_backtest(monkeypatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_advice_klines(monkeypatch) -> None:
+    """The advisor's resolver reads Binance klines for rows outside the snapshot; never in tests."""
+    monkeypatch.setattr("bot.advisor.calibration.fetch_closed", lambda *_args: None)
+
+
+@pytest.fixture(autouse=True)
 def _clear_mode_pin() -> Iterator[None]:
     reset_weight()
     reset_journal_cache()

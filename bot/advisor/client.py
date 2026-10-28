@@ -3,7 +3,9 @@
 The client never touches the Binance weight budget or its HTTP session. Every failure becomes
 ``AdvisorError(kind)``; the message names the kind and the HTTP status only, never the body (a
 proxy or the API may echo the request) and never the key. An empty content, which the API
-documents as possible in JSON mode, is asked once more before it counts as ``empty``.
+documents as possible in JSON mode, is asked once more before it counts as ``empty``. Every
+attempt the API answered is billed, the empty one included: the completion carries the usage of
+all of them, and an error after a billed attempt carries that usage (``AdvisorError.usage``).
 """
 
 from __future__ import annotations
@@ -38,14 +40,6 @@ PEAK_HOURS_UTC = (range(1, 4), range(6, 10))
 OFF_PEAK_DISCOUNT = 0.5
 
 
-class AdvisorError(Exception):
-    """A failed call. ``kind`` is one of ``ErrorKind``; ``str()`` never holds the body or the key."""
-
-    def __init__(self, kind: ErrorKind, message: str) -> None:
-        super().__init__(f"{kind}: {message}")
-        self.kind: ErrorKind = kind
-
-
 @dataclass(frozen=True)
 class Completion:
     """The answer's content and what it cost in tokens and time."""
@@ -56,6 +50,29 @@ class Completion:
     cache_miss_tokens: int
     completion_tokens: int
     latency_ms: float
+
+    def after(self, earlier: Completion | None) -> Completion:
+        """This answer with the tokens and time of ``earlier`` billed attempts added."""
+        if earlier is None:
+            return self
+        return Completion(
+            content=self.content,
+            prompt_tokens=earlier.prompt_tokens + self.prompt_tokens,
+            cache_hit_tokens=earlier.cache_hit_tokens + self.cache_hit_tokens,
+            cache_miss_tokens=earlier.cache_miss_tokens + self.cache_miss_tokens,
+            completion_tokens=earlier.completion_tokens + self.completion_tokens,
+            latency_ms=earlier.latency_ms + self.latency_ms,
+        )
+
+
+class AdvisorError(Exception):
+    """A failed call. ``kind`` is one of ``ErrorKind``; ``str()`` never holds the body or the key.
+    ``usage`` holds what the billed attempts cost, when the API reported it: the budget counts it."""
+
+    def __init__(self, kind: ErrorKind, message: str, *, usage: Completion | None = None) -> None:
+        super().__init__(f"{kind}: {message}")
+        self.kind: ErrorKind = kind
+        self.usage = usage
 
 
 def is_peak(moment: datetime) -> bool:
@@ -109,11 +126,17 @@ class DeepSeekClient:
             "max_tokens": MAX_TOKENS,
             "stream": False,
         }
+        billed: Completion | None = None
         for _attempt in range(2):
-            completion = self._post(body)
+            try:
+                completion = self._post(body).after(billed)
+            except AdvisorError as exc:
+                exc.usage = exc.usage.after(billed) if exc.usage is not None else billed
+                raise
             if completion.content.strip():
                 return completion
-        raise AdvisorError("empty", "resposta sem conteúdo duas vezes")
+            billed = completion
+        raise AdvisorError("empty", "resposta sem conteúdo duas vezes", usage=billed)
 
     def _post(self, body: dict[str, Any]) -> Completion:
         started = time.monotonic()
@@ -139,16 +162,20 @@ class DeepSeekClient:
             usage = payload.get("usage") or {}
         except (ValueError, KeyError, IndexError, TypeError, AttributeError):
             raise AdvisorError("invalid_json", f"corpo da resposta fora do formato (HTTP {status})") from None
-        if not isinstance(content, str):
-            raise AdvisorError("invalid_json", "conteúdo da resposta não é texto")
-        return Completion(
-            content=content,
+        if not isinstance(usage, dict):
+            usage = {}
+        completion = Completion(
+            content=content if isinstance(content, str) else "",
             prompt_tokens=_count(usage.get("prompt_tokens")),
             cache_hit_tokens=_count(usage.get("prompt_cache_hit_tokens")),
             cache_miss_tokens=_count(usage.get("prompt_cache_miss_tokens")),
             completion_tokens=_count(usage.get("completion_tokens")),
             latency_ms=latency,
         )
+        if not isinstance(content, str):
+            # Answered, so billed: the error carries the usage.
+            raise AdvisorError("invalid_json", "conteúdo da resposta não é texto", usage=completion)
+        return completion
 
 
 def _count(value: object) -> int:

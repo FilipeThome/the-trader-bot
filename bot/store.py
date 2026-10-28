@@ -9,6 +9,7 @@ per pair and strategy.
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import math
 import sqlite3
@@ -201,7 +202,8 @@ CREATE TABLE IF NOT EXISTS advice_log (
     taken INTEGER NOT NULL DEFAULT 0,
     position_id INTEGER,
     counterfactual_r REAL,
-    resolved_at TEXT
+    resolved_at TEXT,
+    expired_at TEXT
 );
 CREATE INDEX IF NOT EXISTS advice_log_open ON advice_log(resolved_at);
 CREATE TABLE IF NOT EXISTS advisor_usage_daily (
@@ -296,6 +298,12 @@ _ADDED_POSITION_COLUMNS = (
     ("entry_advice_confidence", "REAL"),
 )
 
+#: Columns added to ``advice_log`` after it shipped. ``expired_at``: the row's window and its
+#: grace passed without the candles to label it (``calibration.resolve_pending``).
+_ADDED_ADVICE_COLUMNS = (("expired_at", "TEXT"),)
+#: One verdict per signal: a restart that asks again finds the logged row instead.
+_ADVICE_SIGNAL_KEY = ("symbol", "strategy", "timeframe", "signal_close_at", "prompt_version", "model")
+
 #: Counters of ``advisor_usage_daily`` that ``record_advisor_usage`` adds to.
 _USAGE_COLUMNS = (
     "calls", "prompt_tokens", "cache_hit_tokens", "completion_tokens", "cost_usd",
@@ -338,6 +346,41 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _usage(conn: sqlite3.Connection, since: str, until: str | None) -> dict[str, Any]:
+    """``Store.advisor_usage`` on ``conn``."""
+    sums = ", ".join(f"COALESCE(SUM({name}), 0) AS {name}" for name in _USAGE_COLUMNS)
+    query = f"SELECT {sums} FROM advisor_usage_daily WHERE day >= ?"
+    values: list[Any] = [since]
+    if until is not None:
+        query += " AND day <= ?"
+        values.append(until)
+    row = conn.execute(query, values).fetchone()
+    return {name: (float(row[name]) if name == "cost_usd" else int(row[name])) for name in _USAGE_COLUMNS}
+
+
+def advisor_usage_at(path: Path, since: str, until: str | None = None) -> dict[str, Any] | None:
+    """``Store.advisor_usage`` of the database at ``path``, read only: another mode's store is
+    summed without migrating or locking it. None when the file or its usage table is missing."""
+    if not path.is_file():
+        return None
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 10000")
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='advisor_usage_daily'").fetchone() is None:
+            return None
+        return _usage(conn, since, until)
+    finally:
+        conn.close()
+
+
+def _advice_item(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    item["risk_flags"] = json.loads(item["risk_flags"] or "[]")
+    item["taken"] = bool(item["taken"])
+    return item
+
+
 def _locked(method: _F) -> _F:
     @functools.wraps(method)
     def wrapper(self: "Store", *args: Any, **kwargs: Any) -> Any:
@@ -361,12 +404,20 @@ class Store:
         self._migrate_positions()
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
-        self._add_missing_columns()
+        self._add_missing_columns("positions", _ADDED_POSITION_COLUMNS)
+        self._add_missing_columns("advice_log", _ADDED_ADVICE_COLUMNS)
+        self._unique_advice()
 
-    def _add_missing_columns(self) -> None:
-        """Add nullable columns a v2 ``positions`` table lacks. Additive and idempotent."""
-        present = {row["name"] for row in self._conn.execute("PRAGMA table_info(positions)").fetchall()}
-        missing = [(name, kind) for name, kind in _ADDED_POSITION_COLUMNS if name not in present]
+    @functools.cached_property
+    def identity(self) -> str:
+        """A short, stable name of this database file. The advisor keys its verdicts by it, so a
+        verdict asked by one mode's store never gates or links a row of the other mode's."""
+        return hashlib.sha256(str(self.path.resolve()).encode("utf-8")).hexdigest()[:16]
+
+    def _add_missing_columns(self, table: str, added: tuple[tuple[str, str], ...]) -> None:
+        """Add nullable columns an older ``table`` lacks. Additive and idempotent."""
+        present = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        missing = [(name, kind) for name, kind in added if name not in present]
         if not missing:
             return
         previous = self._conn.isolation_level
@@ -375,13 +426,43 @@ class Store:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 for name, kind in missing:
-                    self._conn.execute(f"ALTER TABLE positions ADD COLUMN {name} {kind}")
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
                 self._conn.execute("COMMIT")
             except BaseException:
                 self._conn.execute("ROLLBACK")
                 raise
         finally:
             self._conn.isolation_level = previous
+
+    def _unique_advice(self) -> None:
+        """Give ``advice_log`` its unique signal key (``_ADVICE_SIGNAL_KEY``).
+
+        A table from before the key may hold the same signal twice (a restart asked again). The
+        oldest row of each signal stays; it takes over a later duplicate's link to a position, so
+        the realized column keeps it. Runs once: afterwards the index exists.
+        """
+        exists = self._conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='advice_log_signal'").fetchone()
+        if exists is not None:
+            return
+        key = ", ".join(_ADVICE_SIGNAL_KEY)
+        with self._conn:
+            groups = self._conn.execute(
+                f"SELECT {key}, MIN(id) AS keep FROM advice_log GROUP BY {key} HAVING COUNT(*) > 1"
+            ).fetchall()
+            match = " AND ".join(f"{name}=?" for name in _ADVICE_SIGNAL_KEY)
+            for group in groups:
+                values = [group[name] for name in _ADVICE_SIGNAL_KEY]
+                keep = int(group["keep"])
+                linked = self._conn.execute(
+                    f"SELECT position_id FROM advice_log WHERE {match} AND id<>? AND taken=1 ORDER BY id LIMIT 1",
+                    (*values, keep),
+                ).fetchone()
+                if linked is not None:
+                    self._conn.execute(
+                        "UPDATE advice_log SET taken=1, position_id=? WHERE id=? AND taken=0", (linked["position_id"], keep)
+                    )
+                self._conn.execute(f"DELETE FROM advice_log WHERE {match} AND id<>?", (*values, keep))
+            self._conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS advice_log_signal ON advice_log({key})")
 
     def _migrate_positions(self) -> None:
         """Rebuild a v1 ``positions`` table (one row per pair, strategy and status).
@@ -985,7 +1066,8 @@ class Store:
 
     @_locked
     def add_advice(self, row: dict[str, Any]) -> int:
-        """Log one verdict (``_ADVICE_COLUMNS``; ``latency_ms`` optional); returns its id."""
+        """Log one verdict (``_ADVICE_COLUMNS``; ``latency_ms`` optional); returns its id. A signal
+        already logged (``_ADVICE_SIGNAL_KEY``) keeps its row, whose id is returned."""
         missing = [name for name in _ADVICE_COLUMNS if name not in row and name != "latency_ms"]
         if missing:
             raise ValueError(f"missing advice fields: {missing}")
@@ -993,24 +1075,45 @@ class Store:
         columns = ", ".join(_ADVICE_COLUMNS)
         marks = ", ".join("?" for _ in _ADVICE_COLUMNS)
         with self._conn:
-            cursor = self._conn.execute(f"INSERT INTO advice_log ({columns}) VALUES ({marks})", values)
-        return int(cursor.lastrowid or 0)
+            cursor = self._conn.execute(f"INSERT OR IGNORE INTO advice_log ({columns}) VALUES ({marks})", values)
+        if cursor.rowcount:
+            return int(cursor.lastrowid or 0)
+        # Ignored: lastrowid would be the connection's previous insert, not this signal's row.
+        kept = self.advice_for(*(str(row[name]) for name in _ADVICE_SIGNAL_KEY))
+        return int(kept["id"]) if kept is not None else 0
+
+    @_locked
+    def advice_for(
+        self, symbol: str, strategy: str, timeframe: str, signal_close_at: str, prompt_version: str, model: str
+    ) -> dict[str, Any] | None:
+        """The logged verdict of one signal (``_ADVICE_SIGNAL_KEY``), or None."""
+        match = " AND ".join(f"{name}=?" for name in _ADVICE_SIGNAL_KEY)
+        row = self._conn.execute(
+            f"SELECT * FROM advice_log WHERE {match} ORDER BY id LIMIT 1",
+            (symbol, strategy, timeframe, signal_close_at, prompt_version, model),
+        ).fetchone()
+        return _advice_item(row) if row is not None else None
 
     @_locked
     def advice_rows(self, *, unresolved: bool = False) -> list[dict[str, Any]]:
         """Logged verdicts, oldest first, with the closed position's result in R (``realized_r``)
-        when the row entered one. ``unresolved`` keeps the rows without a counterfactual yet."""
+        when the row entered one. ``unresolved`` keeps the rows without a counterfactual yet that
+        did not expire."""
         query = """SELECT a.*, p.r_multiple AS realized_r FROM advice_log a
             LEFT JOIN positions p ON p.id = a.position_id AND p.status = 'closed'"""
         if unresolved:
-            query += " WHERE a.resolved_at IS NULL"
-        out = []
-        for row in self._conn.execute(query + " ORDER BY a.id").fetchall():
-            item = dict(row)
-            item["risk_flags"] = json.loads(item["risk_flags"] or "[]")
-            item["taken"] = bool(item["taken"])
-            out.append(item)
-        return out
+            query += " WHERE a.resolved_at IS NULL AND a.expired_at IS NULL"
+        return [_advice_item(row) for row in self._conn.execute(query + " ORDER BY a.id").fetchall()]
+
+    @_locked
+    def expire_advice(self, advice_id: int, expired_at: str) -> None:
+        """Mark an unresolved row as expired: its window and grace passed without the candles to
+        label it. It is never tried again and counts apart in the calibration."""
+        with self._conn:
+            self._conn.execute(
+                "UPDATE advice_log SET expired_at=? WHERE id=? AND resolved_at IS NULL AND expired_at IS NULL",
+                (expired_at, advice_id),
+            )
 
     @_locked
     def resolve_advice(self, advice_id: int, counterfactual_r: float, resolved_at: str) -> None:
@@ -1048,14 +1151,7 @@ class Store:
     def advisor_usage(self, since: str, until: str | None = None) -> dict[str, Any]:
         """The advisor counters summed over the UTC days ``since`` to ``until``, both included
         (``until`` None: every day from ``since``). Zeros without a row."""
-        sums = ", ".join(f"COALESCE(SUM({name}), 0) AS {name}" for name in _USAGE_COLUMNS)
-        query = f"SELECT {sums} FROM advisor_usage_daily WHERE day >= ?"
-        values: list[Any] = [since]
-        if until is not None:
-            query += " AND day <= ?"
-            values.append(until)
-        row = self._conn.execute(query, values).fetchone()
-        return {name: (float(row[name]) if name == "cost_usd" else int(row[name])) for name in _USAGE_COLUMNS}
+        return _usage(self._conn, since, until)
 
     # -- armed entries -----------------------------------------------------
 

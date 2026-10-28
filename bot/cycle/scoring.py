@@ -394,7 +394,7 @@ def _advice_entry(
     bar = _signal_bar(context.snapshot, symbol, timeframe, context.moment)
     if bar is None:
         return None
-    return context.advice.get(advice_key(symbol, strategy_id, timeframe, bar[0], settings.model))
+    return context.advice.get(advice_key(context.advice_scope, symbol, strategy_id, timeframe, bar[0], settings.model))
 
 
 def _advice_factor(entry: AdviceState | None, settings: AdvisorConfig) -> float:
@@ -405,13 +405,15 @@ def _advice_factor(entry: AdviceState | None, settings: AdvisorConfig) -> float:
     return entry.advice.size_factor
 
 
-def advice_request_key(item: Opportunity, snapshot: MarketSnapshot, moment: datetime, model: str) -> tuple[AdviceKey, float] | None:
-    """The advisor's cache key of a ready row and its signal bar's close (the counterfactual's
-    entry); None without a closed bar of the row's timeframe."""
+def advice_request_key(
+    item: Opportunity, snapshot: MarketSnapshot, moment: datetime, model: str, scope: str
+) -> tuple[AdviceKey, float] | None:
+    """The advisor's cache key of a ready row for the store ``scope`` (``Store.identity``) and its
+    signal bar's close (the counterfactual's entry); None without a closed bar of the row's timeframe."""
     bar = _signal_bar(snapshot, item.symbol, item.timeframe, moment)
     if bar is None:
         return None
-    return advice_key(item.symbol, item.strategy, item.timeframe, bar[0], model), bar[1]
+    return advice_key(scope, item.symbol, item.strategy, item.timeframe, bar[0], model), bar[1]
 
 
 def _advice_allows(item: Opportunity, entry: AdviceState | None, moment: datetime, settings: AdvisorConfig) -> bool:

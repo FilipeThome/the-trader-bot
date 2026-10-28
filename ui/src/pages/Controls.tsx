@@ -997,7 +997,7 @@ function AdvisorCard({ status }: { status: Status }) {
         salvar consultor
       </button>
       <p className="text-neutral-500">
-        Hoje: {advisor.today.calls} consultas · {formatUsdCost(advisor.today.cost_usd)} de {formatUsdCost(advisor.daily_budget_usd)} (estimativa) · {advisor.today.errors} erros
+        Hoje, testnet e produção somados: {advisor.today.calls} consultas · {formatUsdCost(advisor.today.cost_usd)} de {formatUsdCost(advisor.daily_budget_usd)} (estimativa) · {advisor.today.errors} erros
         {advisor.last_ok && <> · último veredito {new Date(advisor.last_ok).toLocaleString("pt-BR")}</>} · prompt {advisor.prompt_version}
       </p>
       {advisor.last_error && <p className="text-red-600">Último erro: {advisor.last_error}</p>}

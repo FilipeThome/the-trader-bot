@@ -66,6 +66,9 @@ class CycleContext:
     #: A copy of the advisor's verdict cache taken for this cycle (``Advisor.snapshot``); empty
     #: with the advisor off. Scoring reads it, so it stays free of side effects.
     advice: Mapping[AdviceKey, AdviceState] = field(default_factory=dict)
+    #: The runtime store's ``Store.identity``: the advice keys of this cycle carry it, so a
+    #: verdict another mode's store asked for is never read here.
+    advice_scope: str = ""
 
 
 #: What a ``ScoreEffect`` writes: an equity point, the pair blocks with their ledger event, a

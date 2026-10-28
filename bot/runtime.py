@@ -48,6 +48,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+
 from bot.advisor import prompt
 from bot.advisor.service import AdviceKey, AdviceRequest, AdviceState, Advisor
 from bot.collector import Collector, MarketSnapshot
@@ -61,7 +63,7 @@ from bot.evaluator import Opportunity
 from bot.exchange import service
 from bot.exchange.weight import weight_pressure
 from bot.executor import Executor, UnprotectedPosition
-from bot.features import build_features
+from bot.features import build_features, closed_by
 from bot.instances import DcaParams, GridParams
 from bot.live.halt import clear_halt, halt_flag_set, trip_halt
 from bot.live.mandate.store import load_mandate
@@ -633,6 +635,7 @@ class Runtime:
             takers=takers,
             limits=limits,
             advice=advice or {},
+            advice_scope=self.store.identity,
         )
 
     # -- DeepSeek advisor (``bot.advisor``) ---------------------------------
@@ -653,6 +656,10 @@ class Runtime:
         from numbers and enums (``prompt.user_data``) and queued with ``put_nowait``: a full
         queue is no verdict. Returns the states of the keys queued now, which the cycle's cache
         copy does not have yet.
+
+        The prompt reads only bars closed by the signal bar's close, on every timeframe (the
+        pair's 1h and 15m, BTC's 4h): the counterfactual R scores the path from that close, so a
+        row asked hours later must not show the model part of the path it is scored on.
         """
         advisor = self._advising()
         rows = [item for item in opportunities if item.status == "pronta" and not item.test_only and item.direction > 0]
@@ -661,20 +668,25 @@ class Runtime:
         settings = self.config.advisor
         snapshot, moment = context.snapshot, context.moment
         btc = market._closed(snapshot, market.MARKET_SYMBOL, "4h", moment)
-        btc_trend = prompt.btc_trend(btc["close"].to_numpy() if btc is not None else None)
+        trends: dict[str, str] = {}
         state = context.state
         ledger = self._advice_ledger()
         queued: dict[AdviceKey, AdviceState] = {}
         for item in rows:
-            found = scoring.advice_request_key(item, snapshot, moment, settings.model)
+            found = scoring.advice_request_key(item, snapshot, moment, settings.model, context.advice_scope)
             if found is None or found[0] in context.advice:
                 continue
             key, signal_close = found
+            signal_close_at = key[4]
+            until = pd.Timestamp(signal_close_at)
+            if signal_close_at not in trends:
+                closes = None if btc is None else closed_by(btc, market._BAR["4h"], until)["close"].to_numpy()
+                trends[signal_close_at] = prompt.btc_trend(closes)
             try:
                 data = prompt.user_data(
                     item,
-                    features=_features(snapshot, item.symbol),
-                    btc_trend=btc_trend,
+                    features=_features(snapshot, item.symbol, until),
+                    btc_trend=trends[signal_close_at],
                     risk_level=state.level if state is not None else "normal",
                     drawdown=state.drawdown if state is not None else 0.0,
                     open_positions=len(context.positions),
@@ -707,7 +719,7 @@ class Runtime:
         settings = self.config.advisor
         if item.test_only or settings.mode != "filter" or self.advisor is None:
             return True
-        found = scoring.advice_request_key(item, context.snapshot, context.moment, settings.model)
+        found = scoring.advice_request_key(item, context.snapshot, context.moment, settings.model, context.advice_scope)
         entry = None if found is None else context.advice.get(found[0]) or queued.get(found[0])
         return scoring._advice_allows(item, entry, context.moment, settings)
 
@@ -892,10 +904,11 @@ class Runtime:
             self.store.set_state("ledger_error", kind)
 
 
-def _features(snapshot: MarketSnapshot, symbol: str) -> dict[str, Any] | None:
-    """The panel's feature series of a pair (``build_features``), or None without its 1h and 15m bars."""
+def _features(snapshot: MarketSnapshot, symbol: str, until: pd.Timestamp) -> dict[str, Any] | None:
+    """The feature series of a pair (``build_features``) on the bars closed by ``until``, or None
+    without its 1h and 15m bars."""
     try:
-        return build_features(snapshot, symbol)
+        return build_features(snapshot, symbol, until=until)
     except (KeyError, IndexError, ValueError):
         return None
 

@@ -76,7 +76,10 @@ export type AdvisorStatus = {
   last_ok: string | null;
   /** "<ISO time> <redacted message>" of the last failure. */
   last_error: string | null;
+  /** Today's usage over both modes (testnet and production): one DeepSeek key, one daily budget. */
   today: AdvisorUsageTotals;
+  /** Today's usage of the current mode only. */
+  today_mode?: AdvisorUsageTotals;
   prompt_version: string;
 };
 
@@ -91,7 +94,8 @@ export type AdvisorUsage = {
 /**
  * One line of /bot/performance advice_calibration, per (model, prompt version): "all" is every
  * consulted row, then each verdict, then "veto_confident" (what filter would remove). The means
- * cover only rows whose 48-bar window has passed; ``waiting`` counts the others.
+ * cover only rows whose 48-bar window has passed; ``waiting`` counts the others, and ``expired``
+ * the rows whose window passed without the candles to label them (never in a mean).
  */
 export type AdviceCalibrationLine = {
   model: string;
@@ -102,6 +106,7 @@ export type AdviceCalibrationLine = {
   mean_r: number | null;
   se: number | null;
   waiting: number;
+  expired?: number;
   realized_n: number;
   realized_mean_r: number | null;
   /** reduce only: the mean of (1 − factor) × counterfactual R. */
