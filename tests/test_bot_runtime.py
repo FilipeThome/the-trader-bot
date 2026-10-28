@@ -894,3 +894,103 @@ def test_a_day_row_enters_above_its_first_target_breakeven_not_the_swing_floor(t
     weak, weak_executor = _day_ready(tmp_path / "weak", monkeypatch, wins=32)
     weak.tick()
     assert "act:0" in weak_executor.events
+
+
+_THREE = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+
+
+def _count_limits(monkeypatch) -> list[int]:
+    """Count every ``Runtime._limits`` call (a mandate read)."""
+    calls: list[int] = []
+    inner = Runtime._limits
+
+    def counting(self: Runtime) -> RiskLimits:
+        calls.append(1)
+        return inner(self)
+
+    monkeypatch.setattr(Runtime, "_limits", counting)
+    return calls
+
+
+def _three_ready(tmp_path, monkeypatch, **overrides: Any) -> tuple[Runtime, FakeExecutor]:
+    """Three pairs validated together, each with a ready trend row."""
+    runtime, _collector, executor = _runtime(tmp_path, monkeypatch, _THREE, **overrides)
+    monkeypatch.setattr("bot.runtime._setup", _setup)
+    params = _validated("trend", "trailing", symbols=_THREE, wins=30, trades=40)
+    runtime.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": params})
+    runtime.store.set_state("running", True)
+    return runtime, executor
+
+
+def test_one_tick_reads_the_mandate_once_in_automatic_mode(tmp_path, monkeypatch) -> None:
+    runtime, executor = _three_ready(tmp_path, monkeypatch, entry_mode="auto")
+    calls = _count_limits(monkeypatch)
+    assert runtime.tick()["status"] == "ok"
+    assert any(event.startswith("act:") and event != "act:0" for event in executor.events)
+    assert len(calls) == 1
+
+
+def test_one_tick_reads_the_mandate_once_in_manual_mode_with_three_ready_rows(tmp_path, monkeypatch) -> None:
+    runtime, _executor = _three_ready(tmp_path, monkeypatch)
+    calls = _count_limits(monkeypatch)
+    payload = runtime.tick()
+    assert payload["status"] == "ok" and payload["ready"] == 3
+    # Each ready row is allocated on its own, all on the one context of the cycle.
+    assert len(calls) == 1
+
+
+def test_score_writes_nothing_and_its_effects_carry_the_scored_decision(tmp_path, monkeypatch) -> None:
+    # Validated on BTC only: the ETH row is refused as signal only and counted as a violation avoided.
+    runtime, _collector, _executor = _runtime(tmp_path, monkeypatch, ["BTC/USDT", "ETH/USDT"])
+    monkeypatch.setattr("bot.runtime._setup", _setup)
+    params = _validated("trend", "trailing", wins=30, trades=40)
+    runtime.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": params})
+    # A slippage block left from an earlier cycle: this cycle lifts it.
+    runtime.store.set_state("pair_blocked", {"BTC/USDT||slippage": "antigo"})
+    events: list[dict[str, Any]] = []
+    monkeypatch.setattr("bot.runtime.append_ledger", lambda payload: events.append(dict(payload)))
+    moment = datetime.now(timezone.utc)
+    snapshot = runtime.collector.snapshot
+    state = runtime._risk_state(snapshot, moment)
+    context = runtime._context(moment, snapshot, 100_000.0, state=state, takers={}, limits=runtime._limits())
+    events.clear()
+    changes = runtime.store._conn.total_changes
+
+    rows, effects = runtime._score(context)
+
+    assert runtime.store._conn.total_changes == changes and events == [] and runtime._decided == {}
+    assert [effect.kind for effect in effects] == ["equity", "pair_blocked", "decision", "violation", "decision"]
+    by_symbol = {row.symbol: row for row in rows}
+    assert by_symbol["BTC/USDT"].status == "pronta" and by_symbol["ETH/USDT"].status == "bloqueada"
+    # A later step changes the row; the history keeps the decision as scored.
+    by_symbol["BTC/USDT"].status, by_symbol["BTC/USDT"].reason = "bloqueada", "mudou depois"
+
+    runtime._apply_effects(effects)
+
+    decisions = {row["symbol"]: row for row in runtime.store.decisions() if row["strategy"] == "trend"}
+    assert len(decisions) == 2 and decisions["BTC/USDT"]["decision"] == "pronta"
+    assert runtime._decided[("BTC/USDT", "trend")][0] == "pronta"
+    assert runtime.store.get_state("pair_blocked") == {}
+    assert [event["kind"] for event in events] == ["pair_blocked"] and events[0]["blocked"] is False
+    assert runtime.store.pnl_days()[-1]["violations_avoided"] == 1
+    assert runtime.store._conn.execute("SELECT COUNT(*) FROM equity").fetchone()[0] == 1
+
+
+def test_a_tick_applies_the_score_effects_once(tmp_path, monkeypatch) -> None:
+    runtime, _executor = _three_ready(tmp_path, monkeypatch)
+    applied: list[int] = []
+    inner = Runtime._apply_effects
+
+    def counting(self: Runtime, effects: list[Any]) -> None:
+        applied.append(len(effects))
+        inner(self, effects)
+
+    monkeypatch.setattr(Runtime, "_apply_effects", counting)
+    assert runtime.tick()["status"] == "ok"
+    assert len(applied) == 1
+    scored = [row for row in runtime.store.decisions() if row["strategy"] == "trend"]
+    assert sorted(row["symbol"] for row in scored) == sorted(_THREE)
+    assert runtime.store._conn.execute("SELECT COUNT(*) FROM equity").fetchone()[0] == 1
+    # The next cycle scores the same decisions: nothing new goes to the history.
+    runtime.tick()
+    assert len([row for row in runtime.store.decisions() if row["strategy"] == "trend"]) == 3
