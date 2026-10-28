@@ -62,6 +62,7 @@ export const sizeLimits: Record<string, string> = {
   vol_target: "alvo de volatilidade",
   cash: "caixa",
   throttle: "volatilidade de 7 dias alta (metade)",
+  advice: "análise IA",
 };
 
 export function sizeLimitName(key: string): string {
@@ -83,4 +84,25 @@ export const stopWindowKinds: Record<string, string> = {
   partial: "venda parcial",
   restop: "novo stop após compra",
   exit_remainder: "stop do que sobrou",
+};
+
+/** Opportunity.advice: a done verdict's name, or "pending" while the DeepSeek call runs. */
+export const adviceVerdicts: Record<string, string> = {
+  confirm: "IA confirma",
+  reduce: "IA reduz",
+  veto: "IA desaconselha",
+  abstain: "IA sem opinião",
+  pending: "IA analisando",
+};
+
+/** The advisor's settings (bot.config.AdvisorConfig): what each mode does with a verdict. */
+export const advisorModes: Record<string, string> = {
+  off: "desligado",
+  shadow: "sombra (só registra)",
+  filter: "filtro (pode reduzir ou barrar)",
+};
+
+export const advisorModels: Record<string, string> = {
+  "deepseek-flash": "DeepSeek Flash (padrão)",
+  "deepseek-v4-pro": "DeepSeek V4 Pro",
 };

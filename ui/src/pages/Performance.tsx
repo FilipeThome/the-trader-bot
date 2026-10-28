@@ -3,9 +3,9 @@ import * as echarts from "echarts";
 
 import { Help } from "../Help";
 import { stopWindowKinds, strategyName } from "../labels";
-import { formatR } from "../numbers";
+import { formatR, formatUsdCost } from "../numbers";
 import { useBot } from "../store";
-import type { Status, TimeframeResult } from "../types";
+import type { AdviceCalibrationLine, AdvisorUsage, AdvisorUsageTotals, Status, TimeframeResult } from "../types";
 
 /** The deflated Sharpe the gate needs (runner.MIN_DSR). */
 const MIN_DSR = 0.95;
@@ -34,6 +34,8 @@ export function Performance() {
   const days = useBot((state) => state.days);
   const calibration = useBot((state) => state.calibration);
   const pairs = useBot((state) => state.pairs);
+  const adviceCalibration = useBot((state) => state.adviceCalibration);
+  const advisorUsage = useBot((state) => state.advisorUsage);
   const status = useBot((state) => state.status);
   const dark = useBot((state) => state.dark);
   const node = useRef<HTMLDivElement>(null);
@@ -110,6 +112,8 @@ export function Performance() {
         </table>
       )}
 
+      {(status?.advisor || advisorUsage) && <AdvisorReport lines={adviceCalibration} usage={advisorUsage} />}
+
       <div className="mt-8 grid gap-6 text-sm lg:grid-cols-2">
         <StopWindows status={status} />
         <div>
@@ -152,6 +156,117 @@ export function Performance() {
 
       <Validation status={status} />
     </section>
+  );
+}
+
+/** "+0,12 R ± 0,05": a mean counterfactual R and its standard error. */
+function meanWithError(mean: number | null, se: number | null): string {
+  if (mean == null) return "—";
+  return se == null ? formatR(mean) : `${formatR(mean)} ± ${num(se)}`;
+}
+
+/** "12 confirmar · 3 reduzir · 2 vetar · 1 sem opinião": the verdicts of a usage range. */
+function verdictMix(totals: AdvisorUsageTotals): string {
+  const parts: [number, string][] = [
+    [totals.confirm, "confirmar"],
+    [totals.reduce, "reduzir"],
+    [totals.veto, "vetar"],
+    [totals.abstain, "sem opinião"],
+  ];
+  const shown = parts.filter(([count]) => count > 0).map(([count, label]) => `${count} ${label}`);
+  return shown.length ? shown.join(" · ") : "—";
+}
+
+/** The advisor's verdicts measured by counterfactual R, per model and prompt version, and its calls and cost. */
+function AdvisorReport({ lines, usage }: { lines: AdviceCalibrationLine[]; usage: AdvisorUsage | null }) {
+  const groups = new Map<string, AdviceCalibrationLine[]>();
+  for (const line of lines) {
+    const key = `${line.model} · prompt ${line.prompt_version}`;
+    groups.set(key, [...(groups.get(key) ?? []), line]);
+  }
+  return (
+    <div className="mt-8 text-sm">
+      <p className="mb-2 flex items-center font-medium">
+        Consultor DeepSeek: calibração dos vereditos
+        <Help text="Cada veredito gravado, tenha entrado ou não, recebe o R que a posição teria feito entrando no fechamento da vela do sinal, com o stop e o alvo da linha, pelas regras do teste histórico e já sem o custo. Um veto útil tem R contrafactual médio negativo: as linhas desaconselhadas teriam perdido. Um confirmar útil fica acima da linha de todas as consultadas. Uma linha só entra na média depois que as 48 velas da janela passaram desde o sinal, qualquer que seja o resultado; até lá conta em Aguardando. EP é o erro padrão: uma diferença menor que duas vezes ele pode ser sorte. Os vetos com confiança acima do mínimo têm linha própria: são o que o modo filtro tiraria." />
+      </p>
+      {groups.size === 0 ? (
+        <p className="text-neutral-500">Nenhum veredito registrado neste ambiente.</p>
+      ) : (
+        [...groups.entries()].map(([key, members]) => (
+          <div key={key} className="mb-4 overflow-x-auto">
+            <p className="mb-1 text-neutral-500">{key}</p>
+            <table className="text-left">
+              <thead className="text-neutral-500">
+                <tr>
+                  <th className="pr-6 font-medium">Veredito</th>
+                  <th className="pr-6 font-medium">n</th>
+                  <th className="pr-6 font-medium">R contrafactual (± EP)</th>
+                  <th className="pr-6 font-medium">
+                    Reduzir: (1 − fator) × R
+                    <Help text="Quanto o tamanho menor mudou o resultado, em R da posição cheia. Negativo é perda evitada; positivo é ganho que ficou na mesa." />
+                  </th>
+                  <th className="pr-6 font-medium">
+                    R realizado
+                    <Help text="O R das posições que estas linhas abriram e já fecharam, com o tamanho e as saídas reais. Fica à parte: misturar com o contrafactual escolheria as linhas pelo resultado." />
+                  </th>
+                  <th className="font-medium">Aguardando</th>
+                </tr>
+              </thead>
+              <tbody>
+                {members.map((line) => {
+                  const vetoLine = line.group === "veto" || line.group === "veto_confident";
+                  const tone = !vetoLine || line.mean_r == null ? "" : line.mean_r < 0 ? "text-green-600" : "text-red-600";
+                  return (
+                    <tr key={line.group} className={`border-t border-neutral-200 dark:border-neutral-800 ${line.group === "all" ? "font-medium" : ""}`}>
+                      <td className="pr-6">{line.label}</td>
+                      <td className="pr-6">{line.n}</td>
+                      <td className={`pr-6 ${tone}`}>{meanWithError(line.mean_r, line.se)}</td>
+                      <td className="pr-6">{line.group === "reduce" ? formatR(line.reduced_mean_r) : "—"}</td>
+                      <td className="pr-6">{line.realized_n > 0 ? `${formatR(line.realized_mean_r)} (n=${line.realized_n})` : "—"}</td>
+                      <td>{line.waiting}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ))
+      )}
+      <p className="mb-2 mt-4 flex items-center font-medium">
+        Consultor DeepSeek: uso
+        <Help text="Consultas, custo e vereditos por dia UTC. Uma consulta por sinal Pronto, não por ciclo. O custo é uma estimativa pela tabela de preços do código; o valor faturado é o do painel da DeepSeek. Erros são consultas sem veredito: chave, limite de concorrência, demora, resposta vazia ou inválida." />
+      </p>
+      {!usage ? (
+        <p className="text-neutral-500">Uso indisponível.</p>
+      ) : (
+        <>
+          <table className="text-left">
+            <thead className="text-neutral-500">
+              <tr>
+                <th className="pr-6 font-medium" />
+                <th className="pr-6 font-medium">Consultas</th>
+                <th className="pr-6 font-medium">Custo</th>
+                <th className="pr-6 font-medium">Vereditos</th>
+                <th className="font-medium">Erros</th>
+              </tr>
+            </thead>
+            <tbody>
+              {([["Hoje", usage.today], ["30 dias", usage.last_30_days]] as [string, AdvisorUsageTotals][]).map(([label, totals]) => (
+                <tr key={label} className="border-t border-neutral-200 dark:border-neutral-800">
+                  <td className="pr-6 text-neutral-500">{label}</td>
+                  <td className="pr-6">{totals.calls}</td>
+                  <td className="pr-6">{formatUsdCost(totals.cost_usd)}</td>
+                  <td className="pr-6">{verdictMix(totals)}</td>
+                  <td className={totals.errors > 0 ? "text-amber-600" : ""}>{totals.errors}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="mt-1 text-xs text-neutral-500">Custo estimado com os preços de {usage.prices_as_of}.</p>
+        </>
+      )}
+    </div>
   );
 }
 
