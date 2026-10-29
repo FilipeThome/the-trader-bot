@@ -39,7 +39,7 @@ from bot.strategies.day import DAY_WIN_RATE_MARGIN
 from bot.strategies.trailing import TRAIL
 from bot.markets import CHART_LEAD, chart_interval, merge_symbols, top_liquid_usdt, tradable_symbols, venue_klines, venue_symbols
 from bot.paths import pin_mode_root
-from bot.promotion import PILOT_STATE, switch_to_production
+from bot.promotion import PILOT_SKIP_VALIDATION_STATE, PILOT_STATE, switch_to_production
 from bot.recommend import recommendations
 from bot.reports import build_daily_report, verify_ledger
 from bot.runtime import Runtime, mode_root, profile_for
@@ -136,6 +136,13 @@ class ConfigUpdate(BaseModel):
     advisor: dict[str, Any] | None = None
     #: Rewrite the mandate from the resulting config. Required to change ``flatten_on_halt``.
     reconfirm_mandate: bool = False
+    #: A production pilot asked from the panel, only with a testnet → production switch (422
+    #: otherwise): the capital cap recorded at the switch (same bounds as bot.json's
+    #: ``pilot_max_production_capital_usd``), and whether its strategies operate without a
+    #: stored backtest validation. The second needs the first. Both are ignored when the
+    #: testnet history makes the switch a full promotion.
+    pilot_cap_usd: float | None = Field(default=None, gt=0, le=50)
+    pilot_skip_validation: bool = False
 
 
 class ArmEntry(BaseModel):
@@ -303,6 +310,8 @@ def status() -> dict[str, Any]:
         "min_profit_usd": runtime.config.min_profit_usd,
         "gates": runtime.config.gates,
         "pilot_cap_usd": _pilot_cap(store) if runtime.config.mode == "production" else None,
+        "pilot_skip_validation": _pilot_skip_validation(store) if runtime.config.mode == "production" else False,
+        "production_capital_usd": runtime.config.production_capital(),
         "day": today,
         "violations_avoided": int(today["violations_avoided"]) if today else 0,
         "net_pnl": float(today["net_pnl"]) if today else 0.0,
@@ -874,6 +883,11 @@ def _pilot_cap(store: Store) -> float | None:
     return float(value) if value is not None else None
 
 
+def _pilot_skip_validation(store: Store) -> bool:
+    """Whether the production pilot operates without a stored validation, from the production store."""
+    return bool(store.get_state(PILOT_SKIP_VALIDATION_STATE))
+
+
 def _check_pilot(config: BotConfig, store: Store) -> None:
     """Refuse a production config whose capital exceeds the pilot cap. ``store`` is the production store."""
     if config.mode != "production":
@@ -979,7 +993,13 @@ def update_config(body: ConfigUpdate) -> dict[str, Any]:
                 raise HTTPException(status_code=409, detail=f"pares com posição aberta não podem sair da lista: {dropped}")
         reasons: list[str] = []
         pilot: float | None = None
-        if body.mode == "production" and current.mode != "production":
+        skip_validation = False
+        switching = body.mode == "production" and current.mode != "production"
+        if (body.pilot_cap_usd is not None or body.pilot_skip_validation) and not switching:
+            raise HTTPException(status_code=422, detail="o piloto só se define na troca do Spot Testnet para produção")
+        if body.pilot_skip_validation and body.pilot_cap_usd is None:
+            raise HTTPException(status_code=422, detail="operar sem validação exige o capital do piloto")
+        if switching:
             keys = service.check_status("binance-live-trade-bot")
             config, reasons, pilot = switch_to_production(
                 config,
@@ -989,16 +1009,20 @@ def update_config(body: ConfigUpdate) -> dict[str, Any]:
                 open_orders=len(runtime.store.live_positions()),
                 mandate_ok=mandate_is_restricted(),
                 keys_ok=bool(keys.get("ok")),
+                pilot_cap=body.pilot_cap_usd,
             )
             if reasons:
                 # Refused as a whole: nothing in this request is saved, the runtime keeps its config.
                 raise HTTPException(status_code=409, detail={"mode": current.mode, "reasons": reasons})
             # The pilot state goes to the production store before anything else moves: a failure
-            # here refuses the switch instead of leaving production without its cap. A full
-            # promotion clears it.
+            # here refuses the switch instead of leaving production without its cap. Both keys
+            # are written on every switch: a full promotion clears them, and a pilot without
+            # the waiver never inherits one an earlier pilot left in the store.
+            skip_validation = pilot is not None and body.pilot_skip_validation
             production_store = ctx.store_for(config)
             try:
                 production_store.set_state(PILOT_STATE, pilot)
+                production_store.set_state(PILOT_SKIP_VALIDATION_STATE, skip_validation)
             finally:
                 production_store.close()
             config.save()
@@ -1052,7 +1076,16 @@ def update_config(body: ConfigUpdate) -> dict[str, Any]:
         if rules_changed or body.strategies is not None:
             validating = validation._auto_validate(config, rebound.store)
         recorded = _pilot_cap(rebound.store) if config.mode == "production" else None
-        rebound._ledger("config", {"mode": config.mode, "operator": "panel", "reasons": reasons, "pilot_cap_usd": recorded})
+        rebound._ledger(
+            "config",
+            {
+                "mode": config.mode,
+                "operator": "panel",
+                "reasons": reasons,
+                "pilot_cap_usd": recorded,
+                "pilot_skip_validation": _pilot_skip_validation(rebound.store) if config.mode == "production" else False,
+            },
+        )
         return {"status": "ok", "mode": config.mode, "config": json.loads(config.model_dump_json()), "validating": validating}
 
 

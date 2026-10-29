@@ -27,6 +27,7 @@ from bot.decay import pair_demoted, pair_slippage_blocked
 from bot.evaluator import SPOT_TAKER, Opportunity, classify, estimate_win_rate
 from bot.exchange import service
 from bot.indicators import atr_pct_daily, btc_trend_ok
+from bot.promotion import PILOT_SKIP_VALIDATION_STATE
 from bot.risk import (
     RiskManager,
     breakeven_win_rate,
@@ -119,6 +120,7 @@ def _score(
     stats_by_id = {strategy_id: store.strategy(strategy_id) for strategy_id in enabled}
     # Part of the validation's key: a pass under other thresholds is signal-only until re-validated.
     thresholds = live_thresholds(config.score_threshold, config.cost_multiple, config.min_reward_risk, config.exit_policy)
+    unvalidated_ok = pilot_unvalidated(config, store)
     ranked: list[Opportunity] = []
     for symbol in config.symbols:
         if symbol in snapshot.failed:
@@ -159,7 +161,8 @@ def _score(
                 setup = fixed.apply(setup)
             result = timeframe_result(params, setup.timeframe) if keyed else None
             signal_reason = _signal_only_reason(
-                stats, keyed, result, setup.timeframe, symbol, strategy_id, limits, moment, blocks, effects, store=store
+                stats, keyed, result, setup.timeframe, symbol, strategy_id, limits, moment, blocks, effects,
+                store=store, waived=unvalidated_ok,
             )
             # The thresholds classify judges with below: the filtered hit rate counts only when
             # the replay marked its trades with the same ones.
@@ -264,14 +267,25 @@ def _signal_only_reason(
     effects: list[ScoreEffect],
     *,
     store: Store,
+    waived: bool = False,
 ) -> str | None:
     """Why a setup may only signal, or None when it may trade (6.5, 6.12).
 
     The validation must hold for the current rules, the setup's own timeframe must have
     passed, the pair must belong to the validated set, the Monte Carlo drawdown at the
     risk per trade (``mc_p95_dd_r × risk_per_trade_pct``) must be readable and stay under
-    ``max_drawdown_pct``, and the strategy must not be demoted on this pair.
+    ``max_drawdown_pct``, and the strategy must not be demoted on this pair. A production
+    pilot that ``waived`` the validation (``pilot_unvalidated``) skips the backtest evidence
+    only: a missing or stale validation, the timeframe and pair-set checks and the Monte
+    Carlo limit. A strategy row marked ``signal_only`` (a failed validation, or the live
+    decay review's demotion, ``decay.review_strategy``) and the pair demotion still block:
+    the waiver covers the absence of evidence, never evidence against. Its capital is
+    bounded by the pilot cap.
     """
+    if waived:
+        if stats is not None and bool(stats.get("signal_only")):
+            return SIGNAL_ONLY
+        return _pair_block(blocks, symbol, strategy_id, "expectancy", pair_demoted(store, strategy_id, symbol, now=moment), effects)
     if stats is None or bool(stats.get("signal_only")) or not keyed:
         return SIGNAL_ONLY
     if not (result and result.get("passed")):
@@ -359,9 +373,18 @@ def _macro_block(moment: datetime, config: BotConfig) -> str | None:
     return None
 
 
-def _auto_eligible(item: Opportunity, test_auto: bool, config: BotConfig) -> bool:
-    """Whether automatic trading may take a ready row: its hit rate (or the test mode),
-    and a signal that is still worth its price (D21).
+def pilot_unvalidated(config: BotConfig, store: Store) -> bool:
+    """Whether a production pilot operates without a stored validation (``PILOT_SKIP_VALIDATION_STATE``).
+
+    Only the production store ever holds the key, and only the switch writes it; the mode
+    guard keeps a store file copied between environment roots from waiving anything on the testnet.
+    """
+    return config.mode == "production" and bool(store.get_state(PILOT_SKIP_VALIDATION_STATE))
+
+
+def _auto_eligible(item: Opportunity, test_auto: bool, config: BotConfig, *, unvalidated_ok: bool = False) -> bool:
+    """Whether automatic trading may take a ready row: its hit rate (or the test mode, or a
+    pilot without validation while it has no estimate), and a signal that is still worth its price (D21).
 
     A signal younger than ``max_signal_age_seconds`` is always taken. An older one is
     taken only while the price has not left it: at most ``MAX_LATE_DRIFT_R`` above the
@@ -371,7 +394,7 @@ def _auto_eligible(item: Opportunity, test_auto: bool, config: BotConfig) -> boo
     a restart; the risk of a late entry is chasing the price, which this measures. A
     late row the rule skips stays ready for a manual or armed entry and says why.
     """
-    if not ((item.test_only and test_auto) or _clears_floor(item, config)):
+    if not ((item.test_only and test_auto) or _clears_floor(item, config, unvalidated_ok=unvalidated_ok)):
         return False
     limit = config.limits.max_signal_age_seconds
     age = item.signal_age_seconds
@@ -451,7 +474,7 @@ def _advice_allows(item: Opportunity, entry: AdviceState | None, moment: datetim
     return True
 
 
-def _clears_floor(item: Opportunity, config: BotConfig) -> bool:
+def _clears_floor(item: Opportunity, config: BotConfig, *, unvalidated_ok: bool = False) -> bool:
     """Whether a real (non-test) row's estimated hit rate allows an automatic entry.
 
     Swing rows need ``min_win_rate``. Day rows need the break-even of their
@@ -460,9 +483,14 @@ def _clears_floor(item: Opportunity, config: BotConfig) -> bool:
     never let one in. Rows under the operator's fixed take-profit and stop-loss
     need the break-even of that payoff plus ``FIXED_WIN_RATE_MARGIN``: a 3%
     target over a 1.5% stop pays at a hit rate well under the swing floor.
+    A row without an estimate (no validation and fewer live closes than the
+    sample) enters only under a pilot that waived the validation; once the live
+    sample gives an estimate, the floor judges it like any other row.
     """
-    if item.test_only or item.win_rate is None:
+    if item.test_only:
         return False
+    if item.win_rate is None:
+        return unvalidated_ok
     policy = exit_policy_for(item.strategy, config.exit_policy)
     if policy == "day":
         margin = DAY_WIN_RATE_MARGIN

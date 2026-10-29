@@ -565,10 +565,12 @@ class Runtime:
         # best score first, so the whole flow can be exercised without validated strategies.
         test_auto = self.config.test_mode_active
         if self.config.entry_mode == "auto":
+            unvalidated_ok = scoring.pilot_unvalidated(self.config, self.store)
             eligible = [
                 item
                 for item in ready
-                if scoring._auto_eligible(item, test_auto, self.config) and self._advice_allows(item, context, queued)
+                if scoring._auto_eligible(item, test_auto, self.config, unvalidated_ok=unvalidated_ok)
+                and self._advice_allows(item, context, queued)
             ]
             entries = self._allocate(eligible, context)
         else:

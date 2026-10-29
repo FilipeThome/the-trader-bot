@@ -4,10 +4,13 @@ A full promotion needs the testnet history of the last 30 days: 30 days of PnL w
 a positive net, at least ``MIN_LIVE_TRADES`` closed strategy trades with a recorded
 R, a positive mean R, and a Monte Carlo p95 drawdown (in R, times the risk per
 trade) below the drawdown limit. A pilot skips only that history: it needs every
-other check and a production capital at or below
-``pilot_max_production_capital_usd`` from bot.json. The cap of a pilot is recorded
-in the production store at the switch (``PILOT_STATE``) and enforced where the
-mandate is written, so editing bot.json later cannot loosen it.
+other check and a production capital at or below the pilot cap, either
+``pilot_max_production_capital_usd`` from bot.json or the cap the panel sends with
+the switch (``pilot_cap``). The cap of a pilot is recorded in the production store
+at the switch (``PILOT_STATE``) and enforced where the mandate is written, so
+editing bot.json later cannot loosen it. A pilot may also ask to operate its
+strategies without a stored backtest validation (``PILOT_SKIP_VALIDATION_STATE``,
+read by the cycle's signal-only rule); only the switch writes that key.
 
 Both need a testnet without quantitative mandate breaches in the last 30 days, read
 from the testnet's live-action audit ledger (D22). The ledger is only read here.
@@ -26,6 +29,9 @@ from bot.store import Store
 
 #: Production store key holding the capital cap of a pilot; absent or None after a full promotion.
 PILOT_STATE = "pilot_cap_usd"
+#: Production store key: a pilot's enabled strategies trade without a stored backtest validation.
+#: False or absent after a full promotion. Only the switch writes it.
+PILOT_SKIP_VALIDATION_STATE = "pilot_skip_validation"
 HISTORY_DAYS = 30
 #: Closed testnet trades with a recorded R a full promotion needs within ``HISTORY_DAYS``.
 MIN_LIVE_TRADES = 30
@@ -94,11 +100,13 @@ def production_blockers(
     mandate_ok: bool,
     keys_ok: bool,
     now: datetime | None = None,
+    pilot_cap: float | None = None,
 ) -> tuple[list[str], float | None]:
     """Reasons the switch is refused, and the pilot cap when only the history is missing.
 
-    ``store`` is the testnet store. The cap may come back with other reasons; only
-    an empty list makes it a pilot switch.
+    ``store`` is the testnet store. ``pilot_cap`` is the cap the panel sent with the
+    switch; None reads ``pilot_max_production_capital_usd`` from the config. The cap
+    may come back with other reasons; only an empty list makes it a pilot switch.
     """
     moment = _utc(now or datetime.now(timezone.utc))
     reasons: list[str] = []
@@ -126,7 +134,7 @@ def production_blockers(
     history = _history_blockers(store, config.limits, moment)
     if not history:
         return reasons, None
-    cap = config.pilot_max_production_capital_usd
+    cap = config.pilot_max_production_capital_usd if pilot_cap is None else pilot_cap
     capital = config.production_capital()
     if cap > 0 and capital <= cap:
         return reasons, cap

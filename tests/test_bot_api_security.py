@@ -273,6 +273,94 @@ def test_a_refused_production_switch_saves_nothing_from_the_request(api_client) 
     assert status["mode"] == "testnet" and status["allocated_capital_usd"] == 1000.0
 
 
+def _production_ready(monkeypatch) -> None:
+    """Keys, mandate and gates as a switch needs them; the testnet history stays empty."""
+    from bot.api.app import _bind
+    from bot.config import BotConfig
+
+    monkeypatch.setattr("bot.api.app.service.check_status", lambda _name: {"ok": True})
+    monkeypatch.setattr("bot.api.app.mandate_is_restricted", lambda: True)
+    config = BotConfig.load()
+    config.gates = {"g1": True, "g2": True, "g3": True, "g4": True}
+    config.save()
+    with ctx.lock:
+        _bind(config)
+
+
+def test_the_pilot_fields_only_go_with_the_switch_to_production(api_client) -> None:
+    assert api_client.put("/bot/config", json={"pilot_cap_usd": 25}).status_code == 422
+    assert api_client.put("/bot/config", json={"pilot_skip_validation": True}).status_code == 422
+    refused = api_client.put(
+        "/bot/config", json={"mode": "production", "confirmation": "PRODUCAO", "pilot_skip_validation": True}
+    )
+    assert refused.status_code == 422 and "capital do piloto" in refused.json()["detail"]
+    for cap in (0, 50.01):
+        body = {"mode": "production", "confirmation": "PRODUCAO", "pilot_cap_usd": cap}
+        assert api_client.put("/bot/config", json=body).status_code == 422, cap
+    assert api_client.get("/bot/status").json()["mode"] == "testnet"
+
+
+def test_a_pilot_from_the_panel_records_its_cap_and_waiver_in_the_production_store(api_client, monkeypatch) -> None:
+    from bot.promotion import PILOT_SKIP_VALIDATION_STATE, PILOT_STATE
+
+    _production_ready(monkeypatch)
+    # The production capital (10% of the allocated) must fit the cap: 100 of 1000 does not.
+    over = api_client.put("/bot/config", json={"mode": "production", "confirmation": "PRODUCAO", "pilot_cap_usd": 25})
+    assert over.status_code == 409 and any("piloto" in reason for reason in over.json()["detail"]["reasons"])
+    body = {
+        "mode": "production",
+        "confirmation": "PRODUCAO",
+        "allocated_capital_usd": 200,
+        "pilot_cap_usd": 25,
+        "pilot_skip_validation": True,
+    }
+    response = api_client.put("/bot/config", json=body)
+    assert response.status_code == 200, response.json()
+    status = api_client.get("/bot/status").json()
+    assert status["mode"] == "production" and status["pilot_cap_usd"] == 25
+    assert status["pilot_skip_validation"] is True and status["production_capital_usd"] == 20.0
+    assert ctx.runtime.store.get_state(PILOT_STATE) == 25 and ctx.runtime.store.get_state(PILOT_SKIP_VALIDATION_STATE) is True
+    # The cap recorded at the switch still binds the capital.
+    assert api_client.put("/bot/config", json={"allocated_capital_usd": 300}).status_code == 409
+
+    # Back on the testnet nothing of the pilot shows; a new pilot without the waiver clears it.
+    assert api_client.put("/bot/config", json={"mode": "testnet"}).status_code == 200
+    status = api_client.get("/bot/status").json()
+    assert status["pilot_cap_usd"] is None and status["pilot_skip_validation"] is False
+    again = api_client.put("/bot/config", json={"mode": "production", "confirmation": "PRODUCAO", "pilot_cap_usd": 30})
+    assert again.status_code == 200, again.json()
+    status = api_client.get("/bot/status").json()
+    assert status["pilot_cap_usd"] == 30 and status["pilot_skip_validation"] is False
+    assert ctx.runtime.store.get_state(PILOT_SKIP_VALIDATION_STATE) is False
+
+
+def test_a_full_promotion_ignores_the_pilot_fields_and_clears_the_waiver(api_client, monkeypatch) -> None:
+    from datetime import date, datetime, timedelta, timezone
+
+    from bot.promotion import PILOT_SKIP_VALIDATION_STATE, PILOT_STATE
+
+    _production_ready(monkeypatch)
+    store = ctx.runtime.store
+    today = date.today()
+    for back in range(1, 31):
+        store.record_day((today - timedelta(days=back)).isoformat(), net_pnl=1.0, gross_pnl=1.0, fees=0.0)
+    for _ in range(30):
+        position_id = store.open_pending("BTC/USDT", "trend")
+        assert position_id is not None
+        store.update_position(position_id, status="open", qty=1.0, avg_price=100.0, r_multiple=0.5)
+        store.close_position(position_id, exit_price=101.0, realized_pnl=1.0, fees=0.0)
+    assert store.closed_trades(since=(datetime.now(timezone.utc) - timedelta(days=30)).isoformat())
+    body = {"mode": "production", "confirmation": "PRODUCAO", "pilot_cap_usd": 25, "pilot_skip_validation": True}
+    response = api_client.put("/bot/config", json=body)
+    assert response.status_code == 200, response.json()
+    status = api_client.get("/bot/status").json()
+    # 100 of production capital, above the cap sent: the history made it a full promotion, no pilot.
+    assert status["mode"] == "production" and status["pilot_cap_usd"] is None
+    assert status["pilot_skip_validation"] is False
+    assert ctx.runtime.store.get_state(PILOT_STATE) is None
+    assert ctx.runtime.store.get_state(PILOT_SKIP_VALIDATION_STATE) is False
+
+
 def test_infinite_or_nan_numbers_never_reach_the_config(api_client) -> None:
     from pydantic import ValidationError
 
