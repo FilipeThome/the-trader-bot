@@ -73,6 +73,17 @@ def test_a_small_production_capital_skips_only_the_testnet_history(tmp_path) -> 
     assert production_blockers(_config(150, 25), store, **CHECKS) == ([], 25)
 
 
+def test_the_cap_sent_with_the_switch_replaces_the_one_in_bot_json(tmp_path) -> None:
+    store = Store(tmp_path / "bot.sqlite")
+    # bot.json has no pilot; the panel's cap makes the switch a pilot at that cap.
+    assert production_blockers(_config(150, 0), store, pilot_cap=25, **CHECKS) == ([], 25)
+    # The panel's cap also replaces a larger one in bot.json: too small, the history is required.
+    reasons, pilot = production_blockers(_config(150, 50), store, pilot_cap=10, **CHECKS)
+    assert pilot is None
+    assert "são necessários 30 dias de testnet" in reasons
+    assert "piloto: capital de produção de US$ 15.00 acima do limite de US$ 10.00" in reasons
+
+
 def test_a_pilot_above_its_cap_needs_the_30_days(tmp_path) -> None:
     store = Store(tmp_path / "bot.sqlite")
     reasons, pilot = production_blockers(_config(300, 25), store, **CHECKS)

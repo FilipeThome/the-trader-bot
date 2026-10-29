@@ -22,6 +22,10 @@ export function Controls() {
   const busy = useBot((state) => state.busy);
   const [capital, setCapital] = useState("");
   const [confirmation, setConfirmation] = useState("");
+  // Production pilot asked from the panel: its cap, and which gates of the switch it waives.
+  const [pilotCap, setPilotCap] = useState("");
+  const [pilotHistory, setPilotHistory] = useState(false);
+  const [pilotValidation, setPilotValidation] = useState(false);
   const [winRate, setWinRate] = useState("");
   const [tradeRisk, setTradeRisk] = useState("");
   const [openRisk, setOpenRisk] = useState("");
@@ -53,6 +57,13 @@ export function Controls() {
   const stopLossPct = parseDecimal(stopLoss) ?? (stopLoss.trim() === "" && fixedOn ? (status.stop_loss_pct ?? 0) * 100 : null);
   // Same bounds as bot.strategies.fixed: a target under 1% never clears the cost filter.
   const fixedValid = takeProfitPct != null && takeProfitPct >= 1 && takeProfitPct <= 100 && stopLossPct != null && stopLossPct >= 0.5 && stopLossPct <= 50;
+  // Same bounds as the API's pilot_cap_usd; the production capital must fit the cap.
+  const pilotCapValue = parseDecimal(pilotCap);
+  const pilotCapValid = pilotCapValue != null && pilotCapValue > 0 && pilotCapValue <= 50;
+  const productionCapital = status.production_capital_usd ?? status.allocated_capital_usd * 0.1;
+  const pilotFits = pilotCapValid && productionCapital <= (pilotCapValue ?? 0) + 1e-9;
+  const pilotMaxAllocated =
+    pilotCapValid && productionCapital > 0 ? (status.allocated_capital_usd * (pilotCapValue ?? 0)) / productionCapital : null;
   const riskPayload: Record<string, number> = {};
   if (tradeRisk.trim() !== "") riskPayload.risk_per_trade_pct = tradeRiskValue;
   if (openRisk.trim() !== "") riskPayload.max_open_risk_pct = openRiskValue;
@@ -90,7 +101,11 @@ export function Controls() {
           Ambiente atual: <strong>{status.mode === "production" ? "Produção" : "Spot Testnet"}</strong>. Capital em uso{" "}
           {status.capital_usd} de {status.allocated_capital_usd} USD.
           {status.pilot_cap_usd != null && (
-            <strong className="ml-1 text-amber-600"> Produção piloto: capital limitado a US$ {status.pilot_cap_usd}, sem os 30 dias de testnet.</strong>
+            <strong className="ml-1 text-amber-600">
+              {" "}
+              Produção piloto: capital limitado a US$ {status.pilot_cap_usd}, sem os 30 dias de testnet.
+              {status.pilot_skip_validation && " As estratégias ligadas operam sem validação no histórico."}
+            </strong>
           )}
         </span>
         <Help text="Spot Testnet é o ensaio, sem a conta real. Produção usa dinheiro de verdade e, nessa hora, o robô arrisca só 10% do capital que você alocou. Capital em uso é o que entra na conta do tamanho de cada ordem." />
@@ -508,8 +523,49 @@ export function Controls() {
       <div className="rounded border border-neutral-300 p-3 dark:border-neutral-700">
         <p className="mb-2 flex items-center font-medium">
           Switch de ambiente
-          <Help text="Troca o ensaio pela conta real, ou volta ao ensaio. Ir para produção exige o robô parado, sem posição aberta, chaves válidas, mandato só de cripto, as quatro liberações gravadas no bot.json e a palavra PRODUCAO escrita igual. Se faltar qualquer coisa, ele permanece no testnet." />
+          <Help text="Troca o ensaio pela conta real, ou volta ao ensaio. Ir para produção exige o robô parado, sem posição aberta, chaves válidas, mandato só de cripto, as quatro liberações gravadas no bot.json, a palavra PRODUCAO escrita igual e 30 dias de testnet com lucro, 30 trades com R e drawdown dentro do limite. O piloto abaixo dispensa só esses 30 dias, com o capital limitado. Se faltar qualquer coisa, ele permanece no testnet." />
         </p>
+        <div className="mb-3 rounded border border-amber-400 p-2">
+          <p className="mb-1 flex items-center font-medium">
+            Piloto com pouco dinheiro
+            <Help text="Para testar a conta real com uma quantia pequena. Dispensa os 30 dias de testnet enquanto o capital de produção (10% do alocado) ficar até o limite informado, de no máximo US$ 50. O limite é gravado na troca e trava o capital: subir o alocado depois é recusado. Chaves, mandato, liberações do bot.json, robô parado, sem posição aberta e sem violação no testnet continuam exigidos. A segunda caixa deixa as estratégias ligadas operarem sem o teste histórico e, até haver amostra, sem estimativa de acerto. Mesmo assim, deixe na conta só o valor do teste." />
+          </p>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={pilotHistory}
+              onChange={(event) => {
+                setPilotHistory(event.target.checked);
+                if (!event.target.checked) setPilotValidation(false);
+              }}
+            />
+            Ignorar o histórico de 30 dias do testnet
+          </label>
+          <label className="mt-1 flex items-center gap-2">
+            <input type="checkbox" disabled={!pilotHistory} checked={pilotValidation} onChange={(event) => setPilotValidation(event.target.checked)} />
+            Ignorar a validação das estratégias (operar sem o teste histórico)
+          </label>
+          <p className="mt-2">
+            <label>
+              Capital do piloto (US$, até 50){" "}
+              <input
+                className="w-24 border bg-transparent px-2 py-1"
+                value={pilotCap}
+                onChange={(event) => setPilotCap(event.target.value)}
+                disabled={!pilotHistory}
+                inputMode="decimal"
+                aria-label="Capital do piloto"
+              />
+            </label>
+          </p>
+          <p className="mt-1 text-xs text-neutral-500">
+            Capital de produção hoje: {usd(productionCapital)}, de {usd(status.allocated_capital_usd)} alocados.
+            {pilotHistory && pilotCapValid && !pilotFits && pilotMaxAllocated != null && (
+              <span className="ml-1 text-red-600">Acima do limite: reduza o capital alocado para até {usd(pilotMaxAllocated)}.</span>
+            )}
+            {pilotHistory && pilotCap.trim() !== "" && !pilotCapValid && <span className="ml-1 text-red-600">Informe um valor acima de 0 e até 50.</span>}
+          </p>
+        </div>
         <input
           className="mb-2 block w-full border bg-transparent px-2 py-1"
           placeholder="digite PRODUCAO para promover"
@@ -519,10 +575,29 @@ export function Controls() {
         />
         <p className="flex flex-wrap items-center gap-3">
           <span className="inline-flex items-center">
-            <button className="underline" type="button" onClick={() => void run("Ir para Produção", () => api.updateConfig({ mode: "production", confirmation }))}>
+            <button
+              className="underline disabled:no-underline disabled:opacity-50"
+              type="button"
+              disabled={pilotHistory && !pilotFits}
+              onClick={() => {
+                const payload: Record<string, unknown> = { mode: "production", confirmation };
+                if (pilotHistory) {
+                  payload.pilot_cap_usd = pilotCapValue;
+                  payload.pilot_skip_validation = pilotValidation;
+                  const text =
+                    `Ir para produção como piloto, com dinheiro real?\n\nCapital de produção limitado a ${usd(pilotCapValue ?? 0)}, sem os 30 dias de testnet.` +
+                    (pilotValidation
+                      ? "\nAs estratégias ligadas vão operar SEM validação no histórico e, até haver amostra, sem estimativa de acerto."
+                      : "") +
+                    "\n\nDeixe na conta só o valor do teste.";
+                  if (!window.confirm(text)) return;
+                }
+                void run("Ir para Produção", () => api.updateConfig(payload));
+              }}
+            >
               Ir para Produção
             </button>
-            <Help text="Pede a troca para a conta real. Sem a palavra PRODUCAO e sem as liberações, a tela mostra o motivo e continua no Spot Testnet." />
+            <Help text="Pede a troca para a conta real. Sem a palavra PRODUCAO e sem as liberações, a tela mostra o motivo e continua no Spot Testnet. Com o piloto marcado, pede confirmação e envia o limite de capital." />
           </span>
           <span className="inline-flex items-center">
             <button className="underline" type="button" onClick={() => void run("Voltar para Spot Testnet", () => api.updateConfig({ mode: "testnet" }))}>

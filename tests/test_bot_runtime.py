@@ -1077,3 +1077,48 @@ def test_a_pass_under_other_thresholds_is_signal_only_until_revalidated(tmp_path
     runtime.store.save_strategy({"strategy_id": "trend", "signal_only": False, "params": {**stale, "thresholds": current}})
     runtime.tick()
     assert runtime.store.opportunities()[0]["status"] == "pronta" and "act:1" in executor.events
+
+
+def _pilot_cycle(tmp_path, monkeypatch, mode: str, waived: bool) -> tuple[Runtime, FakeExecutor]:
+    """An automatic cycle with no validation stored, under the pilot waiver or not."""
+    from bot.promotion import PILOT_SKIP_VALIDATION_STATE
+
+    runtime, _collector, executor = _runtime(tmp_path, monkeypatch, mode=mode, entry_mode="auto")
+    monkeypatch.setattr("bot.cycle.scoring._setup", _setup)
+    runtime.store.set_state("running", True)
+    runtime.store.set_state(PILOT_SKIP_VALIDATION_STATE, waived)
+    return runtime, executor
+
+
+def test_a_production_pilot_without_validation_trades_its_enabled_strategies(tmp_path, monkeypatch) -> None:
+    runtime, executor = _pilot_cycle(tmp_path, monkeypatch, "production", waived=True)
+    runtime.tick()
+    row = runtime.store.opportunities()[0]
+    # No validation and no live sample: no hit-rate estimate, yet the pilot enters.
+    assert row["status"] == "pronta" and row["win_rate"] is None
+    assert "act:1" in executor.events
+
+
+def test_without_the_waiver_an_unvalidated_strategy_stays_signal_only(tmp_path, monkeypatch) -> None:
+    runtime, executor = _pilot_cycle(tmp_path, monkeypatch, "production", waived=False)
+    runtime.tick()
+    row = runtime.store.opportunities()[0]
+    assert row["status"] == "bloqueada" and "somente sinal" in row["reason"]
+    assert "act:0" in executor.events
+
+
+def test_the_waiver_key_in_a_testnet_store_waives_nothing(tmp_path, monkeypatch) -> None:
+    runtime, executor = _pilot_cycle(tmp_path, monkeypatch, "testnet", waived=True)
+    runtime.tick()
+    row = runtime.store.opportunities()[0]
+    assert row["status"] == "bloqueada" and "somente sinal" in row["reason"]
+    assert "act:0" in executor.events
+
+
+def test_the_pilot_waiver_keeps_the_demotion_of_a_pair(tmp_path, monkeypatch) -> None:
+    runtime, executor = _pilot_cycle(tmp_path, monkeypatch, "production", waived=True)
+    monkeypatch.setattr("bot.cycle.scoring.pair_demoted", lambda store, strategy, symbol, now: "rebaixada no par")
+    runtime.tick()
+    row = runtime.store.opportunities()[0]
+    assert row["status"] == "bloqueada" and "rebaixada" in row["reason"]
+    assert "act:0" in executor.events

@@ -328,6 +328,11 @@ function Validation({ status }: { status: Status | null }) {
         <Help text="O teste que libera cada estratégia, por tempo gráfico. Aprova com: pelo menos 30 trades fora do hold-out, Sharpe acima de 1, queda menor que 20%, 3 de 4 janelas do walk-forward no lucro com eficiência (WFE) de pelo menos 0,5, hold-out final com pelo menos 5 trades, lucro e ganho por dia de pelo menos metade do da amostra, e Sharpe deflacionado (DSR) de pelo menos 0,95. O DSR desconta quantas combinações foram testadas desde a última aprovação: quanto mais tentativas, mais exigente. O teste aplica os limites da carteira (posições, pausa do par, trava de perdas) com que rodou; mudar um limite não pede validar de novo. Só o tempo gráfico aprovado opera." />
       </p>
       <p className="mb-3 text-neutral-500">PBO não calculado: sem otimização de parâmetros.</p>
+      {status?.pilot_skip_validation && (
+        <p className="mb-3 text-amber-600">
+          Produção piloto sem validação: as estratégias ligadas operam sem este teste. O limite de capital do piloto é a proteção.
+        </p>
+      )}
       {ids.length === 0 && <p className="text-neutral-500">Nenhuma validação registrada neste ambiente.</p>}
       {ids.map((id) => (
         <StrategyValidation

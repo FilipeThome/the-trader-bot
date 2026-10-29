@@ -371,6 +371,10 @@ export type Status = {
   day_win_rate_margin?: number;
   /** Production pilot: the capital cap recorded at the switch; null outside a pilot. */
   pilot_cap_usd?: number | null;
+  /** Production pilot: its enabled strategies trade without a stored validation. False outside a pilot. */
+  pilot_skip_validation?: boolean;
+  /** What production trades with: production_capital_fraction of the allocated capital. */
+  production_capital_usd?: number;
   halted: boolean;
   halt_reason?: string | null;
   journal?: { blocked: boolean; error: string | null; blocking: { state_key: string; event: string }[] };

@@ -257,8 +257,9 @@ class BotConfig(BaseModel):
     tick_seconds: int = 60
     production_capital_fraction: float = Field(default=0.10, gt=0, le=1)
     #: A production pilot without 30 days of testnet history is allowed while the production
-    #: capital stays at or below this (0 = no pilot). Like the gates, only a hand edit of
-    #: bot.json sets it; once in production the cap recorded at the switch is the one enforced.
+    #: capital stays at or below this (0 = no pilot). A hand edit of bot.json sets it, or the
+    #: panel sends a cap with the switch (``pilot_cap_usd``, same bounds); once in production
+    #: the cap recorded at the switch is the one enforced.
     pilot_max_production_capital_usd: float = Field(default=0.0, ge=0, le=50)
     #: Operator attestations, edited in bot.json only. The API never writes them.
     gates: dict[str, bool] = Field(
