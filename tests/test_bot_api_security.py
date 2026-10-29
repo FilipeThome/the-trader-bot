@@ -334,6 +334,33 @@ def test_a_pilot_from_the_panel_records_its_cap_and_waiver_in_the_production_sto
     assert ctx.runtime.store.get_state(PILOT_SKIP_VALIDATION_STATE) is False
 
 
+def test_a_full_promotion_ignores_the_pilot_fields_and_clears_the_waiver(api_client, monkeypatch) -> None:
+    from datetime import date, datetime, timedelta, timezone
+
+    from bot.promotion import PILOT_SKIP_VALIDATION_STATE, PILOT_STATE
+
+    _production_ready(monkeypatch)
+    store = ctx.runtime.store
+    today = date.today()
+    for back in range(1, 31):
+        store.record_day((today - timedelta(days=back)).isoformat(), net_pnl=1.0, gross_pnl=1.0, fees=0.0)
+    for _ in range(30):
+        position_id = store.open_pending("BTC/USDT", "trend")
+        assert position_id is not None
+        store.update_position(position_id, status="open", qty=1.0, avg_price=100.0, r_multiple=0.5)
+        store.close_position(position_id, exit_price=101.0, realized_pnl=1.0, fees=0.0)
+    assert store.closed_trades(since=(datetime.now(timezone.utc) - timedelta(days=30)).isoformat())
+    body = {"mode": "production", "confirmation": "PRODUCAO", "pilot_cap_usd": 25, "pilot_skip_validation": True}
+    response = api_client.put("/bot/config", json=body)
+    assert response.status_code == 200, response.json()
+    status = api_client.get("/bot/status").json()
+    # 100 of production capital, above the cap sent: the history made it a full promotion, no pilot.
+    assert status["mode"] == "production" and status["pilot_cap_usd"] is None
+    assert status["pilot_skip_validation"] is False
+    assert ctx.runtime.store.get_state(PILOT_STATE) is None
+    assert ctx.runtime.store.get_state(PILOT_SKIP_VALIDATION_STATE) is False
+
+
 def test_infinite_or_nan_numbers_never_reach_the_config(api_client) -> None:
     from pydantic import ValidationError
 

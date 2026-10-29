@@ -275,10 +275,16 @@ def _signal_only_reason(
     passed, the pair must belong to the validated set, the Monte Carlo drawdown at the
     risk per trade (``mc_p95_dd_r × risk_per_trade_pct``) must be readable and stay under
     ``max_drawdown_pct``, and the strategy must not be demoted on this pair. A production
-    pilot that ``waived`` the validation (``pilot_unvalidated``) skips every check but the
-    demotion: its capital is bounded by the pilot cap.
+    pilot that ``waived`` the validation (``pilot_unvalidated``) skips the backtest evidence
+    only: a missing or stale validation, the timeframe and pair-set checks and the Monte
+    Carlo limit. A strategy row marked ``signal_only`` (a failed validation, or the live
+    decay review's demotion, ``decay.review_strategy``) and the pair demotion still block:
+    the waiver covers the absence of evidence, never evidence against. Its capital is
+    bounded by the pilot cap.
     """
     if waived:
+        if stats is not None and bool(stats.get("signal_only")):
+            return SIGNAL_ONLY
         return _pair_block(blocks, symbol, strategy_id, "expectancy", pair_demoted(store, strategy_id, symbol, now=moment), effects)
     if stats is None or bool(stats.get("signal_only")) or not keyed:
         return SIGNAL_ONLY

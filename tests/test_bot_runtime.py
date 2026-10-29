@@ -1122,3 +1122,30 @@ def test_the_pilot_waiver_keeps_the_demotion_of_a_pair(tmp_path, monkeypatch) ->
     row = runtime.store.opportunities()[0]
     assert row["status"] == "bloqueada" and "rebaixada" in row["reason"]
     assert "act:0" in executor.events
+
+
+def test_the_pilot_waiver_keeps_a_strategy_demoted_or_failed(tmp_path, monkeypatch) -> None:
+    runtime, executor = _pilot_cycle(tmp_path, monkeypatch, "production", waived=True)
+    # What decay.review_strategy writes on live losses, and what a failed validation leaves.
+    runtime.store.save_strategy({"strategy_id": "trend", "signal_only": True, "params": {"demoted": True}})
+    runtime.tick()
+    row = runtime.store.opportunities()[0]
+    assert row["status"] == "bloqueada" and "somente sinal" in row["reason"]
+    assert "act:0" in executor.events
+
+
+def test_the_pilot_waiver_still_applies_the_hit_rate_floor_once_a_live_sample_exists(tmp_path, monkeypatch) -> None:
+    from bot.strategies import exit_policy_for
+
+    runtime, executor = _pilot_cycle(tmp_path, monkeypatch, "production", waived=True)
+    policy = exit_policy_for("trend", runtime.config.exit_policy)
+    # A live sample at min_win_rate_sample, mostly lost: an estimate exists and is under the floor.
+    for index in range(runtime.config.min_win_rate_sample):
+        position_id = runtime.store.open_pending("BTC/USDT", "trend", exit_policy=policy)
+        assert position_id is not None
+        runtime.store.update_position(position_id, status="open", qty=1.0, avg_price=100.0)
+        runtime.store.close_position(position_id, exit_price=99.0, realized_pnl=1.0 if index < 2 else -1.0, fees=0.0)
+    runtime.tick()
+    row = runtime.store.opportunities()[0]
+    assert row["win_rate"] is not None and row["win_rate"] < runtime.config.min_win_rate
+    assert "act:0" in executor.events
