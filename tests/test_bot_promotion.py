@@ -30,6 +30,28 @@ def _config(allocated: float, cap: float) -> BotConfig:
     return BotConfig(allocated_capital_usd=allocated, pilot_max_production_capital_usd=cap, gates=GATES)
 
 
+def test_skip_gates_waives_only_the_gates_and_only_for_a_pilot(tmp_path) -> None:
+    store = Store(tmp_path / "bot.sqlite")
+    config = _config(150, 0)
+    config.gates = {"g1": False, "g2": True, "g3": False, "g4": True}
+    gates = ["gate G1 não aprovado", "gate G3 não aprovado"]
+    # Without the waiver the gates stay with the pilot's cap.
+    reasons, pilot = production_blockers(config, store, pilot_cap=25, **CHECKS)
+    assert reasons == gates and pilot == 25
+    # With it, the pilot goes through; the stopped bot is still required.
+    assert production_blockers(config, store, pilot_cap=25, skip_gates=True, **CHECKS) == ([], 25)
+    reasons, _ = production_blockers(config, store, pilot_cap=25, skip_gates=True, **{**CHECKS, "bot_stopped": False})
+    assert reasons == ["bot precisa estar parado"]
+    # Over the cap it is no pilot, so the gates come back with the history.
+    reasons, pilot = production_blockers(config, store, pilot_cap=10, skip_gates=True, **CHECKS)
+    assert pilot is None and all(gate in reasons for gate in gates)
+    # A full promotion never waives them.
+    _good_days(store)
+    _trades(store, [1.0] * 40)
+    reasons, pilot = production_blockers(config, store, pilot_cap=25, skip_gates=True, **CHECKS)
+    assert reasons == gates and pilot is None
+
+
 def _good_days(store: Store) -> None:
     for day in range(1, 31):
         store.record_day(f"2026-09-{day:02d}", net_pnl=1.0, gross_pnl=1.0, fees=0.0)

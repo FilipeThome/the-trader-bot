@@ -26,6 +26,7 @@ export function Controls() {
   const [pilotCap, setPilotCap] = useState("");
   const [pilotHistory, setPilotHistory] = useState(false);
   const [pilotValidation, setPilotValidation] = useState(false);
+  const [pilotGates, setPilotGates] = useState(false);
   const [winRate, setWinRate] = useState("");
   const [tradeRisk, setTradeRisk] = useState("");
   const [openRisk, setOpenRisk] = useState("");
@@ -105,6 +106,7 @@ export function Controls() {
               {" "}
               Produção piloto: capital limitado a US$ {status.pilot_cap_usd}, sem os 30 dias de testnet.
               {status.pilot_skip_validation && " As estratégias ligadas operam sem validação no histórico."}
+              {status.pilot_skip_gates && " Trocado sem as liberações G1 a G4."}
             </strong>
           )}
         </span>
@@ -528,7 +530,7 @@ export function Controls() {
         <div className="mb-3 rounded border border-amber-400 p-2">
           <p className="mb-1 flex items-center font-medium">
             Piloto com pouco dinheiro
-            <Help text="Para testar a conta real com uma quantia pequena. Dispensa os 30 dias de testnet enquanto o capital de produção (10% do alocado) ficar até o limite informado, de no máximo US$ 50. O limite é gravado na troca e trava o capital: subir o alocado depois é recusado. Chaves, mandato, liberações do bot.json, robô parado, sem posição aberta e sem violação no testnet continuam exigidos. A segunda caixa deixa as estratégias ligadas operarem sem o teste histórico e, até haver amostra, sem estimativa de acerto. Mesmo assim, deixe na conta só o valor do teste." />
+            <Help text="Para testar a conta real com uma quantia pequena. Dispensa os 30 dias de testnet enquanto o capital de produção (10% do alocado) ficar até o limite informado, de no máximo US$ 50. O limite é gravado na troca e trava o capital: subir o alocado depois é recusado. Chaves, mandato, robô parado, sem posição aberta, a palavra PRODUCAO e sem violação no testnet continuam exigidos. A segunda caixa deixa as estratégias ligadas operarem sem o teste histórico e, até haver amostra, sem estimativa de acerto. A terceira dispensa as quatro liberações G1 a G4 do bot.json só nesta troca. Mesmo assim, deixe na conta só o valor do teste." />
           </p>
           <label className="flex items-center gap-2">
             <input
@@ -536,7 +538,10 @@ export function Controls() {
               checked={pilotHistory}
               onChange={(event) => {
                 setPilotHistory(event.target.checked);
-                if (!event.target.checked) setPilotValidation(false);
+                if (!event.target.checked) {
+                  setPilotValidation(false);
+                  setPilotGates(false);
+                }
               }}
             />
             Ignorar o histórico de 30 dias do testnet
@@ -544,6 +549,10 @@ export function Controls() {
           <label className="mt-1 flex items-center gap-2">
             <input type="checkbox" disabled={!pilotHistory} checked={pilotValidation} onChange={(event) => setPilotValidation(event.target.checked)} />
             Ignorar a validação das estratégias (operar sem o teste histórico)
+          </label>
+          <label className="mt-1 flex items-center gap-2">
+            <input type="checkbox" disabled={!pilotHistory} checked={pilotGates} onChange={(event) => setPilotGates(event.target.checked)} />
+            Ignorar as liberações G1 a G4 do bot.json (robô parado continua exigido)
           </label>
           <p className="mt-2">
             <label>
@@ -584,11 +593,13 @@ export function Controls() {
                 if (pilotHistory) {
                   payload.pilot_cap_usd = pilotCapValue;
                   payload.pilot_skip_validation = pilotValidation;
+                  payload.pilot_skip_gates = pilotGates;
                   const text =
                     `Ir para produção como piloto, com dinheiro real?\n\nCapital de produção limitado a ${usd(pilotCapValue ?? 0)}, sem os 30 dias de testnet.` +
                     (pilotValidation
                       ? "\nAs estratégias ligadas vão operar SEM validação no histórico e, até haver amostra, sem estimativa de acerto."
                       : "") +
+                    (pilotGates ? "\nA troca dispensa as liberações G1 a G4 do bot.json." : "") +
                     "\n\nDeixe na conta só o valor do teste.";
                   if (!window.confirm(text)) return;
                 }
