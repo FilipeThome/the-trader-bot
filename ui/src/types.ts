@@ -373,6 +373,8 @@ export type Status = {
   pilot_cap_usd?: number | null;
   /** Production pilot: its enabled strategies trade without a stored validation. False outside a pilot. */
   pilot_skip_validation?: boolean;
+  /** Production pilot: switched without the operator gates G1-G4 of bot.json. False outside a pilot. */
+  pilot_skip_gates?: boolean;
   /** What production trades with: production_capital_fraction of the allocated capital. */
   production_capital_usd?: number;
   halted: boolean;

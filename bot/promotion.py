@@ -32,6 +32,9 @@ PILOT_STATE = "pilot_cap_usd"
 #: Production store key: a pilot's enabled strategies trade without a stored backtest validation.
 #: False or absent after a full promotion. Only the switch writes it.
 PILOT_SKIP_VALIDATION_STATE = "pilot_skip_validation"
+#: Production store key: the pilot was switched without the operator gates G1-G4 of bot.json.
+#: False or absent after a full promotion. Only the switch writes it.
+PILOT_SKIP_GATES_STATE = "pilot_skip_gates"
 HISTORY_DAYS = 30
 #: Closed testnet trades with a recorded R a full promotion needs within ``HISTORY_DAYS``.
 MIN_LIVE_TRADES = 30
@@ -101,12 +104,16 @@ def production_blockers(
     keys_ok: bool,
     now: datetime | None = None,
     pilot_cap: float | None = None,
+    skip_gates: bool = False,
 ) -> tuple[list[str], float | None]:
     """Reasons the switch is refused, and the pilot cap when only the history is missing.
 
     ``store`` is the testnet store. ``pilot_cap`` is the cap the panel sent with the
     switch; None reads ``pilot_max_production_capital_usd`` from the config. The cap
     may come back with other reasons; only an empty list makes it a pilot switch.
+    ``skip_gates`` waives the operator gates G1-G4, and only for a pilot: a full
+    promotion still needs them, and the stopped bot, open orders, keys, mandate, the
+    confirmation word and the testnet audit are never waived.
     """
     moment = _utc(now or datetime.now(timezone.utc))
     reasons: list[str] = []
@@ -118,9 +125,7 @@ def production_blockers(
         reasons.append("chaves de produção ausentes ou recusadas por check_status")
     if not mandate_ok:
         reasons.append("mandato inválido ou instrumentos não restritos")
-    for gate in ("g1", "g2", "g3", "g4"):
-        if not config.gates.get(gate):
-            reasons.append(f"gate {gate.upper()} não aprovado")
+    gates = [f"gate {gate.upper()} não aprovado" for gate in ("g1", "g2", "g3", "g4") if not config.gates.get(gate)]
     if confirmation != "PRODUCAO":
         reasons.append("confirmação deve ser a palavra PRODUCAO")
     # Applies to a pilot too.
@@ -133,11 +138,12 @@ def production_blockers(
             reasons.append(f"há violações de limite no testnet: {breaches} nos últimos {BREACH_DAYS} dias")
     history = _history_blockers(store, config.limits, moment)
     if not history:
-        return reasons, None
+        return reasons + gates, None
     cap = config.pilot_max_production_capital_usd if pilot_cap is None else pilot_cap
     capital = config.production_capital()
     if cap > 0 and capital <= cap:
-        return reasons, cap
+        return (reasons if skip_gates else reasons + gates), cap
+    reasons.extend(gates)
     reasons.extend(history)
     if cap > 0:
         reasons.append(f"piloto: capital de produção de US$ {capital:.2f} acima do limite de US$ {cap:.2f}")

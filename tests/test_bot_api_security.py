@@ -290,10 +290,10 @@ def _production_ready(monkeypatch) -> None:
 def test_the_pilot_fields_only_go_with_the_switch_to_production(api_client) -> None:
     assert api_client.put("/bot/config", json={"pilot_cap_usd": 25}).status_code == 422
     assert api_client.put("/bot/config", json={"pilot_skip_validation": True}).status_code == 422
-    refused = api_client.put(
-        "/bot/config", json={"mode": "production", "confirmation": "PRODUCAO", "pilot_skip_validation": True}
-    )
-    assert refused.status_code == 422 and "capital do piloto" in refused.json()["detail"]
+    assert api_client.put("/bot/config", json={"pilot_skip_gates": True}).status_code == 422
+    for waiver in ("pilot_skip_validation", "pilot_skip_gates"):
+        refused = api_client.put("/bot/config", json={"mode": "production", "confirmation": "PRODUCAO", waiver: True})
+        assert refused.status_code == 422 and "capital do piloto" in refused.json()["detail"], waiver
     for cap in (0, 50.01):
         body = {"mode": "production", "confirmation": "PRODUCAO", "pilot_cap_usd": cap}
         assert api_client.put("/bot/config", json=body).status_code == 422, cap
@@ -332,6 +332,37 @@ def test_a_pilot_from_the_panel_records_its_cap_and_waiver_in_the_production_sto
     status = api_client.get("/bot/status").json()
     assert status["pilot_cap_usd"] == 30 and status["pilot_skip_validation"] is False
     assert ctx.runtime.store.get_state(PILOT_SKIP_VALIDATION_STATE) is False
+
+
+def test_a_pilot_from_the_panel_can_waive_the_gates_but_not_the_stopped_bot(api_client, monkeypatch) -> None:
+    from bot.promotion import PILOT_SKIP_GATES_STATE
+
+    _production_ready(monkeypatch)
+    config = ctx.runtime.config
+    config.gates = {"g1": False, "g2": False, "g3": False, "g4": False}
+    config.save()
+    body = {"mode": "production", "confirmation": "PRODUCAO", "allocated_capital_usd": 200, "pilot_cap_usd": 25}
+    refused = api_client.put("/bot/config", json=body)
+    assert refused.status_code == 409 and "gate G1 não aprovado" in refused.json()["detail"]["reasons"]
+    assert api_client.get("/bot/status").json()["mode"] == "testnet"
+    body["pilot_skip_gates"] = True
+    ctx.runtime.store.set_state("running", True)
+    refused = api_client.put("/bot/config", json=body)
+    assert refused.status_code == 409 and refused.json()["detail"]["reasons"] == ["bot precisa estar parado"]
+    ctx.runtime.store.set_state("running", False)
+    response = api_client.put("/bot/config", json=body)
+    assert response.status_code == 200, response.json()
+    status = api_client.get("/bot/status").json()
+    assert status["mode"] == "production" and status["pilot_cap_usd"] == 25 and status["pilot_skip_gates"] is True
+    assert ctx.runtime.store.get_state(PILOT_SKIP_GATES_STATE) is True
+    # The gates were not written: the API never touches them.
+    assert status["gates"] == {"g1": False, "g2": False, "g3": False, "g4": False}
+    # A later pilot without the waiver clears the mark.
+    assert api_client.put("/bot/config", json={"mode": "testnet"}).status_code == 200
+    _production_ready(monkeypatch)  # rebinds with the four gates approved
+    again = api_client.put("/bot/config", json={"mode": "production", "confirmation": "PRODUCAO", "pilot_cap_usd": 30})
+    assert again.status_code == 200, again.json()
+    assert api_client.get("/bot/status").json()["pilot_skip_gates"] is False
 
 
 def test_a_full_promotion_ignores_the_pilot_fields_and_clears_the_waiver(api_client, monkeypatch) -> None:

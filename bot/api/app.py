@@ -39,7 +39,7 @@ from bot.strategies.day import DAY_WIN_RATE_MARGIN
 from bot.strategies.trailing import TRAIL
 from bot.markets import CHART_LEAD, chart_interval, merge_symbols, top_liquid_usdt, tradable_symbols, venue_klines, venue_symbols
 from bot.paths import pin_mode_root
-from bot.promotion import PILOT_SKIP_VALIDATION_STATE, PILOT_STATE, switch_to_production
+from bot.promotion import PILOT_SKIP_GATES_STATE, PILOT_SKIP_VALIDATION_STATE, PILOT_STATE, switch_to_production
 from bot.recommend import recommendations
 from bot.reports import build_daily_report, verify_ledger
 from bot.runtime import Runtime, mode_root, profile_for
@@ -139,10 +139,12 @@ class ConfigUpdate(BaseModel):
     #: A production pilot asked from the panel, only with a testnet → production switch (422
     #: otherwise): the capital cap recorded at the switch (same bounds as bot.json's
     #: ``pilot_max_production_capital_usd``), and whether its strategies operate without a
-    #: stored backtest validation. The second needs the first. Both are ignored when the
-    #: testnet history makes the switch a full promotion.
+    #: stored backtest validation, and whether the switch waives the operator gates G1-G4 of
+    #: bot.json. The waivers need the cap. All are ignored when the testnet history makes the
+    #: switch a full promotion.
     pilot_cap_usd: float | None = Field(default=None, gt=0, le=50)
     pilot_skip_validation: bool = False
+    pilot_skip_gates: bool = False
 
 
 class ArmEntry(BaseModel):
@@ -311,6 +313,7 @@ def status() -> dict[str, Any]:
         "gates": runtime.config.gates,
         "pilot_cap_usd": _pilot_cap(store) if runtime.config.mode == "production" else None,
         "pilot_skip_validation": _pilot_skip_validation(store) if runtime.config.mode == "production" else False,
+        "pilot_skip_gates": _pilot_skip_gates(store) if runtime.config.mode == "production" else False,
         "production_capital_usd": runtime.config.production_capital(),
         "day": today,
         "violations_avoided": int(today["violations_avoided"]) if today else 0,
@@ -888,6 +891,11 @@ def _pilot_skip_validation(store: Store) -> bool:
     return bool(store.get_state(PILOT_SKIP_VALIDATION_STATE))
 
 
+def _pilot_skip_gates(store: Store) -> bool:
+    """Whether the production pilot was switched without the gates G1-G4, from the production store."""
+    return bool(store.get_state(PILOT_SKIP_GATES_STATE))
+
+
 def _check_pilot(config: BotConfig, store: Store) -> None:
     """Refuse a production config whose capital exceeds the pilot cap. ``store`` is the production store."""
     if config.mode != "production":
@@ -995,10 +1003,11 @@ def update_config(body: ConfigUpdate) -> dict[str, Any]:
         pilot: float | None = None
         skip_validation = False
         switching = body.mode == "production" and current.mode != "production"
-        if (body.pilot_cap_usd is not None or body.pilot_skip_validation) and not switching:
+        waivers = body.pilot_skip_validation or body.pilot_skip_gates
+        if (body.pilot_cap_usd is not None or waivers) and not switching:
             raise HTTPException(status_code=422, detail="o piloto só se define na troca do Spot Testnet para produção")
-        if body.pilot_skip_validation and body.pilot_cap_usd is None:
-            raise HTTPException(status_code=422, detail="operar sem validação exige o capital do piloto")
+        if waivers and body.pilot_cap_usd is None:
+            raise HTTPException(status_code=422, detail="dispensar a validação ou as liberações exige o capital do piloto")
         if switching:
             keys = service.check_status("binance-live-trade-bot")
             config, reasons, pilot = switch_to_production(
@@ -1010,6 +1019,7 @@ def update_config(body: ConfigUpdate) -> dict[str, Any]:
                 mandate_ok=mandate_is_restricted(),
                 keys_ok=bool(keys.get("ok")),
                 pilot_cap=body.pilot_cap_usd,
+                skip_gates=body.pilot_skip_gates,
             )
             if reasons:
                 # Refused as a whole: nothing in this request is saved, the runtime keeps its config.
@@ -1019,10 +1029,12 @@ def update_config(body: ConfigUpdate) -> dict[str, Any]:
             # are written on every switch: a full promotion clears them, and a pilot without
             # the waiver never inherits one an earlier pilot left in the store.
             skip_validation = pilot is not None and body.pilot_skip_validation
+            skip_gates = pilot is not None and body.pilot_skip_gates
             production_store = ctx.store_for(config)
             try:
                 production_store.set_state(PILOT_STATE, pilot)
                 production_store.set_state(PILOT_SKIP_VALIDATION_STATE, skip_validation)
+                production_store.set_state(PILOT_SKIP_GATES_STATE, skip_gates)
             finally:
                 production_store.close()
             config.save()
@@ -1084,6 +1096,7 @@ def update_config(body: ConfigUpdate) -> dict[str, Any]:
                 "reasons": reasons,
                 "pilot_cap_usd": recorded,
                 "pilot_skip_validation": _pilot_skip_validation(rebound.store) if config.mode == "production" else False,
+                "pilot_skip_gates": _pilot_skip_gates(rebound.store) if config.mode == "production" else False,
             },
         )
         return {"status": "ok", "mode": config.mode, "config": json.loads(config.model_dump_json()), "validating": validating}
