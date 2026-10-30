@@ -530,7 +530,7 @@ export function Controls() {
         <div className="mb-3 rounded border border-amber-400 p-2">
           <p className="mb-1 flex items-center font-medium">
             Piloto com pouco dinheiro
-            <Help text="Para testar a conta real com uma quantia pequena. Dispensa os 30 dias de testnet enquanto o capital de produção (10% do alocado) ficar até o limite informado, de no máximo US$ 50. O limite é gravado na troca e trava o capital: subir o alocado depois é recusado. Chaves, mandato, robô parado, sem posição aberta, a palavra PRODUCAO e sem violação no testnet continuam exigidos. A segunda caixa deixa as estratégias ligadas operarem sem o teste histórico e, até haver amostra, sem estimativa de acerto. A terceira dispensa as quatro liberações G1 a G4 do bot.json só nesta troca. Mesmo assim, deixe na conta só o valor do teste." />
+            <Help text="Para testar a conta real com uma quantia pequena. Dispensa os 30 dias de testnet enquanto o capital de produção (10% do alocado) ficar até o limite informado, de no máximo US$ 50. O limite é gravado na troca e trava o capital: subir o alocado depois é recusado. Chaves, mandato, robô parado, sem posição aberta, a palavra PRODUCAO e sem violação no testnet continuam exigidos. A segunda caixa deixa as estratégias ligadas operarem sem o teste histórico e, até haver amostra, sem estimativa de acerto. A terceira dispensa as quatro liberações G1 a G4 do bot.json só nesta troca, e só se o bot.json tiver pilot_gates_waivable ligado. Mesmo assim, deixe na conta só o valor do teste." />
           </p>
           <label className="flex items-center gap-2">
             <input
@@ -552,7 +552,7 @@ export function Controls() {
           </label>
           <label className="mt-1 flex items-center gap-2">
             <input type="checkbox" disabled={!pilotHistory} checked={pilotGates} onChange={(event) => setPilotGates(event.target.checked)} />
-            Ignorar as liberações G1 a G4 do bot.json (robô parado continua exigido)
+            Ignorar as liberações G1 a G4 (exige pilot_gates_waivable no bot.json; robô parado continua exigido)
           </label>
           <p className="mt-2">
             <label>

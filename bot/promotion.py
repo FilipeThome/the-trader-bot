@@ -111,9 +111,10 @@ def production_blockers(
     ``store`` is the testnet store. ``pilot_cap`` is the cap the panel sent with the
     switch; None reads ``pilot_max_production_capital_usd`` from the config. The cap
     may come back with other reasons; only an empty list makes it a pilot switch.
-    ``skip_gates`` waives the operator gates G1-G4, and only for a pilot: a full
-    promotion still needs them, and the stopped bot, open orders, keys, mandate, the
-    confirmation word and the testnet audit are never waived.
+    ``skip_gates`` waives the operator gates G1-G4, and only for a pilot whose bot.json
+    sets ``pilot_gates_waivable``: a full promotion still needs them, and the stopped
+    bot, open orders, keys, mandate, the confirmation word and the testnet audit are
+    never waived.
     """
     moment = _utc(now or datetime.now(timezone.utc))
     reasons: list[str] = []
@@ -142,7 +143,9 @@ def production_blockers(
     cap = config.pilot_max_production_capital_usd if pilot_cap is None else pilot_cap
     capital = config.production_capital()
     if cap > 0 and capital <= cap:
-        return (reasons if skip_gates else reasons + gates), cap
+        if skip_gates and not config.pilot_gates_waivable:
+            reasons.append("dispensar as liberações G1 a G4 exige pilot_gates_waivable no bot.json")
+        return (reasons if skip_gates and config.pilot_gates_waivable else reasons + gates), cap
     reasons.extend(gates)
     reasons.extend(history)
     if cap > 0:

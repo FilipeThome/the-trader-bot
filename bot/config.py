@@ -261,6 +261,9 @@ class BotConfig(BaseModel):
     #: panel sends a cap with the switch (``pilot_cap_usd``, same bounds); once in production
     #: the cap recorded at the switch is the one enforced.
     pilot_max_production_capital_usd: float = Field(default=0.0, ge=0, le=50)
+    #: Lets the panel's pilot waive the gates G1-G4 (``pilot_skip_gates`` on the switch). Edited in
+    #: bot.json only, like the gates: without it the panel's waiver is refused (409).
+    pilot_gates_waivable: bool = False
     #: Operator attestations, edited in bot.json only. The API never writes them.
     gates: dict[str, bool] = Field(
         default_factory=lambda: {"g1": False, "g2": False, "g3": False, "g4": False}

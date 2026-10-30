@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import threading
 from typing import Any
 
@@ -346,6 +347,11 @@ def test_a_pilot_from_the_panel_can_waive_the_gates_but_not_the_stopped_bot(api_
     assert refused.status_code == 409 and "gate G1 não aprovado" in refused.json()["detail"]["reasons"]
     assert api_client.get("/bot/status").json()["mode"] == "testnet"
     body["pilot_skip_gates"] = True
+    # The panel's waiver needs bot.json's consent.
+    refused = api_client.put("/bot/config", json=body)
+    assert refused.status_code == 409 and any("pilot_gates_waivable" in reason for reason in refused.json()["detail"]["reasons"])
+    config.pilot_gates_waivable = True
+    config.save()
     ctx.runtime.store.set_state("running", True)
     refused = api_client.put("/bot/config", json=body)
     assert refused.status_code == 409 and refused.json()["detail"]["reasons"] == ["bot precisa estar parado"]
@@ -355,6 +361,10 @@ def test_a_pilot_from_the_panel_can_waive_the_gates_but_not_the_stopped_bot(api_
     status = api_client.get("/bot/status").json()
     assert status["mode"] == "production" and status["pilot_cap_usd"] == 25 and status["pilot_skip_gates"] is True
     assert ctx.runtime.store.get_state(PILOT_SKIP_GATES_STATE) is True
+    # The switch is in the production ledger with the waiver.
+    ledger = (ctx.runtime.store.path.parent / "bot-ledger.jsonl").read_text(encoding="utf-8").splitlines()
+    entry = json.loads(ledger[-1])
+    assert entry["kind"] == "config" and entry["mode"] == "production" and entry["pilot_skip_gates"] is True
     # The gates were not written: the API never touches them.
     assert status["gates"] == {"g1": False, "g2": False, "g3": False, "g4": False}
     # A later pilot without the waiver clears the mark.
