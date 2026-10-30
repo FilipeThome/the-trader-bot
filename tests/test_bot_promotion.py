@@ -38,6 +38,10 @@ def test_skip_gates_waives_only_the_gates_and_only_for_a_pilot(tmp_path) -> None
     # Without the waiver the gates stay with the pilot's cap.
     reasons, pilot = production_blockers(config, store, pilot_cap=25, **CHECKS)
     assert reasons == gates and pilot == 25
+    # The waiver needs bot.json's consent: without it the gates stay and the refusal says why.
+    reasons, pilot = production_blockers(config, store, pilot_cap=25, skip_gates=True, **CHECKS)
+    assert reasons == ["dispensar as liberações G1 a G4 exige pilot_gates_waivable no bot.json", *gates] and pilot == 25
+    config.pilot_gates_waivable = True
     # With it, the pilot goes through; the stopped bot is still required.
     assert production_blockers(config, store, pilot_cap=25, skip_gates=True, **CHECKS) == ([], 25)
     reasons, _ = production_blockers(config, store, pilot_cap=25, skip_gates=True, **{**CHECKS, "bot_stopped": False})
