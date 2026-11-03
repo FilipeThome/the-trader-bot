@@ -1,6 +1,6 @@
 # docker compose up -d --build
 #
-# Both services share the operator directory (binance.json, bot.json, api-token and the
+# Both services share the operator directory (binance.json, deepseek.json, bot.json, api-token and the
 # testnet/ and production/ stores), by default ~/.the-trader-bot; set BOT_HOME to use another.
 # Stop any API started outside Docker first: two processes on one directory would both trade.
 # Ports are published on 127.0.0.1 only. The panel's proxy adds the API token, so anyone who
@@ -10,6 +10,9 @@
 # root) and run as its owner, for example
 #   mkdir -p ~/.the-trader-bot && BOT_UID=$(id -u) BOT_GID=$(id -g) docker compose up -d --build
 # Docker Desktop (Windows, macOS) needs neither.
+#
+# The DeepSeek key goes into the shared directory, never into this file or the environment:
+#   docker compose exec api python -m bot.ops advisor-key
 
 services:
   api:
