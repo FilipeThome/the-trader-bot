@@ -1,178 +1,33 @@
-# Bot de trading automático
+# The Trader Bot
 
-Serviço local que analisa pares USDT na Binance e só envia ordem pelo order gate portado do Vibe-Trading. A interface lê o estado e manda pausar, parar ou ajustar limites. Ela não fala com a exchange.
+A local service that analyses USDT pairs on Binance and only sends an order through the order gate ported from Vibe-Trading. The operator panel reads the state and sends pause, stop and limit changes. It never talks to the exchange.
 
-Isto não é recomendação de investimento. Nenhuma estratégia garante lucro. O retorno do painel é líquido de taxa, slippage e funding.
+This is not investment advice. No strategy guarantees a profit. The return shown in the panel is net of fees, slippage and funding.
 
-## O que a v1 faz
+The panel is in Portuguese. This README uses the English term and gives the panel's label in parentheses on first use.
 
-- Spot em BTC, ETH, SOL, BNB e XRP. Futuros USD-M são só leitura: a carrega de funding aparece no painel, com o retorno estimado ao dia, e não executa.
-- Quatro famílias: tendência (1h e 4h), momento (4h), reversão à média (15m e 1h) e carrega de funding (sinal apenas).
-- Testnet por padrão (`binance-paper-trade`). Produção (`binance-live-trade-bot`) só depois dos gates, de 30 dias com PnL líquido positivo e 30 trades com expectativa positiva em R, de um mandato restrito a cripto e da palavra `PRODUCAO`.
-- Nenhuma ordem sem mandato, latch e registro no journal antes do envio. Halt não se desarma sozinho.
-- Toda compra ganha um STOP_LOSS_LIMIT na Binance logo depois da execução, então a posição fica protegida mesmo com o robô desligado. Alvo e saída da estratégia são checados a cada ciclo: o robô cancela o stop e vende com ordens LIMIT IOC.
-- **Entrada LIMIT IOC.** A compra é uma ordem LIMIT IOC 0,2% acima do ask, com a quantidade em moeda base. O que executa abre a posição; o resto é cancelado na hora, e sem execução a linha some. Sem ask, não há compra. Stop e alvo são recalculados sobre o preço médio executado. Cada posição grava o slippage de entrada e de saída, o resultado em R, o MAE e o MFE; Posições mostra o R atual. Robôs DCA e grid continuam comprando a mercado.
-- **Stop atravessado.** Se o último negócio chega ao stop (é o que dispara um STOP_LOSS_LIMIT) e a ordem fica no livro sem executar, com o bid abaixo do limite do stop-limit, o robô cancela o stop e vende com um IOC 0,5% abaixo do bid. Se sobrar moeda, tenta outro IOC 2% abaixo. Se ainda sobrar, entra em halt. Se o stop não sai do livro ou a venda não pode sair (cancelamento sem confirmação, compra parada de um robô sem leitura, ordens do dia esgotadas), o stop continua no livro e o robô tenta de novo no ciclo seguinte; no terceiro ciclo seguido, entra em halt. Só um bloqueio de escrita (halt ativo, mandato inválido) espera sem contar. Não há venda a mercado como último recurso: seria um caminho só de produção, que o Spot Testnet não exercita.
-- Spot não vende a descoberto. Um sinal de venda sem posição aparece como potencial e nunca vira ordem.
-- Stop móvel (ligado por padrão): o stop na Binance sobe com o maior preço, na mesma distância da entrada, e nunca desce. Cada posição grava a regra de saída com que abriu e segue essa regra até fechar, mesmo que a opção mude depois. Uma estratégia validada com outra regra (ou antes desta versão) volta a somente sinal até ser validada de novo. O alvo fixo deixa de fechar a posição; a saída vem do stop ou do sinal da estratégia. O stop só sai do livro quando o novo pode entrar: sem halt, mandato válido, sem pressão de peso da API, com folga abaixo do menor entre o bid e o último preço e com uma ordem do dia reservada para cada posição aberta. A folga é metade da distância do stop móvel, entre 0,5% e 1%: o stop novo não nasce colado no preço, e um `trailing_tp` com distância curta continua subindo. Cada troca de stop mede o tempo sem stop no livro; Desempenho mostra média, p95 e máximo dos últimos 30 dias, por tipo.
-- Modo de entrada:
-  - **Manual** (padrão): o ciclo nunca compra sozinho. Você executa uma oportunidade Pronta pelo painel e o robô cuida do stop e das saídas; o ciclo liga sozinho nessa hora. Compras feitas direto na Binance não são acompanhadas.
-  - **Automático**: o ciclo também compra as oportunidades Prontas cuja **taxa de acerto estimada** da estratégia passa do mínimo (60% por padrão, entre 50% e 95%). A taxa é `(acertos + 1) / (trades + 2)` sobre os trades do teste histórico com a mesma regra de saída e as posições reais fechadas, e só existe com pelo menos 20 trades. É histórico, não probabilidade garantida. Ao trocar para automático o ciclo para e exige Iniciar.
+## Contents
 
-A origem de cada módulo portado está em [ORIGIN.md](ORIGIN.md).
+- [Quick start](#quick-start)
+- [What v1 does](#what-v1-does)
+- [Fixed target and stop](#fixed-target-and-stop)
+- [New coins](#new-coins)
+- [Live trade](#live-trade)
+- [How the bot decides](#how-the-bot-decides)
+- [Day trading](#day-trading)
+- [DCA and grid robots](#dca-and-grid-robots)
+- [DeepSeek advisor](#deepseek-advisor)
+- [Repository layout](#repository-layout)
+- [Operation](#operation)
+- [Environment variables and runtime files](#environment-variables-and-runtime-files)
+- [Performance and concurrency](#performance-and-concurrency)
+- [Docker](#docker)
+- [Tests](#tests)
+- [Execution journal recovery](#execution-journal-recovery)
 
-## Alvo e stop fixos
+## Quick start
 
-Em Controles, **Alvo e stop fixos** recebe o ganho e a perda em porcentagem do preço de entrada (por exemplo, +3% e −1,5%). Ligado, vale para todas as estratégias, day trade incluído, e substitui o stop, o alvo e as saídas de cada uma, o stop móvel e o TP1/equilíbrio/limite de 6 h do day trade.
-
-- **Entrada:** como antes, uma oportunidade Pronta de uma estratégia validada. No automático, a taxa de acerto estimada precisa passar do ponto de equilíbrio da regra, `perda / (perda + ganho líquido)`, mais 3 pontos. Com +3% e −1,5%, isso fica perto de 38%, não nos 60% do swing. O filtro de ganho/risco não vale aqui, porque você escolheu o ganho e a perda; o filtro de custo continua.
-- **Stop:** um STOP_LOSS_LIMIT na Binance à perda escolhida abaixo do **preço médio executado**, não do preço da análise.
-- **Alvo:** o ciclo vende com LIMIT IOC quando o último preço de 15 min chega ao alvo, também calculado sobre o preço médio executado. Não há saída por sinal da estratégia nem limite de tempo.
-- **Score:** o retorno esperado da linha nunca passa do que a própria estratégia estima, então um alvo largo não faz um sinal fraco parecer forte.
-- **Limites:** alvo de 1% a 100% (abaixo de 1% o custo de ida e volta comeria o ganho e nenhuma linha ficaria Pronta), perda de 0,5% a 50%.
-- **Validação:** os valores fazem parte da regra (`fixed:<alvo em pontos-base>:<perda em pontos-base>`). Mudar qualquer um exige validar de novo, e a taxa de acerto só mistura trades da mesma regra. No histórico, o stop dispara pela mínima da vela e vence quando a mesma vela toca os dois; o alvo dispara no **fechamento** da vela, como o ciclo, que vende pelo último preço e não deixa ordem no livro. Toda regra paga 0,03% de slippage por perna. Estratégias day continuam sem entrar entre 03:00 e 07:00 UTC e são julgadas pelo gate day.
-- **Automático de ponta a ponta:** ao mudar o alvo e o stop, ou ao ligar uma estratégia, o robô valida sozinho no histórico, uma estratégia por vez, cada estratégia ligada que ainda não tem resultado para a regra atual. Com o modo de entrada **Automático** e Iniciar, o robô escolhe, compra, protege e vende sem clique, e só opera o que passou no teste.
-- Posições abertas seguem a regra com que abriram.
-
-## Moedas novas
-
-Um par listado há pouco tempo não tem o histórico que as análises longas pedem, então o robô olha o dia dele:
-
-- **Seleção automática:** um par com menos de 29 velas diárias fechadas (listado há menos de um mês) é ranqueado pelas últimas 24 velas de 1 h, com o mesmo cálculo: retorno dividido pelo desvio dos retornos. Ele precisa de pelo menos 12 h de negociação. Antes, esses pares nunca entravam.
-- **Day trade:** com menos de 60 velas de 1 h (listado há menos de 2,5 dias), o filtro de tendência do 1 h lê o próprio dia no 15 min: EMA 20 acima da EMA 50 e fechamento acima da VWAP do dia. Pares com histórico continuam usando o 1 h; os setups deles são idênticos bit a bit aos de antes.
-- A reversão à média no 15 min já operava com 10 h de velas. Tendência (1 h, 60 velas) e Momentum (4 h, semanas de histórico) continuam exigindo o histórico longo, por desenho.
-
-## Trade ao vivo
-
-Ao executar uma oportunidade, o painel mostra o botão **Ver o trade ao vivo no gráfico**; em Posições, cada linha tem o link **ao vivo**. A página `/trade/<id>` mostra as velas do mercado onde a ordem foi executada (no testnet, o livro do Spot Testnet), desde 30 minutos antes da entrada, com as linhas de entrada, stop atual, alvo ou maior preço do stop móvel, e marcadores de entrada e saída. Atualiza a cada 5 segundos enquanto a posição está viva; o servidor guarda as velas por 5 segundos e recua quando o peso da API está alto, para não tirar requisições de stops e saídas.
-
-## Como o robô decide
-
-As regras seguem o que tem evidência publicada para quem só compra no spot. Nada aqui garante lucro: os números de backtest dos artigos são otimistas, o efeito de momento em cripto enfraqueceu depois do lançamento do futuro de BTC, e cada estratégia continua precisando passar no teste histórico antes de operar.
-
-- **Seguir a tendência, só na compra.** O momento de série temporal é o efeito mais robusto em cripto, e funciona no long-only; vender a descoberto não acrescentou retorno significativo. A estratégia **Momentum** compra quando a alta dos últimos 20 dias (120 velas de 4h) é positiva, a EMA 20 está acima da EMA 50, o preço está acima da EMA 50 e o ADX é pelo menos 20. A confiança é essa alta dividida pela oscilação no mesmo período. O stop fica a 2,5 ATR e a saída é o stop móvel ou a EMA 20 cruzando abaixo da 50: deixar o vencedor correr e cortar o perdedor cedo.
-- **Escolher onde olhar pelo momento relativo.** O fator de momento entre moedas existe, mas como estratégia própria é fraco depois dos custos. Por isso ele só escolhe os pares: a seleção automática pega os 40 pares USDT mais líquidos (sem stablecoins e tokens alavancados) e fica com os de melhor momento ajustado ao risco, a alta de 28 dias dividida pelo desvio dos retornos diários, só os positivos. Uma compra ainda exige um setup Pronto de uma estratégia validada.
-- **Tamanho pelo risco, sob tetos separados.** O tamanho sai do stop: a perda no stop é `risk_per_trade_pct` do capital (1% por padrão, no máximo 2%), ou menos quando o Kelly limita. Esse valor dividido pela distância do stop dá o tamanho. Depois vale o menor destes tetos:
-  - **teto por ordem:** `max_order_notional_pct` do capital × 90%. É só um teto de segurança;
-  - **teto da corretora:** o do mandato e o do Spot Testnet (`binance.json`), × 90%;
-  - **volatilidade:** uma ordem exposta a um ATR14 diário custa no máximo `vol_cap_pct` do capital (1% por padrão, 0 desliga). Um par com ATR diário de 10% compra no máximo 10% do capital; BTC e ETH quase nunca chegam nele;
-  - **exposição total:** o que sobra de `max_exposure_pct` (60%), ou do alvo de volatilidade, menos o que já está aberto pelo último preço. A ordem diminui até caber; sem espaço, é recusada.
-
-  Quando a oscilação de 7 dias dos retornos de 4 h passa de `vol_throttle_ratio` (2 por padrão, 0 desliga) vezes a de todas as velas de 4 h lidas (cerca de 50 dias), a ordem cai pela metade. Como o stop vem do ATR, um ativo mais volátil compra menos.
-- **Teto por ordem de 25%** numa instalação nova. Um `bot.json` já gravado mantém o valor salvo (2% nas instalações antigas) até você mudar. O teto entra no mandato: até reconfirmar, o teto do mandato antigo vence, e Controles mostra os dois lado a lado. Com os padrões, um stop de 2% dá 22,5% do capital (vence o teto por ordem) e um stop de 8% dá 12,5% (vence o risco por trade). Com o teto de 2%, toda ordem fica perto de 1,8% do capital e o risco por trade não limita nada. Cada oportunidade mostra o limite que venceu ("teto por ordem", "risco por trade", "volatilidade (ATR diário)" e outros) e o valor de cada teto.
-- **Alvo de volatilidade da carteira** (`target_vol_annual`, 60% por padrão, 0 desliga). A volatilidade anual da carteira, em dólares, é estimada com retornos de 1 h (média exponencial com meia-vida de 72 h, com covariância) e não passa de 60% do capital. Só limita entradas novas: nada é vendido para rebalancear. Com menos de 48 retornos alinhados, não limita.
-- **Risco total limitado.** A soma da perda até o stop de todas as posições vivas, mais a nova, fica abaixo de `max_open_risk_pct` do capital configurado (6% por padrão, no máximo 20%). Uma posição cujo stop móvel já passou do preço médio não conta; uma entrada ainda pendente conta como um trade inteiro.
-- **Correlação e cluster do BTC.** Uma entrada é recusada quando já há `max_correlated` (2) posições com correlação acima de `correlation_threshold` (0,80) com ela, contando as vivas e as linhas já aceitas no mesmo ciclo. Um par está no cluster do BTC quando é o BTC ou quando a correlação dos retornos de 1 h com o BTC passa de `cluster_corr` (0,70). O risco até o stop do cluster, vivas e aceitas no ciclo somadas, fica em metade de `max_open_risk_pct` (3% com os padrões). A linha mostra o cluster.
-- **Várias posições, dentro do saldo.** A cada ciclo o robô lê o USDT livre. No modo automático ele percorre as oportunidades Prontas da maior nota para a menor e aceita uma por par (diversificação: duas estratégias nunca compram o mesmo par), dentro de `max_positions`, do risco total e de 95% do USDT livre já descontada a taxa. Se o caixa não cobre o tamanho inteiro, a ordem diminui até o que cabe, desde que fique acima do mínimo da Binance; se não, a linha fica Bloqueada com o motivo. No modo manual cada linha é conferida sozinha, porque você escolhe uma por vez. Sem leitura do saldo, nenhuma entrada sai.
-- **Lucro mínimo esperado.** `min_profit_usd` (0 por padrão) recusa a entrada cujo tamanho vezes o retorno líquido até o alvo fica abaixo desse valor. Com o stop móvel o alvo é só referência. Lucro maior por trade só vem de ordem maior, e a perda no stop cresce na mesma proporção.
-- **Proteções depois de perder** (como `CooldownPeriod` e `StoplossGuard` do Freqtrade). Um par que fechou com prejuízo fica sem entrada nova por `pair_cooldown_minutes` (120 por padrão). Com `loss_guard_trades` perdas (3 por padrão) nas últimas 6 horas, ou com essas perdas somando `loss_guard_r` R ou mais (2 por padrão, de 0 a 20; R é o prejuízo dividido pelo risco até o stop na entrada), nenhuma entrada nova sai até as perdas mais antigas saírem da janela. Zero desliga cada uma. Isso corta a sequência de re-entradas no mesmo par que vira prejuízo em mercado ruim.
-- **Mesma regra ao vivo e no histórico.** As estratégias e as saídas por sinal decidem só com velas fechadas, como o backtest; a vela ainda aberta só serve de preço, e o painel a marca como "prévia da vela aberta". A saída por sinal lê o timeframe com que a posição abriu: uma tendência de 4 h sai pelas velas de 4 h. Posições antigas, sem timeframe gravado, usam as velas de antes. No backtest, o stop dispara pela mínima da vela, no preço do stop ou na abertura quando a vela abre abaixo dele; o alvo da regra `target` vende no fechamento da vela que fecha no alvo, como o ciclo, nunca num pavio; o stop vence quando a mesma vela toca os dois. Cada perna paga 0,1% de taxa e 0,03% de slippage.
-- **Histerese na saída** (`exit_hysteresis`, ligada por padrão). Tendência e momento só saem pelo sinal quando a EMA 20 fica 0,5% abaixo da EMA 50 ou abaixo dela em 2 velas fechadas seguidas, não no primeiro cruzamento. Faz parte da validação. Cada posição grava a regra com que abriu; posições antigas saem sem histerese.
-- **Indicadores com média simples.** ATR, ADX e RSI usam média móvel simples, não a suavização de Wilder. É uma decisão: ao vivo e histórico calculam os mesmos números, e os digests-ouro e as validações gravadas continuam valendo. Trocar mudaria tudo isso sem evidência de que opera melhor.
-- **Folga para o stop.** A entrada usa no máximo 90% do teto por ordem: o portão avalia o stop pelo bid, e uma alta de até ~11% ainda deixa o stop novo dentro do teto. Acima disso o stop móvel para de subir e o stop atual fica no livro.
-- **Validação no histórico (gate v3).** Cada timeframe que a estratégia opera é validado à parte, sobre o conjunto de pares configurado, e um setup só executa se o timeframe dele passou. Com a seleção automática ligada, o conjunto validado é o universo líquido de onde ela escolhe (os 40 pares de maior volume), não os pares escolhidos pelo momento recente: estes subiram justamente no fim do período, e validar neles seria viés de seleção. A escolha por volume no fim do período ainda carrega um resto desse viés e não vê pares deslistados; o painel diz isso. Um par fora do conjunto validado fica só sinal (o modo teste continua funcionando). Nada é reajustado: os parâmetros são fixos. O replay usa só velas fechadas e aplica os limites da carteira aos trades de todos os pares juntos: `max_positions`, um trade por par, a pausa do par depois de perda e a trava de perdas, contando só trades aceitos que já saíram, sem olhar o futuro. Os limites usados ficam gravados e aparecem no painel; mudá-los não exige validar de novo. Os limites que o replay não reproduz (risco aberto total, cluster do BTC, correlação, entradas por ciclo, degraus de drawdown, caixa) fazem do resultado o melhor caso. O gate:
-  - os últimos 20% do período, pela data de saída, são um hold-out com pelo menos 5 trades, que não pode perder e precisa ganhar por dia pelo menos metade do que a amostra ganha;
-  - o resto é cortado em 4 janelas: 3 precisam lucrar, e a eficiência walk-forward (mediana do ganho por dia de cada janela sobre o das anteriores) fica em pelo menos 0,5;
-  - nos trades antes do hold-out: Sharpe acima de 1, drawdown abaixo de 20% e pelo menos 30 trades;
-  - Sharpe deflacionado de pelo menos 0,95, com N igual ao número de combinações diferentes (timeframe, regra de saída, pares, filtro de mercado, histerese) testadas desde a última aprovação, mais a atual. Cada rodada fica gravada como tentativa, então testar até passar custa.
-
-  O Monte Carlo reamostra 1000 vezes os trades em R e grava o p95 do drawdown. Ele não reprova na validação: o ciclo confere `p95 × risk_per_trade_pct < max_drawdown_pct` a cada minuto, e as linhas viram só sinal quando não passa. Mudar os limites não exige validar de novo. O PBO (probabilidade de overfitting do backtest) não é calculado: o robô não otimiza parâmetros, então não há família de configurações para comparar; a correção para múltiplos testes é o Sharpe deflacionado com N, e o painel diz isso. Um resultado do gate antigo, de outra versão da estratégia ou de outra regra fica velho: o robô valida de novo na partida e no laço, na hora quando muda o gate, a versão ou a regra, e no máximo uma vez por dia quando muda só o conjunto de pares. Os limiares do `classify` (`score_threshold`, `cost_multiple`, `min_reward_risk`, que vale 0 com saída fixa) também fazem parte da regra: mudar um deles deixa a validação velha, e as linhas da estratégia ficam só sinal, no ciclo e em `/bot/status`, até a nova validação passar. O motivo da reprovação aparece no painel.
-- **Degraus de drawdown.** O drawdown é medido do pico do PnL acumulado. Com os padrões:
-  - **5%** (`dd_reduce_pct`, 0 desliga): cautela. Risco por trade pela metade e uma entrada por ciclo.
-  - **10%** (`max_drawdown_pct`): só reduzir. Nenhuma compra sai: estratégia, manual, armada ou robô. Stops, saídas, stop móvel e TP1 continuam. Não é o HALT: volta sozinho quando o drawdown cai abaixo do primeiro degrau (5%), não antes, para não oscilar na linha.
-  - **15%** (`halt_drawdown_pct`): halt, que não se desarma sozinho. Depois de retomar, o robô fica em só reduzir até o drawdown ficar abaixo de 5%.
-
-  Um `bot.json` sem os degraus deriva os dois de `max_drawdown_pct`: metade dele, e 1,5 vez dele entre 15% e 50%. Com um limite de 50% ou mais, o halt fica em 1,5 vez o limite, no máximo 100%. Mudar só `max_drawdown_pct` pelo painel ou pela API recalcula os dois; um degrau de cautela em 0 continua desligado. Um patrimônio ilegível também põe o robô em só reduzir. O painel mostra o degrau numa faixa no topo.
-- **Perda diária sobre o patrimônio.** A perda do dia é o patrimônio agora, com as posições abertas pelo último preço, menos o do primeiro ciclo do dia UTC: o prejuízo não realizado conta. Passou de `max_daily_loss_pct` (3%), nenhuma compra sai até 00:00 UTC, nem manual, nem armada, nem de robô. O ciclo continua rodando: stops, stop atravessado, stop móvel, TP1, limite de tempo e vendas dos robôs seguem funcionando, e Iniciar é aceito durante a pausa. Com `flatten_day_on_daily_loss` (desligado por padrão), o robô vende antes as posições de day trade; as swing ficam com o stop. Zerar por padrão venderia no fundo.
-- **Filtro de mercado** (`market_filter`, desligado por padrão). Com `btc_ema40d`, nenhuma entrada sai enquanto o último fechamento de 4 h do BTC fica abaixo da EMA de 240 velas de 4 h (cerca de 40 dias), nem quando o BTC não foi lido no ciclo. Com menos de 240 velas fechadas, o filtro deixa passar. Ele faz parte da validação: ligar exige validar de novo, e o backtest o aplica sem olhar o futuro. Para comparar, valide com e sem; as duas rodadas contam como tentativas no Sharpe deflacionado. Fica desligado porque não há backtest publicado que o sustente: precisa ser testado, não assumido.
-- **Rebaixamento ao vivo.** A estratégia volta a só sinal quando, em 30 dias corridos com pelo menos 10 trades fechados, o Sharpe diário ao vivo (dia sem trade conta 0) fica abaixo da metade do Sharpe diário do backtest, medido do mesmo jeito, ou quando os últimos 20 trades têm média de R negativa. Com média de R negativa nos últimos 10 trades de um par, dentro de 90 dias, a estratégia para só naquele par. Um par cujo slippage médio de ida e volta nos últimos 20 trades (30 dias, ao menos 10 medidos) passa de `slippage_budget_pct` (0,3%) fica sem entrada. Validar de novo recomeça a contagem da estratégia; os bloqueios por par saem com o tempo. Desempenho mostra o slippage por par.
-- **Idade do sinal.** Um sinal com até `max_signal_age_seconds` (120 s) desde o fechamento da vela de decisão entra no automático. Um sinal mais velho só entra enquanto o preço não o deixou para trás: no máximo 0,5 R acima do fechamento da vela do sinal e menos de um stop inteiro abaixo dele (R é a distância do stop). Uma linha fica Pronta pela vela inteira (quatro horas no 4h), então um limite só de relógio deixava o automático entrar apenas nos primeiros minutos depois de cada fechamento, e nunca depois de um reinício; o risco de entrar tarde é perseguir o preço, e é isso que a regra mede. Fora dela, a linha diz o atraso e o deslocamento e fica para o manual. Entradas manuais e armadas mostram a idade e o deslocamento e passam.
-- **Calendário macro** (convenção, sem artigo). `macro_events_utc` (vazio por padrão) recebe horários de eventos como CPI e FOMC; entradas de day trade pausam `macro_pause_minutes` (15) antes e depois de cada um. O backtest não reproduz a pausa.
-- **Taxa real da conta.** Uma vez por dia o robô lê a taxa da conta na Binance (`/api/v3/account/commission`, padrão mais imposto, sem supor desconto em BNB). Uma falha tenta de novo em 1 h e mantém a última leitura boa. O executor usa essa taxa na margem de venda e na contabilidade, e os robôs também. O score usa a maior entre 0,1% e a da conta; o backtest fica em 0,1%, para a validação não depender da conta.
-- **Kelly fracionário** (como o `KELLY_FRACTION` do jevymarket). Quando a estratégia tem taxa de acerto estimada `p`, o risco no stop passa a ser o menor entre `risk_per_trade_pct` e `kelly_fraction` (0,25 por padrão) de `p − (1 − p) / b`, com `b` o ganho até o alvo por unidade de risco; Kelly ≤ 0 recusa a entrada como "sem vantagem estimada". `b` é o ganho do alvo, e com o stop móvel o alvo não é saída, então é um teto. Com os padrões do modo automático (acerto mínimo de 60% e ganho/risco de 1,5) o Kelly fica acima de 0,33 e o teto não limita; ele pesa nas entradas manuais com acerto baixo e quando o acerto mínimo é reduzido. Linhas de teste não usam Kelly.
-- **Limite de entradas por ciclo** (`max_entries_per_cycle`, 2 por padrão, como o `MAX_TRADES_PER_RUN` do jevymarket): o modo automático abre no máximo esse número de posições por ciclo (1 no modo cautela) e deixa o resto para o próximo, evitando comprar vários pares de uma vez no mesmo movimento.
-- **Taxa de acerto dos setups aceitos.** O replay marca em cada trade se os filtros ao vivo (nota, custo, ganho/risco) o aceitariam. A taxa estimada usada no Kelly e no piso de acerto é a menor entre a de todos os trades e a dos aceitos, mas a dos aceitos só entra com amostra mínima e com os mesmos limiares da config atual; abaixo disso vale a geral. Desempenho mostra as duas.
-- **Calibração** (como o `stats` do jevymarket): cada posição grava a taxa de acerto estimada na entrada; em Desempenho, uma tabela compara, por faixa, o estimado com a parte que realmente lucrou. Linhas de teste ficam de fora.
-- **Capital real.** O tamanho usa o menor entre o capital configurado e o USDT livre mais o valor das posições do robô. Patrimônio, perda diária e drawdown continuam medidos sobre o capital configurado, então um saque não vira um falso drawdown. O pico guardado é o do PnL acumulado, não o do patrimônio, então mudar o capital também não vira drawdown: o pico passa a ser o capital novo mais esse PnL.
-
-Ficou de fora: saída chandelier, venda a mercado como último recurso do stop atravessado (caminho só de produção, sem teste no Spot Testnet) e OCO no TP1 do day trade (veja Day trade). Compras com ordem limitada no livro existem só para os robôs DCA e grid, por opção.
-
-Fontes: [Freqtrade, proteções](https://www.freqtrade.io/en/stable/plugins/#protections); [NautilusTrader, motor de risco](https://nautilustrader.io/docs/python-api-latest/risk.html); [Hummingbot, kill switch](https://hummingbot.org/client/global-configs/kill-switch/); [Coin Bureau, risco por trade e calor da carteira](https://coinbureau.com/guides/risk-management-strategies-crypto-trading); [Rozario et al., arXiv 2009.12155](https://arxiv.org/abs/2009.12155v1); [Liu, Tsyvinski e Wu, NBER w25882](https://www.nber.org/papers/w25882.pdf); [Time series and cross sectional momentum in the cryptocurrency market, AUT](https://acfr.aut.ac.nz/__data/assets/pdf_file/0009/918729/Time_Series_and_Cross_Sectional_Momentum_in_the_Cryptocurrency_Market_with_IA.pdf); [Man Group, Crypto: too hot to handle](https://www.man.com/insights/crypto-too-hot-to-handle); [Volatility-managed crypto momentum, Springer 2025](https://link.springer.com/article/10.1007/s11408-025-00474-9).
-
-## Day trade
-
-Duas estratégias de janela curta, que ligam e desligam como as outras: **Day · Momento intradiário** (`intraday_momentum`) e **Day · Pullback na VWAP** (`vwap_pullback`). O desenho, as fontes e a revisão do architect estão em [docs/plano-day-trade.md](docs/plano-day-trade.md).
-
-- **Entrada:** só compra. Entra numa vela fechada de 15 min, e só com as velas fechadas de 1 h em alta (EMA 20 acima da 50, fechamento acima da 50). Não entra entre 03:00 e 07:00 UTC, as horas de livro mais fino.
-- **Stop:** 1,5 ATR do 15 min, com piso de 1%. Abaixo disso, o custo de ida e volta (cerca de 0,25%) comeria mais de um quarto do risco.
-- **Saída:**
-  - No TP1 (1,5 vez o risco), metade é vendida e o stop do resto sobe para o preço de entrada mais 0,2%.
-  - O que sobrar sai em até 6 horas.
-  - O "equilíbrio" é um stop-limit com folga de 0,5%: num movimento rápido ele pode executar cerca de 0,3% abaixo da entrada, ou não executar num gap.
-- **Filtros:** o score e os filtros de custo e de ganho/risco medem o TP1, o alvo em R do trade. Só o gate do backtest mede o resultado real das duas metades.
-- **Ordens:** um day trade gasta até 5 ordens (entrada, stop, TP1, novo stop, saída). Com uma estratégia day ligada, o mandato conta 6 por entrada.
-- **TP1 sem OCO:** entre cancelar o stop e recolocá-lo no TP1, metade da posição fica alguns segundos sem stop. O robô mede essa janela (Desempenho). A OCO volta a ser estudada se o p95 da janela do TP1 passar de 2 s em 30 dias, ou se um stop atravessado acontecer durante um TP1.
-- **Validação:** 120 dias de velas de 15 min e de 1 h, com as mesmas regras de saída. O gate é o v3 do swing (4 janelas, hold-out e Sharpe deflacionado), com o Sharpe medido nos retornos diários, porque com muitos trades o Sharpe por trade fica fácil:
-  - Sharpe dos retornos diários acima de 1;
-  - pelo menos 30 trades antes do hold-out;
-  - retorno médio líquido de pelo menos 0,10% por trade;
-  - drawdown abaixo de 20%;
-  - 3 de 4 janelas lucrando, hold-out com pelo menos 5 trades e sem perda, e Sharpe deflacionado de pelo menos 0,95.
-
-  A validação vale só para as regras que replicou.
-- **Preset:** "Aplicar preset de day trade" (Controles) mostra o que muda e só então grava:
-  - liga as estratégias day e desliga as swing;
-  - risco de 0,5% por trade;
-  - perda diária de 2%;
-  - até 8 trades por dia;
-  - pausa de 60 min no par depois de uma perda;
-  - alvo de pelo menos 3x o custo;
-  - reconfirma o mandato.
-
-**O que a evidência diz.** A maioria dos day traders perde depois dos custos: menos de 1% lucra de forma previsível em Taiwan, e 97% de quem insistiu perdeu no Brasil. Nenhum estudo revisado por pares mostra day trade só comprado em cripto spot lucrativo depois de 0,2% por ida e volta.
-
-O backtest de 90 dias até 2026-10-16, ainda com o gate antigo, confirmou isso nas duas estratégias:
-- **Pares do testnet (BTC, ETH, SOL):** todos perderam.
-- **Pares voláteis (AVAX, ZEC, INJ, NEAR, STRK, TIA):** só o momento intradiário em INJ passou, 1 de 18 testes, o que se espera do acaso.
-
-O robô não opera de verdade o que não passa no gate; no testnet, o modo teste deixa exercitar o fluxo.
-
-## Robôs DCA e grid
-
-Robôs que o operador configura na tela Robôs, como o Spot DCA e o Spot Grid da Binance. Não passam pelo gate de validação: a criação confere o plano inteiro antes da primeira compra (pior caso contra o risco por trade, exposição total, teto por ordem e orçamento de ordens). As ordens deles saem de `instance_orders_per_day` (0 por padrão: sem robôs), reservado no mandato.
-
-- **Máximo de robôs:** `max_instances` (3 por padrão) vivos ao mesmo tempo. Um por par, e nunca num par com posição de estratégia.
-- **Pausa entre rodadas:** `cooldown_minutes` (1 min por padrão, como os 60 s da Binance). A recompra do DCA depois do alvo e o reinício do grid depois de vender tudo esperam esse tempo.
-- **Prévia:** replay dos últimos 30, 90 e 180 dias de velas de 1 h. Marca em vermelho o grid cujo fechamento ficou fora da faixa em mais de 30% do tempo: grid só rende em lateralização. É histórico, não promessa.
-- **Ordens:** compras a mercado e vendas LIMIT IOC, a cada minuto, com o stop na Binance. Só reduzir, halt e pausa diária bloqueiam as compras dos robôs; stop e vendas continuam. Parar um robô vende o que ele tem, sem halt global.
-- **Compras paradas no livro** (desligadas por padrão; opção "compra limitada no livro" na página dos robôs): com `resting_buys`, o robô deixa no máximo uma ordem LIMIT GTC de compra, no próximo nível do grid ou na próxima ordem de segurança do DCA. Ela trava USDT, não a moeda, então convive com o stop. Custa 3 ordens do orçamento (colocar, cancelar, recolocar o stop). Na faixa VIP0 maker e taker custam 0,1%: o ganho é o preço (executa no nível, sem spread, e pega toques dentro do minuto), não a taxa. Ao executar, a compra entra na posição e o stop é recolocado; o halt cancela as compras paradas antes de gravar o flag. Elas também saem do livro antes de qualquer venda, ao Parar, e em qualquer bloqueio de compra (relógio, pausa diária, só reduzir); uma execução que chega junto com o cancelamento entra na posição. Pausar o ciclo é recusado (409, "compra limitada ainda no livro") enquanto o cancelamento não se confirma ou a parte comprada ainda não tem stop: o ciclo continua até resolver. Uma compra que a Binance já confirmou só é esquecida quando um cancelamento confirma que a ordem não existe; até lá ela bloqueia vendas e novas compras paradas. Se o stop antigo não sai da corretora em 3 ciclos seguidos depois de uma compra, o robô entra em halt. A prévia de 30/90/180 dias executa a compra no nível quando a mínima da vela o toca.
-- **Taxa da conta e o gate.** Com uma taxa de conta menor que a padrão do mercado (faixa VIP), as quantidades de stop e de venda mantêm a margem da taxa padrão, que é a que o order gate confere: sobra um pouco mais de poeira, e o stop nunca é recusado por saldo.
-
-## Consultor DeepSeek
-
-Um consultor opcional pede à [DeepSeek](https://api-docs.deepseek.com) uma segunda opinião sobre cada linha Pronta de estratégia. Ele **aconselha**; quem decide continua sendo o motor determinístico. O desenho, as decisões e a revisão do architect estão em [docs/plano-refatoracao-deepseek.md](docs/plano-refatoracao-deepseek.md).
-
-- **O que ele pode fazer.** Responder `confirm`, `reduce` ou `veto`, com confiança, regime e uma justificativa curta. No modo `filter`, um veto com confiança de pelo menos `min_veto_confidence` (60%) tira a linha do automático; ela continua Pronta para o manual, com o motivo "IA desaconselha: ...". Um `reduce` multiplica o tamanho por um fator entre 0,25 e 1, depois de todos os tetos e do throttle; o teto aparece como "análise IA".
-- **O que ele nunca faz.** Criar uma linha, aumentar um tamanho, transformar uma recusa em entrada, mexer no order gate, no mandato, no halt, nos stops ou nas saídas. Robôs DCA e grid, entradas armadas e linhas de teste não são consultados. Entradas manuais mostram o veredito e não são bloqueadas.
-- **Por que só reduz.** Uma resposta de LLM não pode ser reproduzida no backtest. Remover ou reduzir entradas é a mesma classe dos filtros que já existem só ao vivo, então a validação continua sendo um teto do que o robô faz.
-- **Modos** (`advisor.mode` em Controles): `off` (padrão), `shadow` (consulta e grava, nenhuma ordem muda) e `filter`. Comece em `shadow` e só ligue `filter` quando a calibração mostrar que os vetos evitam perdas.
-- **Falha neutra.** Sem chave, sem rede, com orçamento esgotado, resposta inválida ou demora, o robô opera como sem o consultor. Com `require_verdict`, uma linha sem veredito não entra no automático; o painel pede confirmação antes de ligar.
-- **Fora da trava do ciclo.** As chamadas rodam numa thread própria com fila limitada; o ciclo só lê o cache e enfileira sem esperar. Uma linha espera o veredito por até `wait_seconds` (45 s), contados entre ciclos, e depois segue. Cada sinal (par, estratégia, timeframe e vela) é consultado uma vez por ambiente: um veredito do testnet nunca vale para uma linha de produção. Um reinício não pergunta de novo: os vereditos já gravados em `advice_log` voltam para o cache antes da nota do primeiro ciclo, sem chamada e sem custo, então um `reduce` gravado antes do reinício também reduz a primeira entrada depois dele. Cada tentativa de chamada tem um prazo total de 45 s, além dos prazos de conexão e de leitura: linhas em branco de uma fila longa não prendem o consultor.
-- **Modelo.** `deepseek-flash` (padrão) ou `deepseek-v4-pro`, em modo JSON e sem raciocínio, para latência e custo previsíveis. O prompt leva só números e categorias montados pelo código (setup, indicadores dos timeframes, regime do BTC, nível de risco da conta), nunca texto de fonte externa. Os indicadores usam só velas fechadas até o fechamento da vela do sinal, em todos os timeframes, mesmo quando a consulta acontece horas depois: o modelo não vê o caminho em que a calibração o mede.
-- **Custo.** Orçamento diário em `daily_budget_usd` (US$ 1 por padrão), por chave da DeepSeek: conferido antes de cada chamada contra a soma do gasto do dia UTC no testnet e em produção, então sobrevive a reinícios e a trocas de modo. O cabeçalho e Controles mostram essa soma. Uma tentativa cobrada que termina em erro (como a resposta vazia, repetida uma vez) também conta. O custo é uma estimativa pela tabela de preços do código (datada); o valor cobrado é o do console da DeepSeek. Uma chamada custa perto de US$ 0,001.
-- **Calibração.** Cada veredito ganha um R contrafactual com as regras do replay de saída fixa: entrada no fechamento da vela do sinal, stop pela mínima (com gap), alvo só no fechamento, no máximo 48 velas, líquido de taxa e slippage. Desempenho agrupa por modelo e versão do prompt e mostra, por veredito, n, R médio e erro padrão; os vetos de alta confiança têm linha própria e o R realizado das linhas que entraram fica numa coluna à parte. Um veto útil tem R contrafactual negativo. Uma linha só conta depois que as 48 velas passaram, e cada sinal conta uma vez. Quando o par sai da lista analisada, as velas da janela são lidas da Binance pelo mesmo caminho do teste histórico (poucas por hora, nunca sob pressão de peso); uma linha cujas velas foram lidas e que continua sem rótulo um dia depois do fim da janela expira: fica fora das médias, não é tentada de novo e aparece em Aguardando como expirada. Uma leitura que falha (rede, erro da Binance) não prova falta de dado: a linha é tentada de novo, e só três falhas depois do dia de folga a expiram.
-
-**Chave.** Fica em `deepseek.json`, na mesma pasta do `binance.json` (`BOT_RUNTIME_ROOT`), com permissão 0600. Para gravar, rode na máquina do robô e cole a chave quando pedir (ela é lida da entrada padrão, nunca de argumento):
-
-```powershell
-python -m bot.ops advisor-key
-```
-
-`DEEPSEEK_API_KEY` só vale quando o arquivo não tem chave. A chave nunca vai para o `bot.json`, para o painel, para a API, para os logs, para o ledger ou para o `advice_log`; um campo com `key`, `secret` ou `token` no nome é recusado em `PUT /bot/config`.
-
-## Operação
-
-1. Python 3.12 e Node 22. Na raiz:
+Python 3.12 and Node 22. From the repository root:
 
 ```powershell
 python -m venv .venv
@@ -184,45 +39,285 @@ npm install
 npm run dev
 ```
 
-2. Noutro terminal, com a raiz de runtime explícita (não use a pasta do código para chaves):
+In another terminal, with an explicit runtime root (never keep keys in the source folder):
 
 ```powershell
 $env:BOT_RUNTIME_ROOT = "$env:USERPROFILE\.the-trader-bot"
 python -m bot
 ```
 
-3. A interface fica em `http://127.0.0.1:5173` e a API em `http://127.0.0.1:8000`. Na primeira subida a API grava um token em `%USERPROFILE%\.the-trader-bot\api-token` (o `BOT_RUNTIME_ROOT`). O proxy do Vite lê esse arquivo e manda o token em cada chamada; o navegador nunca o vê. A API recusa pedidos sem o token, com outro `Host`, com outra `Origin` ou, nas escritas, sem o cabeçalho `X-Bot-Client: panel`. Rode o Vite com o mesmo `BOT_RUNTIME_ROOT` da API.
+Panel at `http://127.0.0.1:5173`, API at `http://127.0.0.1:8000`. The first configuration (Spot Testnet keys, capital, mandate, strategies) is in [Operation](#operation). `docker compose up -d --build` runs both services in containers; see [Docker](#docker).
 
-4. Primeira configuração, na tela Controles:
+## What v1 does
 
-- Grave as chaves de **Spot Testnet** em `%USERPROFILE%\.the-trader-bot\binance.json` ou nas variáveis `BINANCE_TESTNET_API_KEY` e `BINANCE_TESTNET_API_SECRET`. A interface não recebe chave. A chave de produção, quando existir, precisa de restrição de IP e sem permissão de saque.
-- Defina o capital e confirme o mandato. O bot grava `mandate.json` com instrumentos só `crypto`, alavancagem 1 e quatro ordens por entrada permitida no dia (entrada, stop, saída e um stop recolocado).
-- No Spot Testnet, ajuste em `binance.json`: `testnet_audit_only: false`, `testnet_max_order_notional` (por exemplo `{"USDT": "100"}`) e `testnet_max_daily_operations` com folga para três ordens por entrada. O padrão do conector é 2 operações por dia, o que não cobre nem uma entrada.
-- Ligue uma estratégia e clique em "validar no histórico" (`POST /bot/strategies/{id}/validate`). O teste roda em segundo plano sobre os pares configurados, em cada timeframe que a estratégia opera: 240 dias de 1h e 480 de 4h para Trend, 480 dias de 4h para Momentum, 120 dias de 15m e 240 de 1h para Mean Reversion e 120 dias de 15m (mais o 1h) para as day, com a mesma janela de 300 velas do robô ao vivo. Todas as estratégias em todos os timeframes, com 15 pares, levaram cerca de 3 minutos em dados sintéticos; cada rodada grava o tempo gasto. O painel mostra o progresso e, em Desempenho, o detalhe por timeframe: Sharpe bruto e deflacionado, tentativas, as 4 janelas, o hold-out, o Monte Carlo contra o limite, fator de lucro e expectativa em R. Ela só opera se passar no gate v3: Sharpe acima de 1, drawdown abaixo de 20% e pelo menos 30 trades antes do hold-out, 3 de 4 janelas lucrando, hold-out com pelo menos 5 trades e sem perda, e Sharpe deflacionado de pelo menos 0,95 (veja "Como o robô decide").
-- Pares: "usar os 20 mais líquidos" troca os 5 pares padrão pelos 20 pares USDT de maior volume em 24h (sem stablecoins); pares com posição aberta nunca saem. A coleta roda em paralelo para caber no ciclo de 60 s.
-- Seleção automática (`auto_select`, desligada por padrão): uma vez por hora o robô troca a lista pelos pares mais promissores (15 por padrão, de 5 a 20). Enquanto ela está ligada, a lista não muda pelo painel. No testnet, a seleção, o botão dos mais líquidos e a lista editada só aceitam pares que o Spot Testnet lista (`testnet.binance.vision`), porque a análise usa o mercado real e as ordens vão para o testnet. Vale qualquer par listado, mesmo com pouca negociação lá. O ticker de 24 h do testnet atrasa de 30 s a minutos nos pares finos, e o gate recusa cotação com mais de 15 s. Por isso, só no testnet, o bid e o ask vêm do livro ao vivo e a idade da cotação conta da hora da leitura; produção continua usando o horário da Binance. Um par sem vendedores no livro do testnet (como PEPE em 2026-10-19) não executa a compra.
-- Modo teste do Spot Testnet (só testnet): setups de compra que falharam num filtro de qualidade ou cuja estratégia não está validada aparecem como Pronta com a marca **teste**, para você testar compra, stop e saída. Saem pelo botão executar e, com o trade automático ligado, também pelo ciclo (da maior nota para a menor, dentro do saldo e dos limites). Não entram na taxa de acerto nem no decaimento. Produção ignora a opção.
-- Inicie. O ciclo é de 60 segundos. O selo cinza significa Spot Testnet.
+- Spot on BTC, ETH, SOL, BNB and XRP. USD-M futures are read-only: the funding carry appears in the panel with its estimated daily return, and never executes.
+- Four families: trend (1h and 4h), momentum (4h), mean reversion (15m and 1h) and funding carry (signal only).
+- Testnet by default (`binance-paper-trade`). Production (`binance-live-trade-bot`) only after the gates, 30 days of positive net PnL and 30 trades with positive expectancy in R, a crypto-only mandate and the word `PRODUCAO`.
+- No order without a mandate, a latch and a journal record before the send. A halt never disarms itself.
+- Every buy gets a STOP_LOSS_LIMIT on Binance right after the fill, so the position stays protected even with the bot off. Target and strategy exit are checked every cycle: the bot cancels the stop and sells with LIMIT IOC orders.
+- **LIMIT IOC entry.** The buy is a LIMIT IOC order 0.2% above the ask, with the quantity in base asset. Whatever fills opens the position; the rest is cancelled at once, and with no fill the row disappears. No ask, no buy. Stop and target are recomputed on the average fill price. Each position records entry and exit slippage, the result in R, the MAE and the MFE; Positions (Posições) shows the current R. DCA and grid robots keep buying at market.
+- **Crossed stop.** If the last trade reaches the stop (which is what triggers a STOP_LOSS_LIMIT) and the order sits in the book unfilled, with the bid below the stop-limit's limit, the bot cancels the stop and sells with an IOC 0.5% below the bid. If coin is left, it tries another IOC 2% below. If coin is still left, it halts. If the stop does not leave the book or the sell cannot go out (unconfirmed cancellation, a stopped robot buy without a read, daily orders exhausted), the stop stays in the book and the bot retries on the next cycle; on the third cycle in a row it halts. Only a write block (active halt, invalid mandate) waits without counting. There is no market sell as a last resort: it would be a production-only path that the Spot Testnet never exercises.
+- Spot never sells short. A sell signal without a position shows as potential and never becomes an order.
+- Trailing stop (on by default): the stop on Binance follows the highest price at the same distance as at entry, and never moves down. Each position records the exit rule it opened with and follows that rule until it closes, even if the option changes later. A strategy validated under another rule (or before this version) goes back to signal-only until validated again. The fixed target no longer closes the position; the exit comes from the stop or the strategy signal. The stop only leaves the book when the new one can enter: no halt, valid mandate, no API weight pressure, room below the lower of bid and last price, and one daily order reserved for each open position. The room is half the trailing distance, between 0.5% and 1%: the new stop is not born glued to the price, and a `trailing_tp` with a short distance keeps rising. Every stop replacement measures the time with no stop in the book; Performance (Desempenho) shows mean, p95 and maximum over the last 30 days, by type.
+- Entry mode:
+  - **Manual** (default): the cycle never buys on its own. You execute a Ready (Pronta) opportunity from the panel and the bot handles the stop and the exits; the cycle starts by itself at that moment. Buys made directly on Binance are not tracked.
+  - **Automatic**: the cycle also buys the Ready opportunities whose strategy **estimated hit rate** passes the minimum (60% by default, between 50% and 95%). The rate is `(wins + 1) / (trades + 2)` over the backtest trades with the same exit rule plus the real closed positions, and only exists with at least 20 trades. It is history, not a guaranteed probability. Switching to automatic stops the cycle and requires Start.
 
-5. Parar tudo (`POST /bot/halt` ou o botão) para o ciclo e grava o HALT, que bloqueia toda ordem nova. Com "zerar no halt" marcado, o robô vende as posições **antes** de gravar o HALT; o que não vender fica com o stop recolocado. Sem a opção, as posições ficam abertas com o stop na Binance. A escolha fica no mandato: mudá-la exige reconfirmar o mandato, e com um mandato gravado é ele que decide. Retomar é `POST /bot/resume`, manual. Antes de liberar, o robô resolve as compras limitadas que o halt deixou no livro; se alguma continua sem confirmação, a retomada é recusada (409) e o halt continua. Iniciar faz a mesma checagem quando o ciclo está parado. O ciclo também entra em halt sozinho depois de três falhas seguidas, com drawdown de `halt_drawdown_pct` (15%) e quando uma posição fica sem stop e sem como sair, inclusive um stop atravessado que os dois IOCs não venderam. Depois de um halt por drawdown, retomar volta em só reduzir até o drawdown cair abaixo de `dd_reduce_pct`.
+The origin of each ported module is in [ORIGIN.md](ORIGIN.md).
 
-6. Produção é outro diretório: `testnet/` e `production/` têm store, journal, mandato, HALT e ledger próprios. `binance.json`, `bot.json` e `api-token` ficam na raiz. O interruptor volta para testnet se qualquer pré-condição faltar, e o motivo aparece na tela. As liberações G1 a G4 só mudam editando `bot.json`; a API não as grava. **Promoção:** a troca exige, nos últimos 30 dias de testnet, PnL líquido positivo, pelo menos 30 trades de estratégia fechados com R registrado, expectativa em R positiva e p95 do Monte Carlo × risco por trade abaixo de `max_drawdown_pct`. Exige também nenhuma violação quantitativa do mandato no ledger de auditoria do testnet nesses 30 dias. **Piloto:** a exceção é um piloto: com um limite de capital de até 50 (`pilot_max_production_capital_usd` no `bot.json`, ou `pilot_cap_usd` enviado pelo painel na troca, no cartão "Piloto com pouco dinheiro") maior que zero e o capital de produção (alocado × `production_capital_fraction`, 10% por padrão) até esse valor, a troca dispensa só o histórico; todas as outras condições continuam valendo. O painel também pode pedir `pilot_skip_validation`: o piloto grava essa marca no store de produção e as estratégias ligadas operam sem validação no histórico (e, até haver amostra, sem estimativa de acerto), mantendo só o rebaixamento por par; a marca é apagada em toda troca que não a pede e nunca vale no testnet. O painel também pode pedir `pilot_skip_gates`, só com `pilot_gates_waivable: true` no `bot.json` (sem isso a troca é recusada): o piloto dispensa as liberações G1 a G4 só nessa troca (robô parado, sem posição aberta, chaves, mandato, PRODUCAO e auditoria do testnet continuam exigidos), e a marca fica no store de produção; uma promoção completa nunca as dispensa. O limite é gravado no store de produção na hora da troca e conferido onde o mandato é escrito, então editar o `bot.json` depois não o afrouxa: subir o capital, reconfirmar o mandato ou aplicar o preset acima do limite é recusado (409). O painel mostra "Produção piloto". Mesmo assim, o limite real é o saldo da conta: deixe nela só o valor do teste. Ao aprovar, o robô grava o mandato de produção com o capital de produção (10% do alocado). Sair de produção exige não haver posição de produção aberta: com "zerar no halt" marcado o robô vende antes; se algo continuar aberto, a troca é recusada, porque o processo em testnet não acompanharia aquelas posições.
+## Fixed target and stop
 
-O mandato limita a exposição das posições abertas pelo robô, avaliadas pela cotação atual. O resto da conta (caixa em USDT, moedas que já estavam lá) não conta como exposição do robô.
+In Controls (Controles), **Fixed target and stop** (Alvo e stop fixos) takes the gain and the loss as a percentage of the entry price (for example +3% and −1.5%). When on, it applies to every strategy, day trading included, and replaces each strategy's stop, target and exits, the trailing stop, and the day trade's TP1, breakeven and 6 h limit.
 
-`binance.json` continua sendo o arquivo de credencial do conector portado. `bot.json` guarda modo, capital, estratégias e limites, e esses limites nunca podem afrouxar o mandato.
+- **Entry:** as before, a Ready opportunity from a validated strategy. In automatic mode the estimated hit rate must pass the rule's breakeven, `loss / (loss + net gain)`, plus 3 points. With +3% and −1.5% that is close to 38%, not the swing mode's 60%. The reward/risk filter does not apply here, because you chose the gain and the loss; the cost filter still does.
+- **Stop:** a STOP_LOSS_LIMIT on Binance at the chosen loss below the **average fill price**, not the analysis price.
+- **Target:** the cycle sells with LIMIT IOC when the last 15 min price reaches the target, also computed on the average fill price. There is no exit on strategy signal and no time limit.
+- **Score:** the row's expected return never exceeds what the strategy itself estimates, so a wide target does not make a weak signal look strong.
+- **Limits:** target from 1% to 100% (below 1% the round-trip cost would eat the gain and no row would be Ready), loss from 0.5% to 50%.
+- **Validation:** the values are part of the rule (`fixed:<target in basis points>:<loss in basis points>`). Changing either requires validating again, and the hit rate only mixes trades of the same rule. In the backtest the stop fires on the candle low and wins when the same candle touches both; the target fires on the candle **close**, like the cycle, which sells at the last price and leaves no order in the book. Every rule pays 0.03% slippage per leg. Day strategies still skip entries between 03:00 and 07:00 UTC and are judged by the day gate.
+- **Automatic end to end:** when the target and stop change, or a strategy is switched on, the bot validates on history by itself, one strategy at a time, every enabled strategy that has no result yet for the current rule. With the **Automatic** entry mode and Start, the bot picks, buys, protects and sells without a click, and only trades what passed the test.
+- Open positions follow the rule they opened with.
 
-## Desempenho e concorrência
+## New coins
 
-Medido no testnet, a partir do Brasil (cerca de 270 ms por requisição à Binance):
+A recently listed pair lacks the history the long analyses need, so the bot looks at its day:
 
-- **Coleta fora da trava do ciclo.** A leitura de mercado roda sem segurar a trava; só o cálculo e as ordens a seguram. Um `PUT /bot/config` durante um ciclo caiu de até 12,3 s para 77 ms.
-- **Coleta paralela por requisição.** Até 16 requisições ao mesmo tempo, com um cliente HTTP reaproveitado (keep-alive) e o livro de todos os pares em uma chamada só. A coleta de 15 pares caiu de 5,7 s para cerca de 2,2 s. Um par que falha fica de fora do ciclo e é registrado no ledger (`collect_partial`); se ele tem posição aberta, o ciclo inteiro é recusado, para o stop e a saída nunca usarem preço velho.
-- **Tabela de mercados da Binance em cache** por uma hora, por host e tipo de cliente, com o ajuste de relógio junto. Antes, cada cotação e ordem baixava o `exchangeInfo` de novo.
-- **Journal verificado por incremento.** A leitura confere só as linhas novas contra o último hash conhecido. A cadeia inteira é refeita a cada 5 minutos e sempre antes de registrar uma ordem nova.
-- **Ledger com rotação** a 1 MiB: anexar não cresce com o histórico. O relatório diário e a verificação na partida (em segundo plano) conferem a cadeia com os arquivos rotacionados.
-- **SQLite** com `busy_timeout` de 10 s e journal de rollback (o WAL precisa de memória compartilhada que o bind mount do Docker Desktop não garante). As decisões só são gravadas quando mudam: a mesma oportunidade lida a cada minuto do mesmo candle vira uma linha, não 240. Como o motivo da reversão à média traz o RSI, ela grava uma linha nova quando o RSI muda. Decisões, sinais e pontos de patrimônio com mais de 30 dias são apagados uma vez por dia; o pico do PnL acumulado fica guardado à parte, então o drawdown não muda.
-- **Backtest.** As estratégias recusam primeiro pelos testes baratos (rompimento e volume, RSI, tendência das médias) e só então calculam ADX e ATR; o resultado é idêntico bit a bit (`tests/test_bot_strategy_golden.py`), e a avaliação ficou de 3 a 14 vezes mais rápida. Cada par roda num processo separado (até 4, `spawn`), porque o cálculo é Python e pandas e threads dividiriam a mesma trava do interpretador. A janela é de 299 velas fechadas, a mesma que o ciclo vê, e fica gravada nos parâmetros da validação.
+- **Automatic selection:** a pair with fewer than 29 closed daily candles (listed less than a month ago) is ranked on its last 24 1 h candles, with the same formula: return divided by the standard deviation of returns. It needs at least 12 h of trading. Before, those pairs never got in.
+- **Day trading:** with fewer than 60 1 h candles (listed less than 2.5 days ago), the 1 h trend filter reads the day itself on the 15 min: EMA 20 above EMA 50 and close above the day's VWAP. Pairs with history keep using the 1 h; their setups are bit-for-bit identical to before.
+- Mean reversion on the 15 min already traded with 10 h of candles. Trend (1 h, 60 candles) and Momentum (4 h, weeks of history) still require the long history, by design.
+
+## Live trade
+
+When you execute an opportunity, the panel shows the **See the live trade on the chart** (Ver o trade ao vivo no gráfico) button; in Positions, each row has the **live** (ao vivo) link. The `/trade/<id>` page shows the candles of the market where the order was filled (on the testnet, the Spot Testnet book), from 30 minutes before the entry, with the entry line, the current stop, the target or the trailing stop's highest price, and entry and exit markers. It refreshes every 5 seconds while the position is alive; the server caches the candles for 5 seconds and backs off when the API weight is high, so it never takes requests away from stops and exits.
+
+## How the bot decides
+
+The rules follow what has published evidence for a spot-only buyer. Nothing here guarantees a profit: the backtest numbers in the papers are optimistic, the momentum effect in crypto weakened after the BTC futures launch, and each strategy still has to pass the historical test before it trades.
+
+- **Follow the trend, long only.** Time-series momentum is the most robust effect in crypto, and it works long-only; shorting added no significant return. The **Momentum** strategy buys when the last 20 days' rise (120 4h candles) is positive, EMA 20 is above EMA 50, the price is above EMA 50 and ADX is at least 20. Confidence is that rise divided by the swing over the same period. The stop sits at 2.5 ATR and the exit is the trailing stop or EMA 20 crossing below EMA 50: let the winner run and cut the loser early.
+- **Pick where to look by relative momentum.** The cross-sectional momentum factor exists, but as a strategy of its own it is weak after costs. So it only picks the pairs: automatic selection takes the 40 most liquid USDT pairs (no stablecoins or leveraged tokens) and keeps those with the best risk-adjusted momentum, the 28-day rise divided by the standard deviation of daily returns, positive ones only. A buy still needs a Ready setup from a validated strategy.
+- **Size by risk, under separate caps.** The size comes from the stop: the loss at the stop is `risk_per_trade_pct` of capital (1% by default, at most 2%), or less when Kelly limits it. That amount divided by the stop distance gives the size. Then the lowest of these caps applies:
+  - **per-order cap:** `max_order_notional_pct` of capital × 90%. A safety ceiling only;
+  - **broker cap:** the mandate's and the Spot Testnet's (`binance.json`), × 90%;
+  - **volatility:** an order exposed to one daily ATR14 costs at most `vol_cap_pct` of capital (1% by default, 0 disables). A pair with a 10% daily ATR buys at most 10% of capital; BTC and ETH almost never reach it;
+  - **total exposure:** what is left of `max_exposure_pct` (60%), or of the volatility target, minus what is already open at the last price. The order shrinks until it fits; with no room, it is refused.
+
+  When the 7-day standard deviation of 4 h returns exceeds `vol_throttle_ratio` (2 by default, 0 disables) times that of all 4 h candles read (about 50 days), the order is halved. Since the stop comes from the ATR, a more volatile asset buys less.
+- **Per-order cap of 25%** on a fresh install. An existing `bot.json` keeps its saved value (2% on old installs) until you change it. The cap enters the mandate: until you reconfirm, the old mandate's cap wins, and Controls shows both side by side. With the defaults, a 2% stop gives 22.5% of capital (the per-order cap wins) and an 8% stop gives 12.5% (risk per trade wins). With the 2% cap, every order sits near 1.8% of capital and risk per trade limits nothing. Each opportunity shows the limit that won ("per-order cap", "risk per trade", "volatility (daily ATR)" and others) and the value of each cap.
+- **Portfolio volatility target** (`target_vol_annual`, 60% by default, 0 disables). The portfolio's annual volatility, in dollars, is estimated from 1 h returns (exponential average with a 72 h half-life, with covariance) and may not exceed 60% of capital. It only limits new entries: nothing is sold to rebalance. With fewer than 48 aligned returns, it does not limit.
+- **Bounded total risk.** The sum of the loss to the stop of every live position, plus the new one, stays below `max_open_risk_pct` of the configured capital (6% by default, at most 20%). A position whose trailing stop already passed the average price does not count; a still-pending entry counts as a whole trade.
+- **Correlation and the BTC cluster.** An entry is refused when there are already `max_correlated` (2) positions with correlation above `correlation_threshold` (0.80) with it, counting live ones and rows already accepted in the same cycle. A pair is in the BTC cluster when it is BTC or when the correlation of its 1 h returns with BTC exceeds `cluster_corr` (0.70). The cluster's risk to the stop, live plus accepted in the cycle, stays within half of `max_open_risk_pct` (3% with the defaults). The row shows the cluster.
+- **Several positions, within the balance.** Every cycle the bot reads the free USDT. In automatic mode it walks the Ready opportunities from the highest score to the lowest and accepts one per pair (diversification: two strategies never buy the same pair), within `max_positions`, the total risk and 95% of the free USDT net of fees. If cash does not cover the whole size, the order shrinks to what fits, as long as it stays above Binance's minimum; otherwise the row is Blocked (Bloqueada) with the reason. In manual mode each row is checked on its own, because you pick one at a time. Without a balance read, no entry goes out.
+- **Minimum expected profit.** `min_profit_usd` (0 by default) refuses an entry whose size times the net return to the target is below that value. With the trailing stop the target is only a reference. A larger profit per trade only comes from a larger order, and the loss at the stop grows in the same proportion.
+- **Protections after a loss** (like Freqtrade's `CooldownPeriod` and `StoplossGuard`). A pair that closed at a loss gets no new entry for `pair_cooldown_minutes` (120 by default). With `loss_guard_trades` losses (3 by default) in the last 6 hours, or with those losses adding up to `loss_guard_r` R or more (2 by default, 0 to 20; R is the loss divided by the risk to the stop at entry), no new entry goes out until the oldest losses leave the window. Zero disables each one. This cuts the string of re-entries in the same pair that turns into a loss in a bad market.
+- **Same rule live and in history.** The strategies and the signal exits decide only on closed candles, like the backtest; the still-open candle only serves as a price, and the panel marks it as "open candle preview". The signal exit reads the timeframe the position opened with: a 4 h trend exits on 4 h candles. Old positions, with no recorded timeframe, use the candles from before. In the backtest the stop fires on the candle low, at the stop price or at the open when the candle opens below it; the `target` rule's target sells at the close of the candle that closes at the target, like the cycle, never on a wick; the stop wins when the same candle touches both. Each leg pays 0.1% fee and 0.03% slippage.
+- **Exit hysteresis** (`exit_hysteresis`, on by default). Trend and momentum only exit on signal when EMA 20 is 0.5% below EMA 50 or below it on 2 closed candles in a row, not on the first cross. It is part of the validation. Each position records the rule it opened with; old positions exit without hysteresis.
+- **Simple-average indicators.** ATR, ADX and RSI use a simple moving average, not Wilder's smoothing. This is a decision: live and history compute the same numbers, and the golden digests and recorded validations stay valid. Changing it would change all of that with no evidence that it trades better.
+- **Room for the stop.** The entry uses at most 90% of the per-order cap: the gate evaluates the stop on the bid, and a rise of up to ~11% still leaves the new stop within the cap. Above that the trailing stop stops rising and the current stop stays in the book.
+- **Historical validation (gate v3).** Each timeframe the strategy trades is validated separately, over the configured set of pairs, and a setup only executes if its timeframe passed. With automatic selection on, the validated set is the liquid universe it picks from (the 40 highest-volume pairs), not the pairs picked by recent momentum: those rose precisely at the end of the period, and validating on them would be selection bias. Picking by volume at the end of the period still carries a remainder of that bias and does not see delisted pairs; the panel says so. Nothing is re-fitted: the parameters are fixed. The replay uses only closed candles and applies the portfolio limits to the trades of all pairs together: `max_positions`, one trade per pair, the pair cooldown after a loss and the loss guard, counting only accepted trades that already exited, without looking ahead. The limits used are recorded and shown in the panel; changing them does not require validating again. The limits the replay does not reproduce (total open risk, BTC cluster, correlation, entries per cycle, drawdown steps, cash) make the result a best case. The gate:
+  - the last 20% of the period, by exit date, is a hold-out with at least 5 trades, which may not lose and must earn per day at least half of what the sample earns;
+  - the rest is cut into 4 windows: 3 must profit, and the walk-forward efficiency (median of each window's gain per day over that of the previous ones) is at least 0.5;
+  - on the trades before the hold-out: Sharpe above 1, drawdown below 20% and at least 30 trades;
+  - deflated Sharpe of at least 0.95, with N equal to the number of distinct combinations (timeframe, exit rule, pairs, market filter, hysteresis) tested since the last approval, plus the current one. Every run is recorded as an attempt, so testing until it passes costs.
+
+  Monte Carlo resamples the trades in R 1000 times and records the p95 drawdown. It does not fail the validation: the cycle checks `p95 × risk_per_trade_pct < max_drawdown_pct` every minute, and the rows turn signal-only when it does not pass. Changing the limits does not require validating again. PBO (probability of backtest overfitting) is not computed: the bot does not optimise parameters, so there is no family of configurations to compare; the multiple-testing correction is the deflated Sharpe with N, and the panel says so. A result from the old gate, another strategy version or another rule goes stale: the bot validates again at start-up and in the loop, at once when the gate, version or rule changes, and at most once a day when only the pair set changes. The `classify` thresholds (`score_threshold`, `cost_multiple`, `min_reward_risk`, which is 0 with a fixed exit) are also part of the rule: changing one makes the validation stale, and the strategy's rows stay signal-only, in the cycle and in `/bot/status`, until the new validation passes. The reason for a failure appears in the panel.
+- **Drawdown steps.** Drawdown is measured from the peak of cumulative PnL. With the defaults:
+  - **5%** (`dd_reduce_pct`, 0 disables): caution. Risk per trade halved and one entry per cycle.
+  - **10%** (`max_drawdown_pct`): reduce-only. No buy goes out: strategy, manual, armed or robot. Stops, exits, trailing stop and TP1 continue. It is not the HALT: it comes back by itself when the drawdown falls below the first step (5%), not before, so it does not oscillate on the line.
+  - **15%** (`halt_drawdown_pct`): halt, which never disarms itself. After resuming, the bot stays in reduce-only until the drawdown is below 5%.
+
+  A `bot.json` without the steps derives both from `max_drawdown_pct`: half of it, and 1.5 times it between 15% and 50%. With a limit of 50% or more, the halt sits at 1.5 times the limit, at most 100%. Changing only `max_drawdown_pct` through the panel or the API recomputes both; a caution step at 0 stays disabled. An unreadable equity also puts the bot in reduce-only. The panel shows the step in a band at the top.
+- **Daily loss on equity.** The day's loss is the equity now, with open positions at the last price, minus that of the first cycle of the UTC day: unrealised loss counts. Past `max_daily_loss_pct` (3%), no buy goes out until 00:00 UTC, not manual, not armed, not robot. The cycle keeps running: stops, crossed stop, trailing stop, TP1, time limit and robot sells keep working, and Start is accepted during the pause. With `flatten_day_on_daily_loss` (off by default), the bot first sells the day-trade positions; swing ones keep their stop. Flattening by default would sell at the bottom.
+- **Market filter** (`market_filter`, off by default). With `btc_ema40d`, no entry goes out while BTC's last 4 h close is below the EMA of 240 4 h candles (about 40 days), nor when BTC was not read in the cycle. With fewer than 240 closed candles, the filter lets it through. It is part of the validation: switching it on requires validating again, and the backtest applies it without looking ahead. To compare, validate with and without; both runs count as attempts in the deflated Sharpe. It stays off because no published backtest supports it: it has to be tested, not assumed.
+- **Live demotion.** A strategy goes back to signal-only when, over 30 calendar days with at least 10 closed trades, its live daily Sharpe (a day without a trade counts 0) is below half the backtest's daily Sharpe, measured the same way, or when the last 20 trades have a negative mean R. With a negative mean R over the last 10 trades of one pair, within 90 days, the strategy stops on that pair only. A pair whose average round-trip slippage over the last 20 trades (30 days, at least 10 measured) exceeds `slippage_budget_pct` (0.3%) gets no entry. Validating again restarts the strategy's count; the per-pair blocks expire with time. Performance shows slippage per pair.
+- **Signal age.** A signal up to `max_signal_age_seconds` (120 s) old since the close of the decision candle enters in automatic mode. An older signal only enters while the price has not left it behind: at most 0.5 R above the close of the signal candle and less than a whole stop below it (R is the stop distance). A row stays Ready for the whole candle (four hours on the 4h), so a clock-only limit let automatic mode enter only in the first minutes after each close, and never after a restart; the risk of entering late is chasing the price, and that is what the rule measures. Outside it, the row states the delay and the displacement and is left for manual. Manual and armed entries show the age and the displacement and pass.
+- **Macro calendar** (convention, no paper). `macro_events_utc` (empty by default) takes event times such as CPI and FOMC; day-trade entries pause `macro_pause_minutes` (15) before and after each one. The backtest does not reproduce the pause.
+- **Real account fee.** Once a day the bot reads the account fee on Binance (`/api/v3/account/commission`, standard plus tax, assuming no BNB discount). A failure retries in 1 h and keeps the last good read. The executor uses that fee in the sell margin and the accounting, and so do the robots. The score uses the higher of 0.1% and the account's; the backtest stays at 0.1%, so the validation does not depend on the account.
+- **Fractional Kelly** (like jevymarket's `KELLY_FRACTION`). When the strategy has an estimated hit rate `p`, the risk at the stop becomes the lower of `risk_per_trade_pct` and `kelly_fraction` (0.25 by default) of `p − (1 − p) / b`, with `b` the gain to the target per unit of risk; Kelly ≤ 0 refuses the entry as "no estimated edge". `b` is the target's gain, and with the trailing stop the target is not an exit, so it is a ceiling. With the automatic mode defaults (minimum hit rate 60% and reward/risk 1.5) Kelly is above 0.33 and the ceiling does not bind; it weighs on manual entries with a low hit rate and when the minimum hit rate is lowered. Test rows do not use Kelly.
+- **Entries per cycle limit** (`max_entries_per_cycle`, 2 by default, like jevymarket's `MAX_TRADES_PER_RUN`): automatic mode opens at most that many positions per cycle (1 in caution mode) and leaves the rest for the next one, avoiding buying several pairs at once on the same move.
+- **Hit rate of accepted setups.** The replay marks on each trade whether the live filters (score, cost, reward/risk) would accept it. The estimated rate used by Kelly and the hit-rate floor is the lower of the rate over all trades and the rate over accepted ones, but the accepted rate only counts with a minimum sample and with the same thresholds as the current config; below that the overall rate applies. Performance shows both.
+- **Calibration** (like jevymarket's `stats`): each position records the estimated hit rate at entry; in Performance, a table compares, per bucket, the estimate with the share that actually profited. Test rows are left out.
+- **Real capital.** Sizing uses the lower of the configured capital and the free USDT plus the value of the bot's positions. Equity, daily loss and drawdown are still measured on the configured capital, so a withdrawal does not become a false drawdown. The stored peak is that of cumulative PnL, not of equity, so changing the capital does not become a drawdown either: the peak becomes the new capital plus that PnL.
+
+Left out: chandelier exit, market sell as the crossed stop's last resort (production-only path, untestable on the Spot Testnet) and OCO on the day trade's TP1 (see Day trading). Resting limit buys exist only for the DCA and grid robots, as an option.
+
+Sources: [Freqtrade, protections](https://www.freqtrade.io/en/stable/plugins/#protections); [NautilusTrader, risk engine](https://nautilustrader.io/docs/python-api-latest/risk.html); [Hummingbot, kill switch](https://hummingbot.org/client/global-configs/kill-switch/); [Coin Bureau, risk per trade and portfolio heat](https://coinbureau.com/guides/risk-management-strategies-crypto-trading); [Rozario et al., arXiv 2009.12155](https://arxiv.org/abs/2009.12155v1); [Liu, Tsyvinski and Wu, NBER w25882](https://www.nber.org/papers/w25882.pdf); [Time series and cross sectional momentum in the cryptocurrency market, AUT](https://acfr.aut.ac.nz/__data/assets/pdf_file/0009/918729/Time_Series_and_Cross_Sectional_Momentum_in_the_Cryptocurrency_Market_with_IA.pdf); [Man Group, Crypto: too hot to handle](https://www.man.com/insights/crypto-too-hot-to-handle); [Volatility-managed crypto momentum, Springer 2025](https://link.springer.com/article/10.1007/s11408-025-00474-9).
+
+## Day trading
+
+Two short-window strategies, switched on and off like the others: **Day · Intraday momentum** (`intraday_momentum`) and **Day · VWAP pullback** (`vwap_pullback`). The design, the sources and the architect's review are in [docs/plano-day-trade.md](docs/plano-day-trade.md).
+
+- **Entry:** buy only. Enters on a closed 15 min candle, and only with the closed 1 h candles rising (EMA 20 above EMA 50, close above EMA 50). No entry between 03:00 and 07:00 UTC, the hours with the thinnest book.
+- **Stop:** 1.5 ATR of the 15 min, with a 1% floor. Below that, the round-trip cost (about 0.25%) would eat more than a quarter of the risk.
+- **Exit:**
+  - At TP1 (1.5 times the risk), half is sold and the stop of the rest rises to the entry price plus 0.2%.
+  - What is left exits within 6 hours.
+  - "Breakeven" is a stop-limit with 0.5% room: in a fast move it may fill about 0.3% below the entry, or not fill on a gap.
+- **Filters:** the score and the cost and reward/risk filters measure TP1, the trade's target in R. Only the backtest gate measures the real result of the two halves.
+- **Orders:** a day trade spends up to 5 orders (entry, stop, TP1, new stop, exit). With a day strategy on, the mandate counts 6 per entry.
+- **TP1 without OCO:** between cancelling the stop and replacing it at TP1, half of the position spends a few seconds with no stop. The bot measures that window (Performance). OCO is reconsidered if the p95 of the TP1 window exceeds 2 s over 30 days, or if a crossed stop happens during a TP1.
+- **Validation:** 120 days of 15 min and 1 h candles, with the same exit rules. The gate is the swing's v3 (4 windows, hold-out and deflated Sharpe), with the Sharpe measured on daily returns, because with many trades the per-trade Sharpe is easy:
+  - Sharpe of daily returns above 1;
+  - at least 30 trades before the hold-out;
+  - average net return of at least 0.10% per trade;
+  - drawdown below 20%;
+  - 3 of 4 windows profitable, hold-out with at least 5 trades and no loss, and deflated Sharpe of at least 0.95.
+
+  The validation only covers the rules it replicated.
+- **Preset:** "Apply day-trade preset" (Aplicar preset de day trade, in Controls) shows what changes and only then saves:
+  - switches the day strategies on and the swing ones off;
+  - 0.5% risk per trade;
+  - 2% daily loss;
+  - up to 8 trades a day;
+  - 60 min pause on the pair after a loss;
+  - target of at least 3x the cost;
+  - reconfirms the mandate.
+
+**What the evidence says.** Most day traders lose after costs: fewer than 1% profit predictably in Taiwan, and 97% of those who persisted lost in Brazil. No peer-reviewed study shows long-only day trading in spot crypto to be profitable after 0.2% per round trip.
+
+The 90-day backtest to 2026-10-16, still with the old gate, confirmed this on both strategies:
+- **Testnet pairs (BTC, ETH, SOL):** all lost.
+- **Volatile pairs (AVAX, ZEC, INJ, NEAR, STRK, TIA):** only intraday momentum on INJ passed, 1 of 18 tests, which is what chance would give.
+
+The bot does not really trade what fails the gate; on the testnet, test mode lets you exercise the flow.
+
+## DCA and grid robots
+
+Robots the operator configures on the Robots (Robôs) page, like Binance's Spot DCA and Spot Grid. They do not go through the validation gate: creation checks the whole plan before the first buy (worst case against risk per trade, total exposure, per-order cap and order budget). Their orders come out of `instance_orders_per_day` (0 by default: no robots), reserved in the mandate.
+
+- **Maximum robots:** `max_instances` (3 by default) alive at the same time. One per pair, and never on a pair with a strategy position.
+- **Pause between rounds:** `cooldown_minutes` (1 min by default, like Binance's 60 s). The DCA's re-buy after the target and the grid's restart after selling everything wait that long.
+- **Preview:** a replay of the last 30, 90 and 180 days of 1 h candles. Marks in red a grid whose close stayed outside the range more than 30% of the time: a grid only earns in a sideways market. It is history, not a promise.
+- **Orders:** market buys and LIMIT IOC sells, every minute, with the stop on Binance. Only reduce-only, halt and the daily pause block robot buys; stops and sells continue. Stopping a robot sells what it holds, with no global halt.
+- **Resting buys in the book** (off by default; "resting limit buy" option (compra limitada no livro) on the robots page): with `resting_buys`, the robot leaves at most one LIMIT GTC buy order, at the next grid level or the DCA's next safety order. It locks USDT, not the coin, so it coexists with the stop. It costs 3 orders of the budget (place, cancel, replace the stop). At VIP0 maker and taker both cost 0.1%: the gain is the price (fills at the level, no spread, and catches touches within the minute), not the fee. On fill, the buy joins the position and the stop is replaced; the halt cancels resting buys before writing the flag. They also leave the book before any sell, on Stop, and on any buy block (clock, daily pause, reduce-only); a fill that arrives together with the cancellation joins the position. Pausing the cycle is refused (409, "compra limitada ainda no livro") while the cancellation is unconfirmed or the bought part has no stop yet: the cycle keeps running until it resolves. A buy Binance already confirmed is only forgotten when a cancellation confirms the order does not exist; until then it blocks sells and new resting buys. If the old stop does not leave the exchange within 3 cycles in a row after a buy, the bot halts. The 30/90/180-day preview fills the buy at the level when the candle low touches it.
+- **Account fee and the gate.** With an account fee lower than the market default (VIP tier), the stop and sell quantities keep the default fee's margin, which is what the order gate checks: a little more dust is left, and the stop is never refused for balance.
+
+## DeepSeek advisor
+
+An optional advisor asks [DeepSeek](https://api-docs.deepseek.com) for a second opinion on each Ready strategy row. It **advises**; the deterministic engine still decides. The design, the decisions and the architect's review are in [docs/plano-refatoracao-deepseek.md](docs/plano-refatoracao-deepseek.md).
+
+- **What it can do.** Answer `confirm`, `reduce` or `veto`, with confidence, regime and a short rationale. In `filter` mode, a veto with confidence of at least `min_veto_confidence` (60%) takes the row out of automatic mode; it stays Ready for manual, with the reason "IA desaconselha: ...". A `reduce` multiplies the size by a factor between 0.25 and 1, after every cap and the throttle; the cap shows as "análise IA".
+- **What it never does.** Create a row, raise a size, turn a refusal into an entry, touch the order gate, the mandate, the halt, the stops or the exits. DCA and grid robots, armed entries and test rows are not consulted. Manual entries show the verdict and are not blocked.
+- **Why it only reduces.** An LLM answer cannot be reproduced in the backtest. Removing or shrinking entries is the same class as the filters that already exist only live, so the validation stays a ceiling on what the bot does.
+- **Modes** (`advisor.mode` in Controls): `off` (default), `shadow` (asks and records, no order changes) and `filter`. Start in `shadow` and only switch to `filter` when the calibration shows the vetoes avoid losses.
+- **Neutral failure.** With no key, no network, an exhausted budget, an invalid answer or a timeout, the bot trades as if there were no advisor. With `require_verdict`, a row without a verdict does not enter in automatic mode; the panel asks for confirmation before switching it on.
+- **Outside the cycle lock.** The calls run on their own thread with a bounded queue; the cycle only reads the cache and enqueues without waiting. A row waits for the verdict for up to `wait_seconds` (45 s), counted across cycles, and then goes on. Each signal (pair, strategy, timeframe and candle) is asked once per environment: a testnet verdict never applies to a production row. A restart does not ask again: the verdicts already recorded in `advice_log` return to the cache before the first cycle's score, with no call and no cost, so a `reduce` recorded before the restart also reduces the first entry after it. Each call attempt has a total deadline of 45 s, besides the connect and read deadlines: blank rows from a long queue do not hold the advisor.
+- **Model.** `deepseek-flash` (default) or `deepseek-v4-pro`, in JSON mode and without reasoning, for predictable latency and cost. The prompt carries only numbers and categories built by the code (setup, timeframe indicators, BTC regime, account risk level), never text from an external source. The indicators use only closed candles up to the close of the signal candle, on every timeframe, even when the query happens hours later: the model does not see the path the calibration measures it on.
+- **Cost.** Daily budget in `daily_budget_usd` (US$ 1 by default), per DeepSeek key: checked before every call against the sum of the UTC day's spend on the testnet and in production, so it survives restarts and mode switches. The header and Controls show that sum. A billed attempt that ends in an error (such as an empty answer, retried once) also counts. The cost is an estimate from the price table in the code (dated); the billed amount is the one in the DeepSeek console. A call costs about US$ 0.001.
+- **Calibration.** Each verdict gets a counterfactual R under the fixed-exit replay rules: entry at the close of the signal candle, stop on the low (with gap), target only on the close, at most 48 candles, net of fee and slippage. Performance groups by model and prompt version and shows, per verdict, n, mean R and standard error; high-confidence vetoes get their own row and the realised R of the rows that entered sits in a separate column. A useful veto has a negative counterfactual R. A row only counts once the 48 candles have passed, and each signal counts once. When the pair leaves the analysed list, the window's candles are read from Binance through the same path as the historical test (a few per hour, never under weight pressure); a row whose candles were read and that is still unlabelled a day after the window ends expires: it stays out of the averages, is not retried and appears in Waiting (Aguardando) as expired. A read that fails (network, Binance error) does not prove missing data: the row is retried, and only three failures after the grace day expire it.
+
+**Key.** Lives in `deepseek.json`, in the same folder as `binance.json` (`BOT_RUNTIME_ROOT`), with permission 0600. To save it, run on the bot's machine and paste the key when prompted (it is read from standard input, never from an argument):
+
+```powershell
+python -m bot.ops advisor-key
+```
+
+`DEEPSEEK_API_KEY` only applies when the file has no key. The key never goes to `bot.json`, the panel, the API, the logs, the ledger or the `advice_log`; a field with `key`, `secret` or `token` in its name is refused in `PUT /bot/config`.
+
+## Repository layout
+
+```
+bot/                 Python package: API, trading loop and everything they share
+  __main__.py        python -m bot: uvicorn API on 8000 plus the tick loop thread
+  runtime.py         Runtime: cycle lock, halt, ledger, start/pause/resume
+  cycle/             one cycle's parts: market reads, exits, risk level, scoring, robots
+  strategies/        trend, momentum, mean reversion, day (intraday, VWAP), fixed, trailing, funding
+  backtest/          walk-forward backtest shared with the live strategies; validation gate
+  risk.py            sizing by risk, caps, drawdown steps, correlation and cluster limits
+  executor.py        entries, stops, exits, crossed stop, reconciliation
+  instances.py       DCA and grid robots
+  exchange/          Binance connector: ccxt reads, SDK writes, weight, profiles
+  live/              mandate, halt and order gate ported from Vibe-Trading
+  governance/        tamper-evident ledger ported from Vibe-Trading
+  advisor/           DeepSeek advisor: client, prompt, budget, calibration
+  api/               FastAPI app, token/Host/Origin auth, presets, validation jobs
+  store.py           SQLite store (positions, decisions, validations, advice log)
+  collector.py, markets.py, features.py, indicators.py   market data and indicators
+  promotion.py, decay.py, mandate_io.py, config.py, paths.py, ops.py   gates, demotion, config, CLI
+ui/                  operator panel: React 19, Vite, Tailwind, ECharts
+  src/pages/         Controls, Opportunities, Positions, Bots, Performance, Balance, History, TradeLive
+  vite.config.ts     proxy that adds the API token and the Host header
+tests/               pytest suite, with a fake venue for the exchange
+docs/                design documents (day trading, strategy review, refactor and DeepSeek)
+ORIGIN.md            origin of every ported module and how to diff it against Vibe-Trading
+Dockerfile, ui/Dockerfile, docker-compose.yml   containers for API and panel
+```
+
+## Operation
+
+1. Python 3.12 and Node 22. From the root:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
+pip install -e ".[dev]"
+pytest
+cd ui
+npm install
+npm run dev
+```
+
+2. In another terminal, with an explicit runtime root (do not use the source folder for keys):
+
+```powershell
+$env:BOT_RUNTIME_ROOT = "$env:USERPROFILE\.the-trader-bot"
+python -m bot
+```
+
+3. The panel is at `http://127.0.0.1:5173` and the API at `http://127.0.0.1:8000`. On first start the API writes a token to `%USERPROFILE%\.the-trader-bot\api-token` (the `BOT_RUNTIME_ROOT`). The Vite proxy reads that file and sends the token with every call; the browser never sees it. The API refuses requests without the token, with another `Host`, with another `Origin` or, on writes, without the `X-Bot-Client: panel` header. Run Vite with the same `BOT_RUNTIME_ROOT` as the API.
+
+4. First configuration, on the Controls page:
+
+- Save the **Spot Testnet** keys in `%USERPROFILE%\.the-trader-bot\binance.json` or in the `BINANCE_TESTNET_API_KEY` and `BINANCE_TESTNET_API_SECRET` variables. The panel never receives a key. The production key, when there is one, needs an IP restriction and no withdrawal permission.
+- Set the capital and confirm the mandate. The bot writes `mandate.json` with `crypto` instruments only, leverage 1 and four orders per entry allowed per day (entry, stop, exit and one replaced stop).
+- On the Spot Testnet, set in `binance.json`: `testnet_audit_only: false`, `testnet_max_order_notional` (for example `{"USDT": "100"}`) and `testnet_max_daily_operations` with room for three orders per entry. The connector's default is 2 operations a day, which does not cover even one entry.
+- Switch a strategy on and click "validate on history" (validar no histórico, `POST /bot/strategies/{id}/validate`). The test runs in the background over the configured pairs, on each timeframe the strategy trades: 240 days of 1h and 480 of 4h for Trend, 480 days of 4h for Momentum, 120 days of 15m and 240 of 1h for Mean Reversion, and 120 days of 15m (plus the 1h) for the day strategies, with the same 300-candle window as the live bot. Every strategy on every timeframe, with 15 pairs, took about 3 minutes on synthetic data; each run records the time spent. The panel shows the progress and, in Performance, the detail per timeframe: raw and deflated Sharpe, attempts, the 4 windows, the hold-out, the Monte Carlo against the limit, profit factor and expectancy in R. It only trades if it passes gate v3: Sharpe above 1, drawdown below 20% and at least 30 trades before the hold-out, 3 of 4 windows profitable, hold-out with at least 5 trades and no loss, and deflated Sharpe of at least 0.95 (see "How the bot decides").
+- Pairs: "use the 20 most liquid" (usar os 20 mais líquidos) swaps the 5 default pairs for the 20 USDT pairs with the highest 24h volume (no stablecoins); pairs with an open position never leave. The collection runs in parallel to fit the 60 s cycle.
+- Automatic selection (`auto_select`, off by default): once an hour the bot replaces the list with the most promising pairs (15 by default, 5 to 20). While it is on, the list cannot be changed from the panel. On the testnet, the selection, the most-liquid button and the edited list only accept pairs the Spot Testnet lists (`testnet.binance.vision`), because the analysis uses the real market and the orders go to the testnet. Any listed pair qualifies, even with little trading there. The testnet's 24 h ticker lags 30 s to minutes on thin pairs, and the gate refuses a quote older than 15 s. So, on the testnet only, bid and ask come from the live book and the quote age counts from the read time; production keeps using Binance's time. A pair with no sellers in the testnet book (like PEPE on 2026-10-19) does not fill the buy.
+- Spot Testnet test mode (testnet only): buy setups that failed a quality filter or whose strategy is not validated appear as Ready with the **test** (teste) mark, so you can test buy, stop and exit. They go out through the execute button and, with automatic trading on, also through the cycle (highest score first, within the balance and the limits). They do not enter the hit rate or the demotion. Production ignores the option.
+- Start. The cycle is 60 seconds. The grey badge means Spot Testnet.
+
+5. Stop everything (`POST /bot/halt` or the button) stops the cycle and writes the HALT, which blocks every new order. With "flatten on halt" (zerar no halt) checked, the bot sells the positions **before** writing the HALT; what it cannot sell keeps a replaced stop. Without the option, the positions stay open with the stop on Binance. The choice lives in the mandate: changing it requires reconfirming the mandate, and with a saved mandate the mandate decides. Resuming is `POST /bot/resume`, manual. Before releasing, the bot resolves the limit buys the halt left in the book; if any is still unconfirmed, the resume is refused (409) and the halt continues. Start runs the same check when the cycle is stopped. The cycle also halts by itself after three failures in a row, on a drawdown of `halt_drawdown_pct` (15%) and when a position is left without a stop and without a way out, including a crossed stop the two IOCs did not sell. After a drawdown halt, resuming returns to reduce-only until the drawdown falls below `dd_reduce_pct`.
+
+6. Production is another directory: `testnet/` and `production/` have their own store, journal, mandate, HALT and ledger. `binance.json`, `bot.json` and `api-token` stay at the root. The switch falls back to testnet if any precondition is missing, and the reason shows on screen. The G1 to G4 releases only change by editing `bot.json`; the API never writes them. **Promotion:** the switch requires, over the last 30 days of testnet, positive net PnL, at least 30 closed strategy trades with a recorded R, positive expectancy in R and the Monte Carlo p95 × risk per trade below `max_drawdown_pct`. It also requires no quantitative mandate violation in the testnet audit ledger over those 30 days. **Pilot:** the exception is a pilot: with a capital limit of up to 50 (`pilot_max_production_capital_usd` in `bot.json`, or `pilot_cap_usd` sent by the panel on the switch, in the "Small-money pilot" (Piloto com pouco dinheiro) card) above zero and the production capital (allocated × `production_capital_fraction`, 10% by default) within that value, the switch waives only the history; every other condition still applies. The panel can also request `pilot_skip_validation`: the pilot writes that flag in the production store and the enabled strategies trade without the historical validation (and, until there is a sample, without a hit-rate estimate), keeping only the per-pair demotion; the flag is cleared on every switch that does not request it and never applies on the testnet. The panel can also request `pilot_skip_gates`, only with `pilot_gates_waivable: true` in `bot.json` (without it the switch is refused): the pilot waives the G1 to G4 releases on that switch only (bot stopped, no open position, keys, mandate, PRODUCAO and the testnet audit are still required), and the flag stays in the production store; a full promotion never waives them. The limit is written to the production store at the switch and checked wherever the mandate is written, so editing `bot.json` later does not loosen it: raising the capital, reconfirming the mandate or applying the preset above the limit is refused (409). The panel shows "Pilot production" (Produção piloto). Even so, the real limit is the account balance: keep only the test amount in it. On approval, the bot writes the production mandate with the production capital (10% of the allocated). Leaving production requires no open production position: with "flatten on halt" checked the bot sells first; if anything stays open, the switch is refused, because the testnet process would not track those positions.
+
+The mandate limits the exposure of the positions the bot opened, valued at the current quote. The rest of the account (USDT cash, coins that were already there) does not count as the bot's exposure.
+
+`binance.json` is still the ported connector's credential file. `bot.json` holds mode, capital, strategies and limits, and those limits can never loosen the mandate.
+
+## Environment variables and runtime files
+
+| Variable | Used by | Meaning |
+| --- | --- | --- |
+| `BOT_RUNTIME_ROOT` | API, panel | Runtime directory for keys, `bot.json`, `api-token` and the stores. Default `~/.the-trader-bot`. The panel reads the token there. |
+| `BOT_API_HOST` | API | Bind address of the API. Default `127.0.0.1`; Docker sets `0.0.0.0`. The Host-header guard still applies. |
+| `BOT_API_URL` | panel | Where the Vite proxy sends `/bot` calls. Default `http://127.0.0.1:8000`; Docker sets `http://api:8000`. |
+| `BOT_PANEL_HOST` | panel | Bind address of Vite. Default `127.0.0.1`; Docker sets `0.0.0.0`. |
+| `BOT_HOME`, `BOT_UID`, `BOT_GID` | docker compose | Host directory mounted at `/data` (default `~/.the-trader-bot`) and the uid/gid the containers run as. |
+| `BINANCE_TESTNET_API_KEY`, `BINANCE_TESTNET_API_SECRET` | API | Spot Testnet keys, as an alternative to `binance.json`. |
+| `DEEPSEEK_API_KEY` | API | Advisor key, only when `deepseek.json` has none. |
+
+Files under `BOT_RUNTIME_ROOT`:
+
+| Path | Content |
+| --- | --- |
+| `binance.json` | Connector credentials and testnet limits (`testnet_audit_only`, `testnet_max_order_notional`, `testnet_max_daily_operations`). |
+| `bot.json` | Mode, capital, strategies, limits, G1 to G4 releases, pilot settings. Written by the API, except the releases. |
+| `api-token` | Token the API writes on first start and the panel's proxy sends on every call. |
+| `deepseek.json` | Advisor key, written by `python -m bot.ops advisor-key`. |
+| `testnet/`, `production/` | One per environment: SQLite store, `mandate.json`, `HALT`, `bot-ledger.jsonl` and `binance-execution-journal.jsonl`. |
+
+## Performance and concurrency
+
+Measured on the testnet, from Brazil (about 270 ms per request to Binance):
+
+- **Collection outside the cycle lock.** The market read runs without holding the lock; only the computation and the orders hold it. A `PUT /bot/config` during a cycle dropped from up to 12.3 s to 77 ms.
+- **Parallel collection per request.** Up to 16 requests at once, with a reused HTTP client (keep-alive) and the book of every pair in a single call. Collecting 15 pairs dropped from 5.7 s to about 2.2 s. A pair that fails is left out of the cycle and recorded in the ledger (`collect_partial`); if it has an open position, the whole cycle is refused, so the stop and the exit never use a stale price.
+- **Binance market table cached** for an hour, per host and client type, with the clock adjustment alongside. Before, every quote and order downloaded `exchangeInfo` again.
+- **Journal verified incrementally.** The read checks only the new lines against the last known hash. The whole chain is rebuilt every 5 minutes and always before recording a new order.
+- **Ledger with rotation** at 1 MiB: appending does not grow with the history. The daily report and the start-up check (in the background) verify the chain across the rotated files.
+- **SQLite** with a 10 s `busy_timeout` and a rollback journal (WAL needs shared memory that Docker Desktop's bind mount does not guarantee). Decisions are only written when they change: the same opportunity read every minute of the same candle becomes one row, not 240. Since the mean reversion reason carries the RSI, it writes a new row when the RSI changes. Decisions, signals and equity points older than 30 days are deleted once a day; the cumulative PnL peak is kept separately, so the drawdown does not change.
+- **Backtest.** The strategies refuse first on the cheap tests (breakout and volume, RSI, moving-average trend) and only then compute ADX and ATR; the result is bit-for-bit identical (`tests/test_bot_strategy_golden.py`), and the evaluation became 3 to 14 times faster. Each pair runs in a separate process (up to 4, `spawn`), because the computation is Python and pandas and threads would share the interpreter lock. The window is 299 closed candles, the same the cycle sees, and is recorded in the validation parameters.
 
 ## Docker
 
@@ -230,30 +325,34 @@ Medido no testnet, a partir do Brasil (cerca de 270 ms por requisição à Binan
 docker compose up -d --build
 ```
 
-Sobe a API (`python -m bot`, porta 8000) e o painel (build do Vite servido por `vite preview`, porta 5173), as duas só em 127.0.0.1. Os dois contêineres montam a pasta do operador (`~/.the-trader-bot`, ou a de `BOT_HOME`) em `/data`: chaves, `bot.json`, `api-token` e os stores de testnet e produção continuam no mesmo lugar que fora do Docker. O painel monta só leitura, para ler o token. O proxy do painel fala com `http://api:8000` e envia o Host `127.0.0.1:8000`, que é o único que a API aceita. Pare a API rodando fora do Docker antes: dois processos na mesma pasta negociariam em dobro. No Linux, crie a pasta antes do primeiro `up` e rode com o dono dela: `mkdir -p ~/.the-trader-bot && BOT_UID=$(id -u) BOT_GID=$(id -g) docker compose up -d --build`; no Docker Desktop (Windows, macOS) não é preciso. A chave da DeepSeek fica na mesma pasta: grave com `docker compose exec api python -m bot.ops advisor-key`, que pede a chave sem mostrar e a salva em `deepseek.json`; o consultor a lê na próxima consulta. `docker compose logs -f api` mostra o ciclo; `docker compose down` para tudo, e as posições continuam protegidas pelo stop na Binance.
+Starts the API (`python -m bot`, port 8000) and the panel (the Vite build served by `vite preview`, port 5173), both on 127.0.0.1 only. Both containers mount the operator's folder (`~/.the-trader-bot`, or the one in `BOT_HOME`) at `/data`: keys, `bot.json`, `api-token` and the testnet and production stores stay where they are outside Docker. The panel mounts it read-only, to read the token. The panel's proxy talks to `http://api:8000` and sends the Host `127.0.0.1:8000`, the only one the API accepts. Stop any API running outside Docker first: two processes on the same folder would trade twice. On Linux, create the folder before the first `up` and run as its owner: `mkdir -p ~/.the-trader-bot && BOT_UID=$(id -u) BOT_GID=$(id -g) docker compose up -d --build`; Docker Desktop (Windows, macOS) needs neither. `docker compose logs -f api` shows the cycle; `docker compose down` stops everything, and the positions stay protected by the stop on Binance.
 
-## Testes
+## Tests
 
 ```powershell
 pytest
+ruff check .
+mypy
 ```
 
-A suíte cobre store e migração, coletor (dado velho, relógio, par sem perpétuo), score, painel e autenticação da API, cada limite de risco com PnL real, o gate de mandato com posições precificadas, entrada, stop, saída parcial, stop recusado, orçamento de ordens, reconciliação, halt com zerar antes do flag, idempotência, backtest, relatório contra o ledger, decaimento de Sharpe e o perfil de produção.
+The suite covers store and migration, collector (stale data, clock, pair without a perpetual), score, panel and API authentication, every risk limit with real PnL, the mandate gate with priced positions, entry, stop, partial exit, refused stop, order budget, reconciliation, halt with flatten before the flag, idempotency, backtest, report against the ledger, Sharpe decay and the production profile.
 
-Desde a revisão de estratégias, cobre também: o tamanho pelo risco com cada teto e o limite que venceu, o teto do mandato até reconfirmar, a entrada LIMIT IOC (parcial, sem execução, sem ask), o stop atravessado (dois IOCs e halt), a folga do stop móvel e a janela sem stop, os degraus de drawdown e o só reduzir em todo caminho de compra, a perda diária sobre o patrimônio, o filtro de mercado sem olhar o futuro, a correlação no mesmo ciclo e o cluster do BTC, o gate v3 (walk-forward, hold-out, Sharpe deflacionado com N, Monte Carlo em R, por timeframe e por pares), a revalidação de resultados velhos, a histerese, o decaimento por trades e por par, o bloqueio por slippage, a promoção com R e auditoria, a idade do sinal, o calendário macro, a taxa da conta e os robôs (pausa entre rodadas, máximo de robôs e prévia de 30/90/180 dias).
+Since the strategy review, it also covers: sizing by risk with every cap and the limit that won, the mandate cap until reconfirmation, the LIMIT IOC entry (partial, no fill, no ask), the crossed stop (two IOCs and halt), the trailing stop's room and the no-stop window, the drawdown steps and reduce-only on every buy path, the daily loss on equity, the market filter without look-ahead, same-cycle correlation and the BTC cluster, gate v3 (walk-forward, hold-out, deflated Sharpe with N, Monte Carlo in R, per timeframe and per pairs), re-validation of stale results, hysteresis, demotion by trades and by pair, the slippage block, promotion with R and audit, signal age, the macro calendar, the account fee and the robots (pause between rounds, maximum robots and the 30/90/180-day preview).
 
-## Recuperação do journal de execução
+`ruff` lints `bot` and `tests`; `mypy` type-checks the packages listed in `pyproject.toml` in strict mode, with the vendored modules reviewed as a diff against their origin instead (see [ORIGIN.md](ORIGIN.md)). The UI type-checks with `npm run build` in `ui/`.
 
-Uma queda no meio de um envio, um cancelamento de resultado desconhecido ou uma contradição entre o journal e a Binance bloqueiam **toda** ordem nova, inclusive stops e saídas, até serem resolvidos. Os stops que já estão na Binance continuam valendo. O painel mostra o aviso e `GET /bot/status` traz o campo `journal`. A API nunca resolve esses estados; só o operador, num terminal, com o robô parado:
+## Execution journal recovery
+
+A crash in the middle of a send, a cancellation with an unknown result or a contradiction between the journal and Binance block **every** new order, stops and exits included, until resolved. The stops already on Binance keep working. The panel shows the warning and `GET /bot/status` carries the `journal` field. The API never resolves these states; only the operator, in a terminal, with the bot stopped:
 
 ```powershell
 python -m bot.ops status
 python -m bot.ops reconcile
-python -m bot.ops confirm-absent order:<id> --reason "processo que enviou caiu"
-python -m bot.ops ack-conflict conflict:<id> --reason "investigado"
-python -m bot.ops adopt-checkpoint --reason "journal restaurado do backup"
+python -m bot.ops confirm-absent order:<id> --reason "the sending process crashed"
+python -m bot.ops ack-conflict conflict:<id> --reason "investigated"
+python -m bot.ops adopt-checkpoint --reason "journal restored from backup"
 ```
 
-`--mode testnet|production` escolhe o ambiente; o padrão é o do `bot.json`. `confirm-absent` só marca a ordem como ausente se a Binance confirmar que ela não existe. `adopt-checkpoint` recusa quando o checkpoint aponta registros que sumiram do journal: restaure o backup primeiro. O robô reconcilia sozinho a cada ciclo enquanto houver pendência, mas um `SUBMISSION_PENDING` (envio que nunca voltou) sempre exige `confirm-absent`.
+`--mode testnet|production` picks the environment; the default is the one in `bot.json`. `confirm-absent` only marks the order as absent if Binance confirms it does not exist. `adopt-checkpoint` refuses when the checkpoint points to records that vanished from the journal: restore the backup first. The bot reconciles by itself every cycle while something is pending, but a `SUBMISSION_PENDING` (a send that never returned) always requires `confirm-absent`.
 
-Se um ledger (`bot-ledger.jsonl`, `binance-execution-journal.jsonl`) terminar sem quebra de linha depois de uma queda, ele recusa novos registros. Faça backup, apague a última linha incompleta e rode `adopt-checkpoint`.
+If a ledger (`bot-ledger.jsonl`, `binance-execution-journal.jsonl`) ends without a line break after a crash, it refuses new records. Back it up, delete the last incomplete line and run `adopt-checkpoint`.
