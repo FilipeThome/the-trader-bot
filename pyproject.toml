@@ -1,7 +1,7 @@
 [project]
 name = "the-trader-bot"
 version = "1.0.0"
-description = "Autonomous Binance spot bot with a ported order gate, journal and operator panel."
+description = "Long-only Binance spot trading bot: validated strategies, risk-sized entries, exchange-side stops, DCA/grid robots, an optional DeepSeek advisor and a local operator panel behind a ported order gate and tamper-evident journal."
 requires-python = ">=3.12"
 dependencies = [
     "ccxt==4.5.76",
