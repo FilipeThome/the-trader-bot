@@ -28,7 +28,7 @@ Cabeçalho `# Based on Vibe-Trading d7f1b9e…`.
 
 | Módulo | O que mudou |
 | --- | --- |
-| `bot/exchange/sdk.py` | Escrita de ordens (`place_order`, `cancel_order`, latch de escrita, `_reject_write_surface`), perfil `live-trade-bot`, ordens `stop_loss_limit`/`take_profit_limit`, `config_path` na raiz base, campos `average`/`cost`/`fees` no retorno, `.env` via `python-dotenv` |
+| `bot/exchange/sdk.py` | Escrita de ordens (`place_order`, `cancel_order`, latch de escrita, `_reject_write_surface`), perfil `live-trade-bot`, ordens `stop_loss_limit`/`take_profit_limit`, `config_path` na raiz base, campos `average`/`cost`/`fees` no retorno, `.env` via `python-dotenv`, recusa definitiva pela hierarquia de erros do ccxt (com recuo pelos nomes do MRO), um reenvio da escrita recusada por -1021 depois de remedir o relógio |
 | `bot/exchange/profiles.py` | Perfis de escrita `binance-paper-trade` e `binance-live-trade-bot`, `profile_by_id` |
 | `bot/exchange/shaping.py` | `average` e `cost` em `order_to_dict` |
 | `bot/exchange/__init__.py` | Docstring |

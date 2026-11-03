@@ -2,8 +2,8 @@ import { useState } from "react";
 
 import { api } from "../api";
 import { Help } from "../Help";
-import { riskLevels, strategyName } from "../labels";
-import { parseDecimal, parseWhole } from "../numbers";
+import { advisorModels, advisorModes, riskLevels, strategyName } from "../labels";
+import { formatUsdCost, parseDecimal, parseWhole } from "../numbers";
 import { useBot } from "../store";
 import type { MandateSummary, Status, ValidationJob } from "../types";
 
@@ -22,6 +22,11 @@ export function Controls() {
   const busy = useBot((state) => state.busy);
   const [capital, setCapital] = useState("");
   const [confirmation, setConfirmation] = useState("");
+  // Production pilot asked from the panel: its cap, and which gates of the switch it waives.
+  const [pilotCap, setPilotCap] = useState("");
+  const [pilotHistory, setPilotHistory] = useState(false);
+  const [pilotValidation, setPilotValidation] = useState(false);
+  const [pilotGates, setPilotGates] = useState(false);
   const [winRate, setWinRate] = useState("");
   const [tradeRisk, setTradeRisk] = useState("");
   const [openRisk, setOpenRisk] = useState("");
@@ -53,6 +58,13 @@ export function Controls() {
   const stopLossPct = parseDecimal(stopLoss) ?? (stopLoss.trim() === "" && fixedOn ? (status.stop_loss_pct ?? 0) * 100 : null);
   // Same bounds as bot.strategies.fixed: a target under 1% never clears the cost filter.
   const fixedValid = takeProfitPct != null && takeProfitPct >= 1 && takeProfitPct <= 100 && stopLossPct != null && stopLossPct >= 0.5 && stopLossPct <= 50;
+  // Same bounds as the API's pilot_cap_usd; the production capital must fit the cap.
+  const pilotCapValue = parseDecimal(pilotCap);
+  const pilotCapValid = pilotCapValue != null && pilotCapValue > 0 && pilotCapValue <= 50;
+  const productionCapital = status.production_capital_usd ?? status.allocated_capital_usd * 0.1;
+  const pilotFits = pilotCapValid && productionCapital <= (pilotCapValue ?? 0) + 1e-9;
+  const pilotMaxAllocated =
+    pilotCapValid && productionCapital > 0 ? (status.allocated_capital_usd * (pilotCapValue ?? 0)) / productionCapital : null;
   const riskPayload: Record<string, number> = {};
   if (tradeRisk.trim() !== "") riskPayload.risk_per_trade_pct = tradeRiskValue;
   if (openRisk.trim() !== "") riskPayload.max_open_risk_pct = openRiskValue;
@@ -90,7 +102,12 @@ export function Controls() {
           Ambiente atual: <strong>{status.mode === "production" ? "Produção" : "Spot Testnet"}</strong>. Capital em uso{" "}
           {status.capital_usd} de {status.allocated_capital_usd} USD.
           {status.pilot_cap_usd != null && (
-            <strong className="ml-1 text-amber-600"> Produção piloto: capital limitado a US$ {status.pilot_cap_usd}, sem os 30 dias de testnet.</strong>
+            <strong className="ml-1 text-amber-600">
+              {" "}
+              Produção piloto: capital limitado a US$ {status.pilot_cap_usd}, sem os 30 dias de testnet.
+              {status.pilot_skip_validation && " As estratégias ligadas operam sem validação no histórico."}
+              {status.pilot_skip_gates && " Trocado sem as liberações G1 a G4."}
+            </strong>
           )}
         </span>
         <Help text="Spot Testnet é o ensaio, sem a conta real. Produção usa dinheiro de verdade e, nessa hora, o robô arrisca só 10% do capital que você alocou. Capital em uso é o que entra na conta do tamanho de cada ordem." />
@@ -504,11 +521,60 @@ export function Controls() {
       </p>
       <RulesCard status={status} />
       <MacroCard status={status} />
+      <AdvisorCard status={status} />
       <div className="rounded border border-neutral-300 p-3 dark:border-neutral-700">
         <p className="mb-2 flex items-center font-medium">
           Switch de ambiente
-          <Help text="Troca o ensaio pela conta real, ou volta ao ensaio. Ir para produção exige o robô parado, sem posição aberta, chaves válidas, mandato só de cripto, as quatro liberações gravadas no bot.json e a palavra PRODUCAO escrita igual. Se faltar qualquer coisa, ele permanece no testnet." />
+          <Help text="Troca o ensaio pela conta real, ou volta ao ensaio. Ir para produção exige o robô parado, sem posição aberta, chaves válidas, mandato só de cripto, as quatro liberações gravadas no bot.json, a palavra PRODUCAO escrita igual e 30 dias de testnet com lucro, 30 trades com R e drawdown dentro do limite. O piloto abaixo dispensa só esses 30 dias, com o capital limitado. Se faltar qualquer coisa, ele permanece no testnet." />
         </p>
+        <div className="mb-3 rounded border border-amber-400 p-2">
+          <p className="mb-1 flex items-center font-medium">
+            Piloto com pouco dinheiro
+            <Help text="Para testar a conta real com uma quantia pequena. Dispensa os 30 dias de testnet enquanto o capital de produção (10% do alocado) ficar até o limite informado, de no máximo US$ 50. O limite é gravado na troca e trava o capital: subir o alocado depois é recusado. Chaves, mandato, robô parado, sem posição aberta, a palavra PRODUCAO e sem violação no testnet continuam exigidos. A segunda caixa deixa as estratégias ligadas operarem sem o teste histórico e, até haver amostra, sem estimativa de acerto. A terceira dispensa as quatro liberações G1 a G4 do bot.json só nesta troca, e só se o bot.json tiver pilot_gates_waivable ligado. Mesmo assim, deixe na conta só o valor do teste." />
+          </p>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={pilotHistory}
+              onChange={(event) => {
+                setPilotHistory(event.target.checked);
+                if (!event.target.checked) {
+                  setPilotValidation(false);
+                  setPilotGates(false);
+                }
+              }}
+            />
+            Ignorar o histórico de 30 dias do testnet
+          </label>
+          <label className="mt-1 flex items-center gap-2">
+            <input type="checkbox" disabled={!pilotHistory} checked={pilotValidation} onChange={(event) => setPilotValidation(event.target.checked)} />
+            Ignorar a validação das estratégias (operar sem o teste histórico)
+          </label>
+          <label className="mt-1 flex items-center gap-2">
+            <input type="checkbox" disabled={!pilotHistory} checked={pilotGates} onChange={(event) => setPilotGates(event.target.checked)} />
+            Ignorar as liberações G1 a G4 (exige pilot_gates_waivable no bot.json; robô parado continua exigido)
+          </label>
+          <p className="mt-2">
+            <label>
+              Capital do piloto (US$, até 50){" "}
+              <input
+                className="w-24 border bg-transparent px-2 py-1"
+                value={pilotCap}
+                onChange={(event) => setPilotCap(event.target.value)}
+                disabled={!pilotHistory}
+                inputMode="decimal"
+                aria-label="Capital do piloto"
+              />
+            </label>
+          </p>
+          <p className="mt-1 text-xs text-neutral-500">
+            Capital de produção hoje: {usd(productionCapital)}, de {usd(status.allocated_capital_usd)} alocados.
+            {pilotHistory && pilotCapValid && !pilotFits && pilotMaxAllocated != null && (
+              <span className="ml-1 text-red-600">Acima do limite: reduza o capital alocado para até {usd(pilotMaxAllocated)}.</span>
+            )}
+            {pilotHistory && pilotCap.trim() !== "" && !pilotCapValid && <span className="ml-1 text-red-600">Informe um valor acima de 0 e até 50.</span>}
+          </p>
+        </div>
         <input
           className="mb-2 block w-full border bg-transparent px-2 py-1"
           placeholder="digite PRODUCAO para promover"
@@ -518,10 +584,31 @@ export function Controls() {
         />
         <p className="flex flex-wrap items-center gap-3">
           <span className="inline-flex items-center">
-            <button className="underline" type="button" onClick={() => void run("Ir para Produção", () => api.updateConfig({ mode: "production", confirmation }))}>
+            <button
+              className="underline disabled:no-underline disabled:opacity-50"
+              type="button"
+              disabled={pilotHistory && !pilotFits}
+              onClick={() => {
+                const payload: Record<string, unknown> = { mode: "production", confirmation };
+                if (pilotHistory) {
+                  payload.pilot_cap_usd = pilotCapValue;
+                  payload.pilot_skip_validation = pilotValidation;
+                  payload.pilot_skip_gates = pilotGates;
+                  const text =
+                    `Ir para produção como piloto, com dinheiro real?\n\nCapital de produção limitado a ${usd(pilotCapValue ?? 0)}, sem os 30 dias de testnet.` +
+                    (pilotValidation
+                      ? "\nAs estratégias ligadas vão operar SEM validação no histórico e, até haver amostra, sem estimativa de acerto."
+                      : "") +
+                    (pilotGates ? "\nA troca dispensa as liberações G1 a G4 do bot.json." : "") +
+                    "\n\nDeixe na conta só o valor do teste.";
+                  if (!window.confirm(text)) return;
+                }
+                void run("Ir para Produção", () => api.updateConfig(payload));
+              }}
+            >
               Ir para Produção
             </button>
-            <Help text="Pede a troca para a conta real. Sem a palavra PRODUCAO e sem as liberações, a tela mostra o motivo e continua no Spot Testnet." />
+            <Help text="Pede a troca para a conta real. Sem a palavra PRODUCAO e sem as liberações, a tela mostra o motivo e continua no Spot Testnet. Com o piloto marcado, pede confirmação e envia o limite de capital." />
           </span>
           <span className="inline-flex items-center">
             <button className="underline" type="button" onClick={() => void run("Voltar para Spot Testnet", () => api.updateConfig({ mode: "testnet" }))}>
@@ -854,6 +941,186 @@ function RulesCard({ status }: { status: Status }) {
         <Help text={`A perda do dia conta o patrimônio, inclusive o que ainda não foi realizado. Ao passar de ${pctText(status.limits.max_daily_loss_pct)} do capital, o robô pausa as entradas até o dia seguinte (UTC). Marcado, ele também vende os day trades abertos antes de pausar; as posições swing seguem com o stop. Desmarcado por padrão, porque vender na perda costuma vender no fundo.`} />
       </p>
     </div>
+  );
+}
+
+/** The DeepSeek advisor's settings, saved through PUT /bot/config ``advisor``. The key never passes through the panel. */
+function AdvisorCard({ status }: { status: Status }) {
+  const perform = useBot((state) => state.perform);
+  const [budget, setBudget] = useState("");
+  const [vetoPct, setVetoPct] = useState("");
+  const [wait, setWait] = useState("");
+  const advisor = status.advisor;
+  if (!advisor) return null;
+  // Same bounds as bot.config.AdvisorConfig; the API refuses anything else with a 422.
+  const budgetValue = parseDecimal(budget);
+  const budgetValid = budgetValue != null && budgetValue <= 50;
+  const vetoValue = parseDecimal(vetoPct);
+  const vetoValid = vetoValue != null && vetoValue >= 50 && vetoValue <= 100;
+  const waitValue = parseWhole(wait);
+  const waitValid = waitValue != null && waitValue >= 5 && waitValue <= 120;
+  const typed: [string, boolean, string, number | null][] = [
+    ["daily_budget_usd", budgetValid, budget, budgetValue],
+    ["min_veto_confidence", vetoValid, vetoPct, vetoValue == null ? null : vetoValue / 100],
+    ["wait_seconds", waitValid, wait, waitValue],
+  ];
+  const filled = typed.filter(([, , text]) => text.trim() !== "");
+  const payload: Record<string, number> = {};
+  for (const [key, , , value] of filled) if (value != null) payload[key] = value;
+  const valid = filled.length > 0 && filled.every(([, ok]) => ok);
+  const save = (label: string, change: Record<string, unknown>, describe?: () => string) =>
+    perform(label, () => api.updateConfig({ advisor: change }), describe);
+  return (
+    <div className="space-y-2 rounded border border-neutral-300 p-3 dark:border-neutral-700">
+      <p className="flex items-center font-medium">
+        Consultor DeepSeek
+        <Help text="Uma segunda opinião sobre cada sinal Pronto das estratégias, dada pela IA da DeepSeek com os números do setup, do par, do BTC e da conta. O motor do robô decide: a IA só pode tirar uma entrada do automático ou diminuir o tamanho dela. Nunca cria nem aumenta uma ordem, e nunca passa pelo portão de segurança, pelo mandato, pelo halt ou pelos stops. Sem chave, sem rede ou sem orçamento, o robô opera como se ela estivesse desligada." />
+      </p>
+      <p>
+        Chave:{" "}
+        {advisor.configured ? (
+          <span className="text-green-600">presente</span>
+        ) : (
+          <>
+            <span className="text-amber-600">ausente</span>
+            <span className="block text-neutral-500">
+              Rode <code>python -m bot.ops advisor-key</code> na máquina do robô e cole a chave quando ele pedir. Ela fica em deepseek.json, nunca no painel nem no bot.json.
+            </span>
+          </>
+        )}
+      </p>
+      <p className="flex flex-wrap items-center gap-2">
+        <label className="inline-flex items-center">
+          Modo
+          <select
+            className="ml-2 bg-transparent"
+            value={advisor.mode}
+            onChange={(event) => {
+              const mode = event.target.value;
+              void save(`Consultor: ${advisorModes[mode] ?? mode}`, { mode });
+            }}
+          >
+            {Object.entries(advisorModes).map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <Help text="Desligado: nada é consultado. Sombra: cada sinal Pronto é enviado à IA uma vez; o veredito é gravado e aparece em Oportunidades, e nenhuma ordem muda nem espera. Filtro: um veto com confiança acima do mínimo tira a linha do automático (o manual continua permitido), e um reduzir multiplica o tamanho por um fator entre 0,25 e 1. Confirmar não muda nada. Em nenhum modo a IA cria ou aumenta uma ordem. Robôs DCA e Grid, entradas armadas e linhas de teste não são consultados. Use a sombra até a calibração em Desempenho mostrar que os vetos ajudam." />
+        <label className="ml-4 inline-flex items-center">
+          Modelo
+          <select
+            className="ml-2 bg-transparent"
+            value={advisor.model}
+            onChange={(event) => {
+              const model = event.target.value;
+              void save(`Consultor: modelo ${advisorModels[model] ?? model}`, { model });
+            }}
+          >
+            {Object.entries(advisorModels).map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <Help align="end" text="Flash é rápido e barato. V4 Pro custa mais por chamada. Cada modelo e cada versão do prompt têm a própria linha na calibração de Desempenho." />
+      </p>
+      <p className="flex items-center">
+        <label>
+          <input
+            type="checkbox"
+            checked={advisor.require_verdict}
+            onChange={(event) => {
+              const on = event.target.checked;
+              if (on && !window.confirm("Exigir o veredito da IA?\n\nNo modo filtro, uma linha sem veredito não entra no automático. Se a DeepSeek falhar, a chave faltar ou o orçamento do dia acabar, as entradas automáticas param até ela voltar.")) return;
+              void save(on ? "Exigir o veredito da IA" : "Não exigir o veredito da IA", { require_verdict: on });
+            }}
+          />{" "}
+          Exigir veredito para entrar no automático
+        </label>
+        <Help text="Só no modo filtro. Marcado, uma linha Pronta sem veredito não entra no automático. Atenção: se a API da DeepSeek falhar, ficar sem chave ou o orçamento do dia acabar, as entradas automáticas param até ela voltar. Stops, saídas e a entrada manual continuam. Desmarcado, depois da espera a linha segue sem veredito." />
+      </p>
+      <AdvisorField
+        label="Orçamento diário (US$)"
+        help="Gasto máximo estimado por dia UTC. Ao chegar nele, as linhas seguem sem veredito até o dia seguinte. De 0 a 50."
+        current={formatUsdCost(advisor.daily_budget_usd)}
+        text={budget}
+        bad={budget.trim() !== "" && !budgetValid}
+        onChange={setBudget}
+      />
+      <AdvisorField
+        label="Confiança mínima do veto (%)"
+        help="No modo filtro, um veto só tira a linha do automático com pelo menos esta confiança. Abaixo dela, o veto só aparece. De 50 a 100."
+        current={`${Math.round(advisor.min_veto_confidence * 100)}%`}
+        text={vetoPct}
+        bad={vetoPct.trim() !== "" && !vetoValid}
+        onChange={setVetoPct}
+      />
+      <AdvisorField
+        label="Espera pelo veredito (s)"
+        help="No modo filtro, quanto tempo uma linha Pronta fica fora do automático esperando o veredito, contado entre ciclos. Depois disso, ou com erro, segue sem ele. De 5 a 120."
+        current={`${advisor.wait_seconds} s`}
+        text={wait}
+        bad={wait.trim() !== "" && !waitValid}
+        onChange={setWait}
+      />
+      <button
+        className="underline disabled:opacity-50"
+        type="button"
+        disabled={!valid}
+        onClick={() =>
+          void save("Salvar o consultor", payload, () => "Consultor salvo").then((outcome) => {
+            if (outcome.ok) {
+              setBudget("");
+              setVetoPct("");
+              setWait("");
+            }
+          })
+        }
+      >
+        salvar consultor
+      </button>
+      <p className="text-neutral-500">
+        Hoje, testnet e produção somados: {advisor.today.calls} consultas · {formatUsdCost(advisor.today.cost_usd)} de {formatUsdCost(advisor.daily_budget_usd)} (estimativa) · {advisor.today.errors} erros
+        {advisor.last_ok && <> · último veredito {new Date(advisor.last_ok).toLocaleString("pt-BR")}</>} · prompt {advisor.prompt_version}
+      </p>
+      {advisor.last_error && <p className="text-red-600">Último erro: {advisor.last_error}</p>}
+    </div>
+  );
+}
+
+/** One numeric advisor setting: typed, checked against its bounds, saved with the others. */
+function AdvisorField({
+  label,
+  help,
+  current,
+  text,
+  bad,
+  onChange,
+}: {
+  label: string;
+  help: string;
+  current: string;
+  text: string;
+  bad: boolean;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label className="flex flex-wrap items-center gap-2">
+      <span className="inline-flex w-64 items-center">
+        {label}
+        <Help text={help} />
+      </span>
+      <input
+        className={`w-20 border bg-transparent px-2 py-1 ${bad ? "border-red-600" : ""}`}
+        value={text}
+        onChange={(event) => onChange(event.target.value)}
+        aria-label={label}
+      />
+      <span className="text-neutral-500">atual {current}</span>
+    </label>
   );
 }
 

@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-import bot.runtime as runtime_module
+from bot.cycle import market as market_module
 from bot.exchange import service
 from bot.exchange.execution.rules import MarketRules
 from bot.exchange.service import AccountMarketRules
@@ -148,7 +148,7 @@ def test_a_slow_fee_read_does_not_delay_the_cycle_beyond_the_budget(tmp_path, mo
         return (Decimal("0.001"), Decimal("0.00075"))
 
     monkeypatch.setattr(service, "trading_fees", slow)
-    monkeypatch.setattr(runtime_module, "FEE_WARMUP_BUDGET_SECONDS", 0.2)
+    monkeypatch.setattr(market_module, "FEE_WARMUP_BUDGET_SECONDS", 0.2)
     runtime = _live_runtime(tmp_path, monkeypatch)
     started = time.monotonic()
     assert runtime._account_takers(["BTC/USDT", "ETH/USDT"]) == {}

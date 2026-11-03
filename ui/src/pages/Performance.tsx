@@ -3,9 +3,9 @@ import * as echarts from "echarts";
 
 import { Help } from "../Help";
 import { stopWindowKinds, strategyName } from "../labels";
-import { formatR } from "../numbers";
+import { formatR, formatUsdCost } from "../numbers";
 import { useBot } from "../store";
-import type { Status, TimeframeResult } from "../types";
+import type { AdviceCalibrationLine, AdvisorUsage, AdvisorUsageTotals, Status, TimeframeResult } from "../types";
 
 /** The deflated Sharpe the gate needs (runner.MIN_DSR). */
 const MIN_DSR = 0.95;
@@ -34,6 +34,8 @@ export function Performance() {
   const days = useBot((state) => state.days);
   const calibration = useBot((state) => state.calibration);
   const pairs = useBot((state) => state.pairs);
+  const adviceCalibration = useBot((state) => state.adviceCalibration);
+  const advisorUsage = useBot((state) => state.advisorUsage);
   const status = useBot((state) => state.status);
   const dark = useBot((state) => state.dark);
   const node = useRef<HTMLDivElement>(null);
@@ -110,6 +112,8 @@ export function Performance() {
         </table>
       )}
 
+      {(status?.advisor || advisorUsage) && <AdvisorReport lines={adviceCalibration} usage={advisorUsage} />}
+
       <div className="mt-8 grid gap-6 text-sm lg:grid-cols-2">
         <StopWindows status={status} />
         <div>
@@ -152,6 +156,120 @@ export function Performance() {
 
       <Validation status={status} />
     </section>
+  );
+}
+
+/** "+0,12 R ± 0,05": a mean counterfactual R and its standard error. */
+function meanWithError(mean: number | null, se: number | null): string {
+  if (mean == null) return "—";
+  return se == null ? formatR(mean) : `${formatR(mean)} ± ${num(se)}`;
+}
+
+/** "12 confirmar · 3 reduzir · 2 vetar · 1 sem opinião": the verdicts of a usage range. */
+function verdictMix(totals: AdvisorUsageTotals): string {
+  const parts: [number, string][] = [
+    [totals.confirm, "confirmar"],
+    [totals.reduce, "reduzir"],
+    [totals.veto, "vetar"],
+    [totals.abstain, "sem opinião"],
+  ];
+  const shown = parts.filter(([count]) => count > 0).map(([count, label]) => `${count} ${label}`);
+  return shown.length ? shown.join(" · ") : "—";
+}
+
+/** The advisor's verdicts measured by counterfactual R, per model and prompt version, and its calls and cost. */
+function AdvisorReport({ lines, usage }: { lines: AdviceCalibrationLine[]; usage: AdvisorUsage | null }) {
+  const groups = new Map<string, AdviceCalibrationLine[]>();
+  for (const line of lines) {
+    const key = `${line.model} · prompt ${line.prompt_version}`;
+    groups.set(key, [...(groups.get(key) ?? []), line]);
+  }
+  return (
+    <div className="mt-8 text-sm">
+      <p className="mb-2 flex items-center font-medium">
+        Consultor DeepSeek: calibração dos vereditos
+        <Help text="Cada veredito gravado, tenha entrado ou não, recebe o R que a posição teria feito entrando no fechamento da vela do sinal, com o stop e o alvo da linha, pelas regras do teste histórico e já sem o custo. Um veto útil tem R contrafactual médio negativo: as linhas desaconselhadas teriam perdido. Um confirmar útil fica acima da linha de todas as consultadas. Uma linha só entra na média depois que as 48 velas da janela passaram desde o sinal, qualquer que seja o resultado; até lá conta em Aguardando. Uma linha cuja janela passou sem as velas para medi-la (o par saiu da lista e a leitura do histórico falhou) expira: fica fora das médias e aparece em Aguardando como expirada. EP é o erro padrão: uma diferença menor que duas vezes ele pode ser sorte. Os vetos com confiança acima do mínimo têm linha própria: são o que o modo filtro tiraria." />
+      </p>
+      {groups.size === 0 ? (
+        <p className="text-neutral-500">Nenhum veredito registrado neste ambiente.</p>
+      ) : (
+        [...groups.entries()].map(([key, members]) => (
+          <div key={key} className="mb-4 overflow-x-auto">
+            <p className="mb-1 text-neutral-500">{key}</p>
+            <table className="text-left">
+              <thead className="text-neutral-500">
+                <tr>
+                  <th className="pr-6 font-medium">Veredito</th>
+                  <th className="pr-6 font-medium">n</th>
+                  <th className="pr-6 font-medium">R contrafactual (± EP)</th>
+                  <th className="pr-6 font-medium">
+                    Reduzir: (1 − fator) × R
+                    <Help text="Quanto o tamanho menor mudou o resultado, em R da posição cheia. Negativo é perda evitada; positivo é ganho que ficou na mesa." />
+                  </th>
+                  <th className="pr-6 font-medium">
+                    R realizado
+                    <Help text="O R das posições que estas linhas abriram e já fecharam, com o tamanho e as saídas reais. Fica à parte: misturar com o contrafactual escolheria as linhas pelo resultado." />
+                  </th>
+                  <th className="font-medium">Aguardando</th>
+                </tr>
+              </thead>
+              <tbody>
+                {members.map((line) => {
+                  const vetoLine = line.group === "veto" || line.group === "veto_confident";
+                  const tone = !vetoLine || line.mean_r == null ? "" : line.mean_r < 0 ? "text-green-600" : "text-red-600";
+                  return (
+                    <tr key={line.group} className={`border-t border-neutral-200 dark:border-neutral-800 ${line.group === "all" ? "font-medium" : ""}`}>
+                      <td className="pr-6">{line.label}</td>
+                      <td className="pr-6">{line.n}</td>
+                      <td className={`pr-6 ${tone}`}>{meanWithError(line.mean_r, line.se)}</td>
+                      <td className="pr-6">{line.group === "reduce" ? formatR(line.reduced_mean_r) : "—"}</td>
+                      <td className="pr-6">{line.realized_n > 0 ? `${formatR(line.realized_mean_r)} (n=${line.realized_n})` : "—"}</td>
+                      <td>
+                        {line.waiting}
+                        {line.expired ? ` (+${line.expired} expiradas)` : ""}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ))
+      )}
+      <p className="mb-2 mt-4 flex items-center font-medium">
+        Consultor DeepSeek: uso
+        <Help text="Consultas, custo e vereditos por dia UTC. Uma consulta por sinal Pronto, não por ciclo. O custo é uma estimativa pela tabela de preços do código; o valor faturado é o do painel da DeepSeek. Erros são consultas sem veredito: chave, limite de concorrência, demora, resposta vazia ou inválida." />
+      </p>
+      {!usage ? (
+        <p className="text-neutral-500">Uso indisponível.</p>
+      ) : (
+        <>
+          <table className="text-left">
+            <thead className="text-neutral-500">
+              <tr>
+                <th className="pr-6 font-medium" />
+                <th className="pr-6 font-medium">Consultas</th>
+                <th className="pr-6 font-medium">Custo</th>
+                <th className="pr-6 font-medium">Vereditos</th>
+                <th className="font-medium">Erros</th>
+              </tr>
+            </thead>
+            <tbody>
+              {([["Hoje", usage.today], ["30 dias", usage.last_30_days]] as [string, AdvisorUsageTotals][]).map(([label, totals]) => (
+                <tr key={label} className="border-t border-neutral-200 dark:border-neutral-800">
+                  <td className="pr-6 text-neutral-500">{label}</td>
+                  <td className="pr-6">{totals.calls}</td>
+                  <td className="pr-6">{formatUsdCost(totals.cost_usd)}</td>
+                  <td className="pr-6">{verdictMix(totals)}</td>
+                  <td className={totals.errors > 0 ? "text-amber-600" : ""}>{totals.errors}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="mt-1 text-xs text-neutral-500">Custo estimado com os preços de {usage.prices_as_of}.</p>
+        </>
+      )}
+    </div>
   );
 }
 
@@ -207,9 +325,14 @@ function Validation({ status }: { status: Status | null }) {
     <div className="mt-8 text-sm">
       <p className="mb-1 flex items-center font-medium">
         Validação no histórico
-        <Help text="O teste que libera cada estratégia, por tempo gráfico. Aprova com: pelo menos 30 trades fora do hold-out, Sharpe acima de 1, queda menor que 20%, 3 de 4 janelas do walk-forward no lucro com eficiência (WFE) de pelo menos 0,5, hold-out final sem prejuízo e Sharpe deflacionado (DSR) de pelo menos 0,95. O DSR desconta quantas combinações foram testadas desde a última aprovação: quanto mais tentativas, mais exigente. Só o tempo gráfico aprovado opera." />
+        <Help text="O teste que libera cada estratégia, por tempo gráfico. Aprova com: pelo menos 30 trades fora do hold-out, Sharpe acima de 1, queda menor que 20%, 3 de 4 janelas do walk-forward no lucro com eficiência (WFE) de pelo menos 0,5, hold-out final com pelo menos 5 trades, lucro e ganho por dia de pelo menos metade do da amostra, e Sharpe deflacionado (DSR) de pelo menos 0,95. O DSR desconta quantas combinações foram testadas desde a última aprovação: quanto mais tentativas, mais exigente. O teste aplica os limites da carteira (posições, pausa do par, trava de perdas) com que rodou; mudar um limite não pede validar de novo. Só o tempo gráfico aprovado opera." />
       </p>
       <p className="mb-3 text-neutral-500">PBO não calculado: sem otimização de parâmetros.</p>
+      {status?.pilot_skip_validation && (
+        <p className="mb-3 text-amber-600">
+          Produção piloto sem validação: as estratégias ligadas operam sem este teste. O limite de capital do piloto é a proteção.
+        </p>
+      )}
       {ids.length === 0 && <p className="text-neutral-500">Nenhuma validação registrada neste ambiente.</p>}
       {ids.map((id) => (
         <StrategyValidation
@@ -272,7 +395,7 @@ function StrategyValidation({
         <span className="block text-xs text-neutral-500">WFE {num(r.wfe)}</span>
       </span>
     )],
-    ["Hold-out", "Os últimos 20% do histórico, guardados fora do teste. Não pode dar prejuízo.", (r) =>
+    ["Hold-out", "Os últimos 20% do histórico, guardados fora do teste. Precisa de pelo menos 5 trades, lucro e ganho por dia de pelo menos metade do ganho por dia da amostra.", (r) =>
       r.holdout ? (
         <span className={r.holdout.passed ? "text-green-600" : "text-red-600"}>
           {pct(r.holdout.net)} em {r.holdout.trades} trades <span className="text-neutral-500">desde {day(r.holdout.start)}</span>
@@ -289,12 +412,38 @@ function StrategyValidation({
         </span>
       );
     }],
+    ["Filtro de entrada", "Os trades que o robô aceitaria ao vivo (nota, custo e ganho/risco com os limiares usados no teste), com a taxa de acerto, comparados a todos os trades do teste que os limites da carteira deixaram entrar. Com amostra suficiente e os mesmos limiares de hoje, a menor das duas taxas vale no piso de acerto e no Kelly.", (r) =>
+      r.filtered_trades == null ? "—" : (
+        <span>
+          {r.filtered_trades} de {r.trades ?? "—"} · acerto {pct(r.filtered_trades ? (r.filtered_wins ?? 0) / r.filtered_trades : null, 0)}
+          {" "}(todos {pct(r.trades ? (r.wins ?? 0) / r.trades : null, 0)})
+          <span className="block text-xs text-neutral-500">
+            Sharpe diário {num(r.filtered_sharpe)} · nota {num(r.score_threshold)} · custo {num(r.cost_multiple, 1)}x · ganho/risco {num(r.min_reward_risk, 1)}
+          </span>
+        </span>
+      )],
+    ["Limites da carteira", "Os limites com que o teste rodou: vagas, um trade por par, pausa do par depois de perda e trava de perdas. Os trades recusados por eles saem do teste. Risco total, cluster do BTC, correlação, caixa e vagas de outras estratégias não entram: o resultado é o melhor caso.", (r) =>
+      r.limits && r.limits.max_positions != null ? (
+        <span>
+          {r.skipped_by_limits ?? 0} trades pulados
+          <span className="block text-xs text-neutral-500">
+            {r.limits.max_positions} posições · pausa do par {r.limits.pair_cooldown_minutes} min · trava {r.limits.loss_guard_trades} perdas ou {num(r.limits.loss_guard_r, 1)} R em 6 h
+          </span>
+        </span>
+      ) : "—"],
     ["Fator de lucro", "Ganhos brutos divididos pelas perdas brutas. Acima de 1 ganha mais do que perde.", (r) => num(r.profit_factor)],
     ["Expectativa", "Resultado médio por trade em unidades de risco: +0,2 R ganha em média um quinto do que arrisca.", (r) => formatR(r.expectancy_r)],
     ["Queda máxima", "A maior queda do teste, por unidade investida. Precisa ficar abaixo de 20%.", (r) => pct(r.max_drawdown)],
   ];
+  const liquid = Object.values(results).find((result) => result.universe === "liquid");
   return (
     <div className="mb-6 overflow-x-auto rounded border border-neutral-300 p-3 dark:border-neutral-700">
+      {liquid && (
+        <p className="mb-2 text-xs text-neutral-500">
+          Seleção automática: o teste rodou nos {liquid.universe_pairs ?? 40} pares mais líquidos por volume, não só nos escolhidos.
+          A escolha por volume no fim do período ainda carrega algum viés e não vê pares deslistados.
+        </p>
+      )}
       <p className="mb-2 font-medium">
         {strategyName(id)} · {validated ? <span className="text-green-600">opera</span> : <span className="text-neutral-500">só sinal</span>}
         <span className="ml-2 inline-flex items-center font-normal text-neutral-500">

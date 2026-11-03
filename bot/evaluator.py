@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from bot.strategies import THRESHOLD_KEYS
 from bot.strategies.base import Setup
 
 SPOT_TAKER = 0.001
@@ -16,8 +18,7 @@ MIN_REWARD_RISK = 1.5
 
 def regime_factor(strategy_id: str, regime: str, direction: float) -> float:
     if strategy_id == "trend":
-        if regime == "range":
-            return 0.5
+        # A breakout setup needs an ADX trend, so it never carries "range".
         if (direction > 0 and regime == "trend_up") or (direction < 0 and regime == "trend_down"):
             return 1.0
         return 0.0
@@ -119,9 +120,16 @@ class Opportunity:
     slippage_est: float | None = None
     #: Target distance above the entry; the executor re-applies it on the average fill.
     plan_target_pct: float | None = None
+    #: The setup's market regime (``Setup.regime``: trend_up, trend_down, range, funding...).
+    regime: str | None = None
+    #: The DeepSeek advisor's verdict on this row, for the panel and the position it opens
+    #: (``bot.advisor.service.AdviceState.public``); None when the row was not consulted.
+    advice: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
 
 
 def estimate_win_rate(
@@ -130,23 +138,48 @@ def estimate_win_rate(
     *,
     exit_policy: str,
     min_sample: int,
+    thresholds: tuple[float, float, float] | None = None,
 ) -> tuple[float | None, int]:
     """Laplace estimate (wins + 1) / (trades + 2) over backtest and live trades.
 
-    Backtest trades count only when they were replayed with ``exit_policy``,
-    and ``live`` must already hold only positions opened under it (see
+    Backtest trades count only when they were replayed with ``exit_policy``
+    (``trades`` and ``wins``: the replayed trades left after the portfolio
+    limits), and ``live`` must already hold only positions opened under it (see
     ``Store.strategy_outcomes``): a different exit rule describes a different
-    trade. Returns ``(None, n)``
-    below ``min_sample`` trades. This is a historical hit rate of the strategy,
-    not a probability for one setup.
+    trade. Returns ``(None, n)`` below ``min_sample`` trades. This is a
+    historical hit rate of the strategy, not a probability for one setup.
+
+    Live trades only setups ``classify`` makes ready, a smaller population than
+    the replay's. When the replay's filtered trades (``filtered_trades`` and
+    ``filtered_wins``) were marked with ``thresholds`` (``THRESHOLD_KEYS``, the
+    current config) and, with the live trades, reach ``min_sample``, the
+    estimate is the lower of the general and the filtered one. Otherwise the
+    general estimate holds: the filtered side never makes it None.
     """
     wins, total = live
+    filtered: tuple[int, int] | None = None
     if params and params.get("exit_policy") == exit_policy:
+        if _same_thresholds(params, thresholds) and params.get("filtered_trades") is not None:
+            filtered = (wins + int(params.get("filtered_wins") or 0), total + int(params.get("filtered_trades") or 0))
         wins += int(params.get("wins") or 0)
         total += int(params.get("trades") or 0)
     if total < min_sample:
         return None, total
-    return (wins + 1) / (total + 2), total
+    rate = (wins + 1) / (total + 2)
+    if filtered is not None and filtered[1] >= min_sample:
+        rate = min(rate, (filtered[0] + 1) / (filtered[1] + 2))
+    return rate, total
+
+
+def _same_thresholds(params: dict[str, Any], thresholds: tuple[float, float, float] | None) -> bool:
+    """Whether the replay marked its filtered trades with these ``classify`` thresholds."""
+    if thresholds is None:
+        return False
+    try:
+        stored = [float(params[key]) for key in THRESHOLD_KEYS]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return all(math.isclose(left, float(right), abs_tol=1e-9) for left, right in zip(stored, thresholds))
 
 
 def classify(
@@ -217,4 +250,5 @@ def classify(
         alphas=setup.alphas,
         blocker=blocker,
         slippage_est=slippage,
+        regime=setup.regime,
     )

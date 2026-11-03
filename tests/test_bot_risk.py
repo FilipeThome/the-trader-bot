@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import math
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -10,10 +11,13 @@ import pytest
 from bot.config import RiskLimits
 from bot.evaluator import Opportunity
 from bot.risk import (
+    CLOCK_BUY_BLOCK,
+    PAUSE_BUY_BLOCK,
     SIZE_LIMITS,
     RiskManager,
     RiskState,
     allocate,
+    buy_block,
     mc_drawdown,
     mc_drawdown_ok,
     planned_notional,
@@ -581,3 +585,117 @@ def test_without_returns_allocation_is_unchanged() -> None:
     assert [row.symbol for row in first] == [row.symbol for row in second] == ["ETH/USDT", "SOL/USDT", "DOGE/USDT"]
     assert all(row.cluster is None for row in plain + explicit)
     assert [row.size_usd for row in plain] == [row.size_usd for row in explicit] == [500.0, 500.0, 500.0]
+
+
+# -- buy_block: the one answer to "may the bot buy now?" -------------------------------------
+
+_NOW = datetime(2026, 10, 28, 12, 0, tzinfo=timezone.utc)
+_REDUCING = "modo só reduzir: drawdown de 11% desde o pico (limite de 10%); só saídas"
+_HALT = "drawdown de 15% desde o pico: parada no limite de 15%"
+_LEVELS: dict[str, Any] = {
+    "none": None,
+    "normal": {"level": "normal", "drawdown": 0.02, "reason": ""},
+    "cautious": {"level": "cautious", "drawdown": 0.06, "reason": "modo cauteloso: drawdown de 6%"},
+    "reducing": {"level": "reducing", "drawdown": 0.11, "reason": _REDUCING},
+    "reducing_unlabelled": {"level": "reducing", "drawdown": 0.12},
+    "reducing_bare": {"level": "reducing"},
+    "halt": {"level": "halt", "drawdown": 0.15, "reason": _HALT},
+    "cycle_normal": RiskState("normal", 0.0, 1.0, None, ""),
+    "cycle_reducing": RiskState("reducing", 0.11, 0.0, 0, _REDUCING),
+    "cycle_halt": RiskState("halt", 0.15, 0.0, 0, _HALT),
+    "cycle_daily_loss": RiskState("normal", 0.0, 1.0, None, "perda diária de 2% — pausa até o próximo dia UTC", pause_day=True),
+}
+#: The block each level gives on its own (no pause, clock in sync).
+_LEVEL_BLOCK: dict[str, str | None] = {
+    "none": None,
+    "normal": None,
+    "cautious": None,
+    "reducing": _REDUCING,
+    "reducing_unlabelled": "modo só reduzir: drawdown de 12.0%",
+    "reducing_bare": "modo só reduzir",
+    "halt": _HALT,
+    "cycle_normal": None,
+    "cycle_reducing": _REDUCING,
+    "cycle_halt": _HALT,
+    "cycle_daily_loss": "perda diária de 2% — pausa até o próximo dia UTC",
+}
+_PAUSES = {"none": None, "past": "2026-10-28T00:00:00+00:00", "running": "2026-10-29T00:00:00+00:00", "garbage": 3}
+
+
+@pytest.mark.parametrize("clock", [False, True])
+@pytest.mark.parametrize("pause", list(_PAUSES))
+@pytest.mark.parametrize("level", list(_LEVELS))
+def test_buy_block_is_the_clock_then_the_level_then_the_pause(level: str, pause: str, clock: bool) -> None:
+    reason = buy_block(_LEVELS[level], _PAUSES[pause], _NOW, clock_blocked=clock)
+    if clock:
+        expected = CLOCK_BUY_BLOCK
+    elif _LEVEL_BLOCK[level] is not None:
+        expected = _LEVEL_BLOCK[level]
+    elif pause == "running":
+        expected = PAUSE_BUY_BLOCK
+    else:
+        expected = None
+    assert reason == expected
+
+
+def _r_losses(now: datetime, r_values: list[float]) -> list[dict[str, Any]]:
+    """Losing closes an hour apart, the newest an hour ago, each risking 10 USD at its stop."""
+    from datetime import timedelta
+
+    return [
+        {
+            "symbol": f"P{index}/USDT",
+            "closed_at": (now - timedelta(hours=len(r_values) - index)).isoformat(),
+            "realized_pnl": r * 10.0,
+            "initial_risk_usd": 10.0,
+        }
+        for index, r in enumerate(r_values)
+    ]
+
+
+def test_three_small_losses_still_pause_the_entries() -> None:
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    row = _opportunity()
+    protect([row], _r_losses(now, [-0.1, -0.1, -0.1]), RiskLimits(pair_cooldown_minutes=0), now)
+    assert row.status == "bloqueada" and "3 perdas nas últimas 6 h" in row.reason
+
+
+def test_two_full_stop_outs_now_pause_the_entries() -> None:
+    from datetime import timedelta
+
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    losses = _r_losses(now, [-1.0, -1.0])
+    row = _opportunity()
+    protect([row], losses, RiskLimits(pair_cooldown_minutes=0), now)
+    # The older loss closed at 10:00: the sum rises above -2 R when it leaves the window at 16:00.
+    assert row.status == "bloqueada" and row.reason == "perdas somando -2.0 R nas últimas 6 h: entradas pausadas até 16:00 UTC"
+    off = _opportunity()
+    protect([off], losses, RiskLimits(pair_cooldown_minutes=0, loss_guard_r=0), now)
+    assert off.status == "pronta"
+    smaller = _opportunity()
+    protect([smaller], _r_losses(now, [-1.0, -0.9]), RiskLimits(pair_cooldown_minutes=0), now)
+    assert smaller.status == "pronta"
+    later = _opportunity()
+    protect([later], losses, RiskLimits(pair_cooldown_minutes=0), now + timedelta(hours=4, minutes=1))
+    assert later.status == "pronta"
+
+
+def test_the_loss_guard_r_is_bounded_and_on_by_default() -> None:
+    assert RiskLimits().loss_guard_r == 2.0
+    with pytest.raises(ValueError):
+        RiskLimits(loss_guard_r=-1)
+    with pytest.raises(ValueError):
+        RiskLimits(loss_guard_r=21)
+
+
+def test_recent_losses_carry_the_entry_risk(tmp_path) -> None:
+    from bot.store import Store
+
+    store = Store(tmp_path / "bot.sqlite")
+    position_id = store.open_pending("BTC/USDT", "trend", stop_price=95.0)
+    assert position_id is not None
+    store.update_position(position_id, status="open", qty=1.0, avg_price=100.0, initial_risk_usd=5.0)
+    store.close_position(position_id, exit_price=95.0, realized_pnl=-5.0, fees=0.0)
+    (loss,) = store.recent_losses("2000-01-01")
+    assert loss["initial_risk_usd"] == 5.0 and loss["realized_pnl"] == -5.0
+    store.close()

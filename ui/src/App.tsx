@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { NavLink, Route, Routes } from "react-router";
 
 import { Help } from "./Help";
+import { formatUsdCost } from "./numbers";
 import { Balance } from "./pages/Balance";
 import { Bots } from "./pages/Bots";
 import { Controls } from "./pages/Controls";
@@ -97,6 +98,14 @@ export function App() {
                     : "O patrimônio caiu além do primeiro degrau de drawdown. Cada trade arrisca a metade e entra no máximo uma posição por ciclo. Detalhes em Controles."
                 }
               />
+            </>
+          )}
+          {status.advisor && status.advisor.mode !== "off" && (
+            <>
+              <span className={status.advisor.today.cost_usd >= status.advisor.daily_budget_usd ? "font-medium text-amber-600" : ""}>
+                · IA {formatUsdCost(status.advisor.today.cost_usd)} / {formatUsdCost(status.advisor.daily_budget_usd).replace("US$ ", "")}
+              </span>
+              <Help text="Custo estimado de hoje (UTC) das consultas ao consultor DeepSeek e o orçamento diário. Chegando ao orçamento, as linhas seguem sem veredito até o dia seguinte. O valor faturado é o do painel da DeepSeek. Detalhes em Controles e Desempenho." />
             </>
           )}
           <span>{status.halted ? "· halt ativo" : status.running ? "· em ciclo" : "· parado"}</span>

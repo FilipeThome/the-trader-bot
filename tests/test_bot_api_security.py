@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import threading
 from typing import Any
 
@@ -271,6 +272,134 @@ def test_a_refused_production_switch_saves_nothing_from_the_request(api_client) 
     assert response.status_code == 409
     status = api_client.get("/bot/status").json()
     assert status["mode"] == "testnet" and status["allocated_capital_usd"] == 1000.0
+
+
+def _production_ready(monkeypatch) -> None:
+    """Keys, mandate and gates as a switch needs them; the testnet history stays empty."""
+    from bot.api.app import _bind
+    from bot.config import BotConfig
+
+    monkeypatch.setattr("bot.api.app.service.check_status", lambda _name: {"ok": True})
+    monkeypatch.setattr("bot.api.app.mandate_is_restricted", lambda: True)
+    config = BotConfig.load()
+    config.gates = {"g1": True, "g2": True, "g3": True, "g4": True}
+    config.save()
+    with ctx.lock:
+        _bind(config)
+
+
+def test_the_pilot_fields_only_go_with_the_switch_to_production(api_client) -> None:
+    assert api_client.put("/bot/config", json={"pilot_cap_usd": 25}).status_code == 422
+    assert api_client.put("/bot/config", json={"pilot_skip_validation": True}).status_code == 422
+    assert api_client.put("/bot/config", json={"pilot_skip_gates": True}).status_code == 422
+    for waiver in ("pilot_skip_validation", "pilot_skip_gates"):
+        refused = api_client.put("/bot/config", json={"mode": "production", "confirmation": "PRODUCAO", waiver: True})
+        assert refused.status_code == 422 and "capital do piloto" in refused.json()["detail"], waiver
+    for cap in (0, 50.01):
+        body = {"mode": "production", "confirmation": "PRODUCAO", "pilot_cap_usd": cap}
+        assert api_client.put("/bot/config", json=body).status_code == 422, cap
+    assert api_client.get("/bot/status").json()["mode"] == "testnet"
+
+
+def test_a_pilot_from_the_panel_records_its_cap_and_waiver_in_the_production_store(api_client, monkeypatch) -> None:
+    from bot.promotion import PILOT_SKIP_VALIDATION_STATE, PILOT_STATE
+
+    _production_ready(monkeypatch)
+    # The production capital (10% of the allocated) must fit the cap: 100 of 1000 does not.
+    over = api_client.put("/bot/config", json={"mode": "production", "confirmation": "PRODUCAO", "pilot_cap_usd": 25})
+    assert over.status_code == 409 and any("piloto" in reason for reason in over.json()["detail"]["reasons"])
+    body = {
+        "mode": "production",
+        "confirmation": "PRODUCAO",
+        "allocated_capital_usd": 200,
+        "pilot_cap_usd": 25,
+        "pilot_skip_validation": True,
+    }
+    response = api_client.put("/bot/config", json=body)
+    assert response.status_code == 200, response.json()
+    status = api_client.get("/bot/status").json()
+    assert status["mode"] == "production" and status["pilot_cap_usd"] == 25
+    assert status["pilot_skip_validation"] is True and status["production_capital_usd"] == 20.0
+    assert ctx.runtime.store.get_state(PILOT_STATE) == 25 and ctx.runtime.store.get_state(PILOT_SKIP_VALIDATION_STATE) is True
+    # The cap recorded at the switch still binds the capital.
+    assert api_client.put("/bot/config", json={"allocated_capital_usd": 300}).status_code == 409
+
+    # Back on the testnet nothing of the pilot shows; a new pilot without the waiver clears it.
+    assert api_client.put("/bot/config", json={"mode": "testnet"}).status_code == 200
+    status = api_client.get("/bot/status").json()
+    assert status["pilot_cap_usd"] is None and status["pilot_skip_validation"] is False
+    again = api_client.put("/bot/config", json={"mode": "production", "confirmation": "PRODUCAO", "pilot_cap_usd": 30})
+    assert again.status_code == 200, again.json()
+    status = api_client.get("/bot/status").json()
+    assert status["pilot_cap_usd"] == 30 and status["pilot_skip_validation"] is False
+    assert ctx.runtime.store.get_state(PILOT_SKIP_VALIDATION_STATE) is False
+
+
+def test_a_pilot_from_the_panel_can_waive_the_gates_but_not_the_stopped_bot(api_client, monkeypatch) -> None:
+    from bot.promotion import PILOT_SKIP_GATES_STATE
+
+    _production_ready(monkeypatch)
+    config = ctx.runtime.config
+    config.gates = {"g1": False, "g2": False, "g3": False, "g4": False}
+    config.save()
+    body = {"mode": "production", "confirmation": "PRODUCAO", "allocated_capital_usd": 200, "pilot_cap_usd": 25}
+    refused = api_client.put("/bot/config", json=body)
+    assert refused.status_code == 409 and "gate G1 não aprovado" in refused.json()["detail"]["reasons"]
+    assert api_client.get("/bot/status").json()["mode"] == "testnet"
+    body["pilot_skip_gates"] = True
+    # The panel's waiver needs bot.json's consent.
+    refused = api_client.put("/bot/config", json=body)
+    assert refused.status_code == 409 and any("pilot_gates_waivable" in reason for reason in refused.json()["detail"]["reasons"])
+    config.pilot_gates_waivable = True
+    config.save()
+    ctx.runtime.store.set_state("running", True)
+    refused = api_client.put("/bot/config", json=body)
+    assert refused.status_code == 409 and refused.json()["detail"]["reasons"] == ["bot precisa estar parado"]
+    ctx.runtime.store.set_state("running", False)
+    response = api_client.put("/bot/config", json=body)
+    assert response.status_code == 200, response.json()
+    status = api_client.get("/bot/status").json()
+    assert status["mode"] == "production" and status["pilot_cap_usd"] == 25 and status["pilot_skip_gates"] is True
+    assert ctx.runtime.store.get_state(PILOT_SKIP_GATES_STATE) is True
+    # The switch is in the production ledger with the waiver.
+    ledger = (ctx.runtime.store.path.parent / "bot-ledger.jsonl").read_text(encoding="utf-8").splitlines()
+    entry = json.loads(ledger[-1])
+    assert entry["kind"] == "config" and entry["mode"] == "production" and entry["pilot_skip_gates"] is True
+    # The gates were not written: the API never touches them.
+    assert status["gates"] == {"g1": False, "g2": False, "g3": False, "g4": False}
+    # A later pilot without the waiver clears the mark.
+    assert api_client.put("/bot/config", json={"mode": "testnet"}).status_code == 200
+    _production_ready(monkeypatch)  # rebinds with the four gates approved
+    again = api_client.put("/bot/config", json={"mode": "production", "confirmation": "PRODUCAO", "pilot_cap_usd": 30})
+    assert again.status_code == 200, again.json()
+    assert api_client.get("/bot/status").json()["pilot_skip_gates"] is False
+
+
+def test_a_full_promotion_ignores_the_pilot_fields_and_clears_the_waiver(api_client, monkeypatch) -> None:
+    from datetime import date, datetime, timedelta, timezone
+
+    from bot.promotion import PILOT_SKIP_VALIDATION_STATE, PILOT_STATE
+
+    _production_ready(monkeypatch)
+    store = ctx.runtime.store
+    today = date.today()
+    for back in range(1, 31):
+        store.record_day((today - timedelta(days=back)).isoformat(), net_pnl=1.0, gross_pnl=1.0, fees=0.0)
+    for _ in range(30):
+        position_id = store.open_pending("BTC/USDT", "trend")
+        assert position_id is not None
+        store.update_position(position_id, status="open", qty=1.0, avg_price=100.0, r_multiple=0.5)
+        store.close_position(position_id, exit_price=101.0, realized_pnl=1.0, fees=0.0)
+    assert store.closed_trades(since=(datetime.now(timezone.utc) - timedelta(days=30)).isoformat())
+    body = {"mode": "production", "confirmation": "PRODUCAO", "pilot_cap_usd": 25, "pilot_skip_validation": True}
+    response = api_client.put("/bot/config", json=body)
+    assert response.status_code == 200, response.json()
+    status = api_client.get("/bot/status").json()
+    # 100 of production capital, above the cap sent: the history made it a full promotion, no pilot.
+    assert status["mode"] == "production" and status["pilot_cap_usd"] is None
+    assert status["pilot_skip_validation"] is False
+    assert ctx.runtime.store.get_state(PILOT_STATE) is None
+    assert ctx.runtime.store.get_state(PILOT_SKIP_VALIDATION_STATE) is False
 
 
 def test_infinite_or_nan_numbers_never_reach_the_config(api_client) -> None:

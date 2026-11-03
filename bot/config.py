@@ -95,6 +95,9 @@ class RiskLimits(BaseModel):
     pair_cooldown_minutes: int = Field(default=120, ge=0, le=1440)
     #: Losing closes in the last 6 hours that pause every new entry (0 = off).
     loss_guard_trades: int = Field(default=3, ge=0, le=20)
+    #: Losses in R (realized PnL over the entry risk) summing to minus this in the last 6 hours
+    #: also pause every new entry, so two full stop-outs pause like three small losses (0 = off).
+    loss_guard_r: float = Field(default=2.0, ge=0, le=20)
     #: Share of full Kelly a sized row may risk at its stop, when its hit rate is known (0 = off).
     kelly_fraction: float = Field(default=0.25, ge=0, le=1)
     #: New positions one cycle may open; the rest wait for the next cycle.
@@ -163,6 +166,42 @@ class RiskLimits(BaseModel):
         return self
 
 
+#: The DeepSeek advisor's modes (``bot.advisor``): ``shadow`` asks and records, ``filter`` may also
+#: keep a vetoed row out of automatic trading or shrink its size.
+AdvisorMode = Literal["off", "shadow", "filter"]
+AdvisorModel = Literal["deepseek-flash", "deepseek-v4-pro"]
+#: Field names that would carry a credential. The DeepSeek key lives in ``deepseek.json`` only,
+#: so a key pasted in the panel is refused instead of being written to bot.json.
+_SECRET_NAME = re.compile(r"(?i)key|secret|token")
+
+
+class AdvisorConfig(BaseModel):
+    """The DeepSeek advisor's settings. Not part of the mandate: the advisor only removes or
+    shrinks automatic entries, and the mandate holds the broker's ceilings."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    mode: AdvisorMode = "off"
+    model: AdvisorModel = "deepseek-flash"
+    daily_budget_usd: float = Field(default=1.0, ge=0, le=50)
+    #: A veto takes a row out of automatic trading only at this confidence or above.
+    min_veto_confidence: float = Field(default=0.6, ge=0.5, le=1)
+    #: In ``filter``, no automatic entry without a verdict (a failed or late call stops them).
+    require_verdict: bool = False
+    #: Seconds a ready row waits, across cycles, for its verdict before it goes on without one.
+    wait_seconds: int = Field(default=45, ge=5, le=120)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_credentials(cls, data: Any) -> Any:
+        """Refuse any credential-shaped field by name; its value is never echoed."""
+        if isinstance(data, dict):
+            named = sorted(str(name) for name in data if _SECRET_NAME.search(str(name)))
+            if named:
+                raise ValueError(f"a chave da DeepSeek fica em deepseek.json, nunca na configuração: {named}")
+        return data
+
+
 class BotConfig(BaseModel):
     # json.loads accepts Infinity; an infinite capital would be saved as null and break the next load.
     model_config = ConfigDict(allow_inf_nan=False)
@@ -207,6 +246,7 @@ class BotConfig(BaseModel):
     macro_events_utc: list[str] = Field(default_factory=list, max_length=MAX_MACRO_EVENTS)
     macro_pause_minutes: int = Field(default=15, ge=0, le=180)
     limits: RiskLimits = Field(default_factory=RiskLimits)
+    advisor: AdvisorConfig = Field(default_factory=AdvisorConfig)
     score_threshold: float = 0.3
     min_reward_risk: float = 1.5
     #: An entry needs this expected profit in USD at its target, net of costs, at the size it gets.
@@ -217,9 +257,13 @@ class BotConfig(BaseModel):
     tick_seconds: int = 60
     production_capital_fraction: float = Field(default=0.10, gt=0, le=1)
     #: A production pilot without 30 days of testnet history is allowed while the production
-    #: capital stays at or below this (0 = no pilot). Like the gates, only a hand edit of
-    #: bot.json sets it; once in production the cap recorded at the switch is the one enforced.
+    #: capital stays at or below this (0 = no pilot). A hand edit of bot.json sets it, or the
+    #: panel sends a cap with the switch (``pilot_cap_usd``, same bounds); once in production
+    #: the cap recorded at the switch is the one enforced.
     pilot_max_production_capital_usd: float = Field(default=0.0, ge=0, le=50)
+    #: Lets the panel's pilot waive the gates G1-G4 (``pilot_skip_gates`` on the switch). Edited in
+    #: bot.json only, like the gates: without it the panel's waiver is refused (409).
+    pilot_gates_waivable: bool = False
     #: Operator attestations, edited in bot.json only. The API never writes them.
     gates: dict[str, bool] = Field(
         default_factory=lambda: {"g1": False, "g2": False, "g3": False, "g4": False}

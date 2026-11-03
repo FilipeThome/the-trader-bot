@@ -31,9 +31,21 @@ def ensure_chart_data(collector: Collector, symbol: str) -> None:
         collector._load_funding(symbol)
 
 
-def build_features(snapshot: MarketSnapshot, symbol: str, *, funding_threshold: float = 0.10) -> dict[str, Any]:
-    trend = snapshot.candles[(symbol, "1h")].frame
-    mean = snapshot.candles[(symbol, "15m")].frame
+def closed_by(frame: pd.DataFrame, width: pd.Timedelta, until: pd.Timestamp | None) -> pd.DataFrame:
+    """The bars of ``frame`` (indexed by open time) that closed at or before ``until``; all of
+    them when ``until`` is None. This drops the forming bar and every bar after ``until``."""
+    if until is None:
+        return frame
+    return frame[frame.index + width <= until]
+
+
+def build_features(
+    snapshot: MarketSnapshot, symbol: str, *, funding_threshold: float = 0.10, until: pd.Timestamp | None = None
+) -> dict[str, Any]:
+    """The panel's series of ``symbol``. ``until`` keeps only the 1h and 15m bars closed by then:
+    the advisor's prompt is built on what was known when the signal bar closed."""
+    trend = closed_by(snapshot.candles[(symbol, "1h")].frame, pd.Timedelta(hours=1), until)
+    mean = closed_by(snapshot.candles[(symbol, "15m")].frame, pd.Timedelta(minutes=15), until)
     latest = snapshot.funding.get(symbol) or []
     return {
         "symbol": symbol,

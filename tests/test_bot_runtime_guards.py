@@ -9,12 +9,14 @@ from typing import Any
 import pandas as pd
 import pytest
 
-from bot import runtime as runtime_module
 from bot.collector import MarketSnapshot, Series
 from bot.config import BotConfig
+from bot.cycle import exits as exits_module
+from bot.cycle.exits import _exit_reason
+from bot.cycle.scoring import _setup
 from bot.decay import PAIR_DEMOTED, SLIPPAGE_BLOCKED
 from bot.evaluator import Opportunity
-from bot.runtime import Runtime, _exit_reason, _setup
+from bot.runtime import Runtime
 from bot.store import Store
 from bot.strategies import IntradayMomentum, validation_params
 from bot.strategies.base import Setup
@@ -87,7 +89,7 @@ def test_position_records_hysteresis_and_legacy_rows_exit_without_it(tmp_path, m
     assert plain.executor.exit_hysteresis is False and default.executor.exit_hysteresis is True
     assert default.executor.ledger == default._ledger
     seen: list[bool] = []
-    monkeypatch.setattr(runtime_module._TREND, "exit_reason", lambda _frame, _side, *, hysteresis=True: seen.append(hysteresis))
+    monkeypatch.setattr(exits_module._TREND, "exit_reason", lambda _frame, _side, *, hysteresis=True: seen.append(hysteresis))
     snapshot = MarketSnapshot(candles={("BTC/USDT", "1h"): _series(RISING, "1h")})
     for flag in (1, 0, None):
         _exit_reason(_position("trend", "1h", flag), snapshot, MOMENT, use_target=False)
@@ -115,7 +117,7 @@ PASSED = {"passed": True, "wins": 30, "trades": 40, "mc_p95_dd_r": 0.0}
 def test_a_setup_on_an_unvalidated_timeframe_is_signal_only(tmp_path, monkeypatch) -> None:
     runtime, executor = _scored(tmp_path, monkeypatch, _params({"4h": PASSED, "1h": {"passed": False, "wins": 30, "trades": 40}}))
     asked: list[tuple[str, ...]] = []
-    monkeypatch.setattr("bot.runtime._setup", lambda *args: (asked.append(args[5]), _trend_setup(*args))[1])
+    monkeypatch.setattr("bot.cycle.scoring._setup", lambda *args: (asked.append(args[5]), _trend_setup(*args))[1])
     runtime.tick()
     row = runtime.store.opportunities()[0]
     assert row["status"] == "bloqueada" and "timeframe 1h não passou" in row["reason"]
@@ -254,7 +256,7 @@ def test_a_late_signal_the_price_left_is_not_entered_automatically(tmp_path, mon
 
 def test_a_late_signal_without_a_live_price_is_not_entered_automatically(tmp_path, monkeypatch) -> None:
     runtime, executor = _aged(tmp_path, monkeypatch, "auto")
-    monkeypatch.setattr("bot.runtime._last_price", lambda *_args: None)
+    monkeypatch.setattr("bot.cycle.market._last_price", lambda *_args: None)
     runtime.tick(now=MOMENT)
     row = runtime.store.opportunities()[0]
     assert row["entry_drift_r"] is None
@@ -289,8 +291,8 @@ def _macro(tmp_path, monkeypatch, events: list[str]) -> Runtime:
     runtime.collector.snapshot = MarketSnapshot(  # type: ignore[attr-defined]
         candles={("BTC/USDT", "1h"): _series([100.0] * 80, "1h"), ("BTC/USDT", "15m"): _series([100.0] * 80, "15m")}
     )
-    monkeypatch.setattr("bot.runtime._setup", _both)
-    monkeypatch.setattr("bot.runtime.in_quiet_hours", lambda *_a: False)
+    monkeypatch.setattr("bot.cycle.scoring._setup", _both)
+    monkeypatch.setattr("bot.cycle.scoring.in_quiet_hours", lambda *_a: False)
     return runtime
 
 

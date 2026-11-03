@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from bot.api import app as module
+from bot.api import validation
 from bot.api.app import ctx
 from bot.collector import Series
 from bot.config import BotConfig
@@ -75,9 +76,9 @@ def runs(monkeypatch) -> list[str]:
 
     def run(key: tuple[str, str], strategy_id: str, config: BotConfig, root: Any) -> None:
         started.append(strategy_id)
-        module._update_job(key, status="done", stage="pronto", finished_at=datetime.now(timezone.utc).isoformat())
+        validation._update_job(key, status="done", stage="pronto", finished_at=datetime.now(timezone.utc).isoformat())
 
-    monkeypatch.setattr(module, "_run_validation", run)
+    monkeypatch.setattr(validation, "_run_validation", run)
     return started
 
 
@@ -116,13 +117,13 @@ def test_the_market_filter_refuses_to_validate_without_btc_history(api_client, m
 
 def test_each_run_logs_a_trial_and_dsr_counts_trials_since_the_last_pass(api_client, loader, monkeypatch) -> None:
     calls: list[tuple[str, int, list[float]]] = []
-    real = module.validate_strategy
+    real = validation.validate_strategy
 
     def spy(strategy_id: str, frames: Any, timeframe: str, **kwargs: Any) -> Any:
         calls.append((timeframe, kwargs["trials"], list(kwargs["trial_sharpes"])))
         return real(strategy_id, frames, timeframe, **kwargs)
 
-    monkeypatch.setattr(module, "validate_strategy", spy)
+    monkeypatch.setattr(validation, "validate_strategy", spy)
     store = ctx.runtime.store  # type: ignore[union-attr]
 
     def validate() -> None:
@@ -194,6 +195,21 @@ def test_a_rule_change_revalidates_at_once(api_client, runs) -> None:
     assert module.revalidate_stale(runtime) == ["momentum"]
 
 
+def test_a_threshold_change_makes_a_passed_validation_stale(api_client, runs) -> None:
+    runtime = _use({"strategies": {**ctx.runtime.config.strategies, "momentum": True}})  # type: ignore[union-attr]
+    passed = {**_params("momentum", {"4h": {"passed": True}}), "thresholds": validation._thresholds(runtime.config)}
+    runtime.store.save_strategy({"strategy_id": "momentum", "signal_only": False, "params": passed})
+    universe = validation.replay_universe(runtime.config, runtime.store)
+    assert validation._stale_cause(passed, "momentum", runtime.config, universe) is None
+    assert module.revalidate_stale(runtime) == []
+    _use({"score_threshold": 0.6})
+    assert validation._stale_cause(passed, "momentum", runtime.config, universe) == "rules"
+    assert module.revalidate_stale(runtime) == ["momentum"]
+    # A record from before the top-level key: the timeframe results carry the thresholds it ran with.
+    older = _params("momentum", {"4h": {"passed": True, "score_threshold": 0.3, "cost_multiple": 2.0, "min_reward_risk": 1.5}})
+    assert validation._stale_cause(older, "momentum", runtime.config, universe) == "rules"
+
+
 def test_pair_set_staleness_revalidates_at_most_daily(api_client, runs) -> None:
     runtime = _use({"strategies": {**ctx.runtime.config.strategies, "momentum": True}})  # type: ignore[union-attr]
     other_pairs = _params("momentum", {"4h": {"passed": True}}, symbols=["BTC/USDT"])
@@ -214,9 +230,9 @@ def test_pair_set_staleness_revalidates_at_most_daily(api_client, runs) -> None:
 
 def test_a_failed_revalidation_waits_before_trying_again(api_client, monkeypatch) -> None:
     def fail(key: tuple[str, str], *_args: Any) -> None:
-        module._update_job(key, status="error", error="x", finished_at=datetime.now(timezone.utc).isoformat())
+        validation._update_job(key, status="error", error="x", finished_at=datetime.now(timezone.utc).isoformat())
 
-    monkeypatch.setattr(module, "_run_validation", fail)
+    monkeypatch.setattr(validation, "_run_validation", fail)
     runtime = _use({"strategies": {**ctx.runtime.config.strategies, "momentum": True}})  # type: ignore[union-attr]
     stale = {**_params("momentum", {"4h": {"passed": True}}), "gate": GATE_VERSION - 1}
     runtime.store.save_strategy({"strategy_id": "momentum", "signal_only": False, "params": stale})
@@ -306,13 +322,13 @@ def test_positions_include_r_mae_mfe(api_client) -> None:
 
 def test_status_trials_n_is_the_n_the_next_validation_reaches(api_client, loader, monkeypatch) -> None:
     seen_n: list[int] = []
-    real = module.validate_strategy
+    real = validation.validate_strategy
 
     def spy(strategy_id: str, frames: Any, timeframe: str, **kwargs: Any) -> Any:
         seen_n.append(kwargs["trials"])
         return real(strategy_id, frames, timeframe, **kwargs)
 
-    monkeypatch.setattr(module, "validate_strategy", spy)
+    monkeypatch.setattr(validation, "validate_strategy", spy)
 
     def status() -> dict[str, Any]:
         return api_client.get("/bot/status").json()
@@ -335,3 +351,111 @@ def test_status_trials_n_is_the_n_the_next_validation_reaches(api_client, loader
     assert status()["trials"]["trend"] == 4
     validate()
     assert status()["trials"]["trend"] == 6 and status()["trials_n"]["trend"] == 4
+
+
+def test_auto_select_replays_the_liquid_universe_not_the_chosen_pairs(api_client, loader, monkeypatch) -> None:
+    from bot.cycle.market import UNIVERSE_STATE
+
+    universe = ["ADA/USDT", "BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    strategies = {**ctx.runtime.config.strategies, "trend": True}  # type: ignore[union-attr]
+    runtime = _use({"auto_select": True, "symbols": ["SOL/USDT", "ETH/USDT"], "strategies": strategies})
+    runtime.store.set_state(UNIVERSE_STATE, universe)
+    assert api_client.post("/bot/strategies/trend/validate").status_code == 202
+    _join()
+    assert loader.reads[0] == ("1h", tuple(universe), 240)
+    params = runtime.store.strategy("trend")["params"]  # type: ignore[index]
+    assert params["symbols"] == universe and params["pairset"] == pairset_hash(universe) and params["universe"] == "liquid"
+    assert all(trial["pairset"] == pairset_hash(universe) for trial in runtime.store.trials_since_pass("trend"))
+    job = api_client.get("/bot/status").json()["validations"]["trend"]
+    assert job["done"] == job["total"] == 2 * len(universe)
+    detail = api_client.get("/bot/status").json()["validation_detail"]["trend"]["1h"]
+    assert detail["universe"] == "liquid" and detail["universe_pairs"] == 4
+    monkeypatch.setattr(validation, "_run_validation", lambda *_args: None)
+    start = datetime.now(timezone.utc)
+    # The hourly choice moves inside the universe: nothing is stale, and the N stays.
+    _use({"symbols": ["ADA/USDT"]})
+    assert module.revalidate_stale(runtime, now=start) == []
+    assert api_client.get("/bot/status").json()["trials_n"]["trend"] == 2
+    # The universe itself changes: stale, at most once a day from the last start (D12).
+    runtime.store.set_state(UNIVERSE_STATE, [*universe, "XRP/USDT"])
+    assert module.revalidate_stale(runtime, now=start + timedelta(hours=1)) == []
+    assert module.revalidate_stale(runtime, now=start + timedelta(hours=25)) == ["trend"]
+
+
+def test_the_validation_keeps_the_limits_it_replayed_and_a_limit_change_keeps_it(api_client, loader) -> None:
+    from bot.config import RiskLimits
+
+    runtime = _use({"limits": RiskLimits(max_positions=3), "strategies": {**ctx.runtime.config.strategies, "trend": True}})  # type: ignore[union-attr]
+    assert api_client.post("/bot/strategies/trend/validate").status_code == 202
+    _join()
+    params = runtime.store.strategy("trend")["params"]  # type: ignore[index]
+    replayed = {"max_positions": 3, "pair_cooldown_minutes": 120, "loss_guard_trades": 3, "loss_guard_r": 2.0}
+    assert params["limits"] == replayed and params["universe"] == "pairs"
+    detail = api_client.get("/bot/status").json()["validation_detail"]["trend"]
+    assert detail["1h"]["limits"] == replayed and detail["1h"]["skipped_by_limits"] == 0
+    assert detail["4h"]["score_threshold"] == 0.3 and detail["4h"]["filtered_trades"] == 0
+    assert params["thresholds"] == {"score_threshold": 0.3, "cost_multiple": runtime.config.cost_multiple, "min_reward_risk": 1.5}
+    # Limits are not part of the key: another limit re-validates nothing.
+    _use({"limits": RiskLimits(max_positions=1, loss_guard_r=1.0)})
+    assert module.revalidate_stale(runtime, now=datetime.now(timezone.utc) + timedelta(days=2)) == []
+
+
+def test_a_strategy_without_a_replay_lists_every_validatable_one(api_client) -> None:
+    from bot.backtest.runner import VALIDATABLE
+
+    reply = api_client.post("/bot/strategies/funding_carry/validate")
+    assert reply.status_code == 422
+    assert reply.json()["detail"] == f"só {', '.join(VALIDATABLE)} têm teste histórico"
+    assert all(strategy_id in reply.json()["detail"] for strategy_id in ("intraday_momentum", "vwap_pullback"))
+
+
+# -- rigorous review: thresholds in the live key, the universe read by the validation ---------------
+
+
+def test_a_threshold_change_leaves_a_pass_unvalidated_in_the_status(api_client) -> None:
+    runtime = _use({"strategies": {**ctx.runtime.config.strategies, "momentum": True}})  # type: ignore[union-attr]
+    passed = {**_params("momentum", {"4h": {"passed": True, "mc_p95_dd_r": 5.0}}), "thresholds": validation._thresholds(runtime.config)}
+    runtime.store.save_strategy({"strategy_id": "momentum", "signal_only": False, "params": passed})
+    assert api_client.get("/bot/status").json()["validated"]["momentum"] is True
+    # As the cycle reads it: until the re-validation passes, the old pass is signal-only.
+    _use({"cost_multiple": 3.0})
+    assert api_client.get("/bot/status").json()["validated"]["momentum"] is False
+    _use({"cost_multiple": runtime.config.cost_multiple, "score_threshold": 0.6})
+    assert api_client.get("/bot/status").json()["validated"]["momentum"] is False
+
+
+def _auto_trend() -> Runtime:
+    strategies = {**ctx.runtime.config.strategies, "trend": True}  # type: ignore[union-attr]
+    return _use({"auto_select": True, "symbols": ["SOL/USDT"], "strategies": strategies})
+
+
+def test_auto_select_without_a_saved_universe_reads_the_liquid_pool_and_saves_it(api_client, loader, monkeypatch) -> None:
+    from bot.cycle.market import UNIVERSE_STATE
+
+    read: list[Any] = []
+    monkeypatch.setattr(validation, "venue_symbols", lambda _collector, mode: None)
+    pool = ["SOL/USDT", "ADA/USDT", "BTC/USDT"]
+    monkeypatch.setattr(validation, "liquid_pool", lambda collector, listed=None: read.append(collector) or list(pool))
+    runtime = _auto_trend()
+    assert runtime.store.get_state(UNIVERSE_STATE) is None
+    assert api_client.post("/bot/strategies/trend/validate").status_code == 202
+    _join()
+    universe = ["ADA/USDT", "BTC/USDT", "SOL/USDT"]
+    assert read == [ctx.collector] and loader.reads[0] == ("1h", tuple(universe), 240)
+    params = runtime.store.strategy("trend")["params"]  # type: ignore[index]
+    assert params["symbols"] == universe and params["pairset"] == pairset_hash(universe) and params["universe"] == "liquid"
+    assert runtime.store.get_state(UNIVERSE_STATE) == universe
+
+
+def test_auto_select_with_no_liquid_pool_ends_the_validation_with_an_error(api_client, loader, monkeypatch) -> None:
+    from bot.cycle.market import UNIVERSE_STATE
+
+    monkeypatch.setattr(validation, "venue_symbols", lambda _collector, mode: None)
+    monkeypatch.setattr(validation, "liquid_pool", lambda _collector, listed=None: [])
+    runtime = _auto_trend()
+    assert api_client.post("/bot/strategies/trend/validate").status_code == 202
+    _join()
+    job = api_client.get("/bot/status").json()["validations"]["trend"]
+    assert job["status"] == "error" and job["error"] == "universo de pares líquidos indisponível para a seleção automática"
+    assert loader.reads == [] and runtime.store.strategy("trend") is None
+    assert runtime.store.get_state(UNIVERSE_STATE) is None

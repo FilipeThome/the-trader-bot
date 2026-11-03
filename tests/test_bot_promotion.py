@@ -30,6 +30,32 @@ def _config(allocated: float, cap: float) -> BotConfig:
     return BotConfig(allocated_capital_usd=allocated, pilot_max_production_capital_usd=cap, gates=GATES)
 
 
+def test_skip_gates_waives_only_the_gates_and_only_for_a_pilot(tmp_path) -> None:
+    store = Store(tmp_path / "bot.sqlite")
+    config = _config(150, 0)
+    config.gates = {"g1": False, "g2": True, "g3": False, "g4": True}
+    gates = ["gate G1 não aprovado", "gate G3 não aprovado"]
+    # Without the waiver the gates stay with the pilot's cap.
+    reasons, pilot = production_blockers(config, store, pilot_cap=25, **CHECKS)
+    assert reasons == gates and pilot == 25
+    # The waiver needs bot.json's consent: without it the gates stay and the refusal says why.
+    reasons, pilot = production_blockers(config, store, pilot_cap=25, skip_gates=True, **CHECKS)
+    assert reasons == ["dispensar as liberações G1 a G4 exige pilot_gates_waivable no bot.json", *gates] and pilot == 25
+    config.pilot_gates_waivable = True
+    # With it, the pilot goes through; the stopped bot is still required.
+    assert production_blockers(config, store, pilot_cap=25, skip_gates=True, **CHECKS) == ([], 25)
+    reasons, _ = production_blockers(config, store, pilot_cap=25, skip_gates=True, **{**CHECKS, "bot_stopped": False})
+    assert reasons == ["bot precisa estar parado"]
+    # Over the cap it is no pilot, so the gates come back with the history.
+    reasons, pilot = production_blockers(config, store, pilot_cap=10, skip_gates=True, **CHECKS)
+    assert pilot is None and all(gate in reasons for gate in gates)
+    # A full promotion never waives them.
+    _good_days(store)
+    _trades(store, [1.0] * 40)
+    reasons, pilot = production_blockers(config, store, pilot_cap=25, skip_gates=True, **CHECKS)
+    assert reasons == gates and pilot is None
+
+
 def _good_days(store: Store) -> None:
     for day in range(1, 31):
         store.record_day(f"2026-09-{day:02d}", net_pnl=1.0, gross_pnl=1.0, fees=0.0)
@@ -71,6 +97,17 @@ def _breach(root, ts: datetime, kind: str = "quantitative") -> None:
 def test_a_small_production_capital_skips_only_the_testnet_history(tmp_path) -> None:
     store = Store(tmp_path / "bot.sqlite")
     assert production_blockers(_config(150, 25), store, **CHECKS) == ([], 25)
+
+
+def test_the_cap_sent_with_the_switch_replaces_the_one_in_bot_json(tmp_path) -> None:
+    store = Store(tmp_path / "bot.sqlite")
+    # bot.json has no pilot; the panel's cap makes the switch a pilot at that cap.
+    assert production_blockers(_config(150, 0), store, pilot_cap=25, **CHECKS) == ([], 25)
+    # The panel's cap also replaces a larger one in bot.json: too small, the history is required.
+    reasons, pilot = production_blockers(_config(150, 50), store, pilot_cap=10, **CHECKS)
+    assert pilot is None
+    assert "são necessários 30 dias de testnet" in reasons
+    assert "piloto: capital de produção de US$ 15.00 acima do limite de US$ 10.00" in reasons
 
 
 def test_a_pilot_above_its_cap_needs_the_30_days(tmp_path) -> None:

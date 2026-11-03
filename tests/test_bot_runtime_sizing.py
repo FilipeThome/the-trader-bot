@@ -91,7 +91,7 @@ def test_collect_reads_btc_and_warms_the_account_fees(tmp_path, monkeypatch) -> 
     runtime.tick()
     assert asked == [["ETH/USDT", "BTC/USDT"]] and warmed == ["ETH/USDT", "BTC/USDT"]
     # Under API weight pressure no fee is read.
-    monkeypatch.setattr("bot.runtime.weight_pressure", lambda: True)
+    monkeypatch.setattr("bot.cycle.market.weight_pressure", lambda: True)
     runtime.tick()
     assert warmed == ["ETH/USDT", "BTC/USDT"]
 

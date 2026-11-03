@@ -42,8 +42,8 @@ python_version = "3.12"
 packages = [
     "bot.api", "bot.evaluator", "bot.risk", "bot.executor", "bot.runtime", "bot.config", "bot.store",
     "bot.collector", "bot.recommend", "bot.markets", "bot.features", "bot.reports", "bot.promotion",
-    "bot.decay", "bot.backtest", "bot.paths", "bot.mandate_io", "bot.strategies", "bot.__main__",
-    "bot.exchange", "bot.ops",
+    "bot.decay", "bot.backtest", "bot.paths", "bot.mandate_io", "bot.strategies", "bot.__main__", "bot.cycle",
+    "bot.exchange", "bot.ops", "bot.logging_setup", "bot.advisor",
 ]
 # Vendored modules this branch changed (ORIGIN.md, "Baseados no commit e alterados aqui") are typed here.
 modules = ["bot.live.sdk_order_gate", "bot.governance.ledger"]

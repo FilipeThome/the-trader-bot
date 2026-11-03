@@ -25,3 +25,9 @@ export function formatR(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return "—";
   return `${value > 0 ? "+" : ""}${value.toFixed(2).replace(".", ",")} R`;
 }
+
+/** "US$ 0,012": an advisor cost, with a third decimal under a dollar, where calls cost fractions of a cent. */
+export function formatUsdCost(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "—";
+  return `US$ ${value.toFixed(Math.abs(value) < 1 ? 3 : 2).replace(".", ",")}`;
+}
